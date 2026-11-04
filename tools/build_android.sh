@@ -4,6 +4,7 @@
 #   game data from game/ (pre-patched for the 640x360 engine size) as APK assets.
 # No Gradle or Java code: NativeActivity + aapt2/zipalign/apksigner from the SDK.
 # Options: ABIS="arm64-v8a x86_64"  VERSION=0.1.0  SERVER=ws://host:8787/ws (default relay)
+#          EXTRA_CFLAGS=-DRG_DIAG  (adds the on-screen input/performance diagnostics overlay)
 set -e
 R="$(cd "$(dirname "$0")/.." && pwd)"
 SDK=${ANDROID_SDK:-/c/dev/toolchains/android-sdk}
@@ -42,7 +43,7 @@ for ABI in $ABIS; do
   echo "== $ABI: compiling generated code"
   ls "$GEN"/*.c | xargs -P 8 -I{} sh -c 'o="'"$OBJ"'/$(basename {} .c).o"; [ "$o" -nt "{}" ] || "'"$CLANG"'" '"$CF"' -w -c "$(cygpath -w {})" -o "$(cygpath -w $o)"'
   for f in "$R"/native/rt/*.c "$R"/native/android/main.c "$NDK/sources/android/native_app_glue/android_native_app_glue.c"; do
-    "$CLANG" $CF -Wall -Wno-unused-function -DRG_DEFAULT_SERVER="\"$SERVER\"" -DRG_DATA_STAMP="\"$STAMP\"" \
+    "$CLANG" $CF -Wall -Wno-unused-function $EXTRA_CFLAGS -DRG_DEFAULT_SERVER="\"$SERVER\"" -DRG_DATA_STAMP="\"$STAMP\"" \
       -c "$(w $f)" -o "$(w $OBJ/$(basename "$f" .c).o)"
   done
   mkdir -p "$OUT/apk/lib/$ABI"

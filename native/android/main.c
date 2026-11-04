@@ -183,6 +183,23 @@ static int controls_visible = 1;
 static uint64_t last_pad_input;
 static int pointer_button[16];           /* which button each touch pointer holds (-1 none) */
 
+#ifdef RG_DIAG
+/* Diagnostics build: an on-screen overlay (top-left; tap it to hide/show) and logcat lines
+ * showing what input the host receives and how fast the engine runs. For remote debugging
+ * on devices we cannot touch: the user sends a screenshot or screen recording. */
+static struct {
+    int show;
+    unsigned events, hovers, cancels;
+    int tool, act, last_btn;                 /* last pointer 0 event */
+    float x, y;
+    uint64_t down_at[8];
+    unsigned taps[8], hold_last[8], hold_max[8];
+    unsigned ticks_s, frames_s, tick_max_s;  /* last full second */
+    unsigned ticks, frames, tick_max;        /* current second */
+    uint64_t sec_at;
+} dg = { .show = 1 };
+#endif
+
 static void layout_controls(void) {
     float side = (float)game_x;               /* width of each side bar */
     float u = BH / 10.0f;
@@ -208,7 +225,16 @@ static void drop_release(void) {
 static void press(int b, int down) {
     if (buttons[b].down == down) return;
     buttons[b].down = down;
-    if (b == B_DROP) {                       /* released by the main loop after DROP_MS */
+#ifdef RG_DIAG
+    if (down) { dg.down_at[b] = mono_ms(); dg.taps[b]++; }
+    else if (dg.down_at[b]) {
+        dg.hold_last[b] = (unsigned)(mono_ms() - dg.down_at[b]);
+        if (dg.hold_last[b] > dg.hold_max[b]) dg.hold_max[b] = dg.hold_last[b];
+        host_log("diag: button %s released after %u ms", buttons[b].label, dg.hold_last[b]);
+        dg.down_at[b] = 0;
+    }
+#endif
+    if (b == B_DROP) {                     /* released by the main loop after DROP_MS */
         if (down) {
             if (!drop_pending) rg_key(1, K_CTRL);
             drop_pending = 1;
@@ -278,6 +304,48 @@ static void mask_triangle(float cx, float cy, float s, int dir, int alpha) {
         }
 }
 
+/* 5x7 bitmap font (upper case, digits, a little punctuation) for button labels and diagnostics */
+static const char font_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:.-/=,";
+static const uint8_t font5x7[][7] = {
+    {0x0e,0x11,0x11,0x1f,0x11,0x11,0x11}, {0x1e,0x11,0x11,0x1e,0x11,0x11,0x1e}, {0x0e,0x11,0x10,0x10,0x10,0x11,0x0e},
+    {0x1e,0x11,0x11,0x11,0x11,0x11,0x1e}, {0x1f,0x10,0x10,0x1e,0x10,0x10,0x1f}, {0x1f,0x10,0x10,0x1e,0x10,0x10,0x10},
+    {0x0e,0x11,0x10,0x17,0x11,0x11,0x0f}, {0x11,0x11,0x11,0x1f,0x11,0x11,0x11}, {0x0e,0x04,0x04,0x04,0x04,0x04,0x0e},
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0c}, {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, {0x10,0x10,0x10,0x10,0x10,0x10,0x1f},
+    {0x11,0x1b,0x15,0x15,0x11,0x11,0x11}, {0x11,0x19,0x15,0x13,0x11,0x11,0x11}, {0x0e,0x11,0x11,0x11,0x11,0x11,0x0e},
+    {0x1e,0x11,0x11,0x1e,0x10,0x10,0x10}, {0x0e,0x11,0x11,0x11,0x15,0x12,0x0d}, {0x1e,0x11,0x11,0x1e,0x14,0x12,0x11},
+    {0x0f,0x10,0x10,0x0e,0x01,0x01,0x1e}, {0x1f,0x04,0x04,0x04,0x04,0x04,0x04}, {0x11,0x11,0x11,0x11,0x11,0x11,0x0e},
+    {0x11,0x11,0x11,0x11,0x11,0x0a,0x04}, {0x11,0x11,0x11,0x15,0x15,0x1b,0x11}, {0x11,0x11,0x0a,0x04,0x0a,0x11,0x11},
+    {0x11,0x11,0x0a,0x04,0x04,0x04,0x04}, {0x1f,0x01,0x02,0x04,0x08,0x10,0x1f},
+    {0x0e,0x11,0x13,0x15,0x19,0x11,0x0e}, {0x04,0x0c,0x04,0x04,0x04,0x04,0x0e}, {0x0e,0x11,0x01,0x02,0x04,0x08,0x1f},
+    {0x1e,0x01,0x01,0x0e,0x01,0x01,0x1e}, {0x02,0x06,0x0a,0x12,0x1f,0x02,0x02}, {0x1f,0x10,0x1e,0x01,0x01,0x11,0x0e},
+    {0x06,0x08,0x10,0x1e,0x11,0x11,0x0e}, {0x1f,0x01,0x02,0x04,0x08,0x08,0x08}, {0x0e,0x11,0x11,0x0e,0x11,0x11,0x0e},
+    {0x0e,0x11,0x11,0x0f,0x01,0x02,0x0c},
+    {0x00,0x0c,0x0c,0x00,0x0c,0x0c,0x00}, {0x00,0x00,0x00,0x00,0x00,0x0c,0x0c}, {0x00,0x00,0x00,0x1f,0x00,0x00,0x00},
+    {0x01,0x01,0x02,0x04,0x08,0x10,0x10}, {0x00,0x00,0x1f,0x00,0x1f,0x00,0x00}, {0x00,0x00,0x00,0x00,0x0c,0x04,0x08},
+};
+
+static const uint8_t *glyph(char c) {
+    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    const char *p = c ? strchr(font_chars, c) : NULL;
+    return p ? font5x7[p - font_chars] : NULL;
+}
+
+static int text_w(const char *s, int sc) { return (int)strlen(s) * 6 * sc - sc; }
+
+/* centred at cx, top at y */
+static void mask_text(float cx, int y, int sc, const char *s, int alpha) {
+    int x = (int)cx - text_w(s, sc) / 2;
+    for (; *s; s++, x += 6 * sc) {
+        const uint8_t *g = glyph(*s);
+        if (!g) continue;
+        for (int r = 0; r < 7; r++)
+            for (int c = 0; c < 5; c++)
+                if (g[r] >> (4 - c) & 1)
+                    for (int dy = 0; dy < sc; dy++)
+                        for (int dx = 0; dx < sc; dx++) cover(x + c * sc + dx, y + r * sc + dy, alpha);
+    }
+}
+
 static void build_mask(void) {
     unsigned key = (unsigned)controls_visible | (unsigned)bw << 1;
     for (int i = 0; i < NB; i++) key = key * 31 + (unsigned)buttons[i].down;
@@ -293,8 +361,11 @@ static void build_mask(void) {
         mask_circle(b->cx, b->cy, b->r, b->down ? 150 : 70, 0);
         mask_circle(b->cx, b->cy, b->r, 140, 1);
         if (i < 4) mask_triangle(b->cx, b->cy, b->r * 0.55f, i, 200);
-        else if (i == 4) mask_circle(b->cx, b->cy, b->r * 0.35f, 170, 0);
-        else if (i == B_DROP) {
+        else if (i == 4) {
+            mask_circle(b->cx, b->cy, b->r * 0.35f, 170, 0);
+            mask_text(b->cx, (int)(b->cy + b->r) + 14, 4, "ROTATE / OK", 230);
+        } else if (i == B_DROP) {
+            mask_text(b->cx, (int)(b->cy + b->r) + 10, 4, "DROP", 230);
             /* a down arrow onto a bar: "place" */
             mask_triangle(b->cx, b->cy - b->r * 0.1f, b->r * 0.5f, 1, 200);
             for (int k = -(int)(b->r * 0.45f); k <= (int)(b->r * 0.45f); k++)
@@ -329,6 +400,51 @@ static void composite_controls(uint32_t *px, int stride) {
     }
 }
 
+#ifdef RG_DIAG
+#define DG_LINES 8
+#define DG_SC 2
+static int dg_x(void) { return game_x + 8; }
+static int dg_w(void) { return 36 * 6 * DG_SC; }
+static int dg_h(void) { return DG_LINES * 9 * DG_SC + 6; }
+
+static void dg_text(uint32_t *px, int stride, int x, int y, const char *s) {
+    for (; *s; s++, x += 6 * DG_SC) {
+        const uint8_t *g = glyph(*s);
+        if (!g) continue;
+        for (int r = 0; r < 7; r++)
+            for (int c = 0; c < 5; c++)
+                if (g[r] >> (4 - c) & 1)
+                    for (int dy = 0; dy < DG_SC; dy++)
+                        for (int dx = 0; dx < DG_SC; dx++) px[(size_t)(y + r * DG_SC + dy) * stride + x + c * DG_SC + dx] = 0xffffffffu;
+    }
+}
+
+static void diag_draw(uint32_t *px, int stride) {
+    if (!dg.show) return;
+    int x0 = dg_x(), y0 = 8;
+    for (int y = y0; y < y0 + dg_h() && y < BH; y++)
+        for (int x = x0 - 4; x < x0 + dg_w() && x < bw; x++) px[(size_t)y * stride + x] = 0xff000000u;
+    char l[64];
+    int y = y0 + 3;
+    snprintf(l, sizeof l, "BUF %dX%d GX %d", bw, BH, game_x); dg_text(px, stride, x0, y, l); y += 9 * DG_SC;
+    snprintf(l, sizeof l, "TICKS %u/S FRAMES %u/S MAX %uMS", dg.ticks_s, dg.frames_s, dg.tick_max_s); dg_text(px, stride, x0, y, l); y += 9 * DG_SC;
+    snprintf(l, sizeof l, "EV %u ACT %d TOOL %d BTN %d", dg.events, dg.act, dg.tool, dg.last_btn); dg_text(px, stride, x0, y, l); y += 9 * DG_SC;
+    snprintf(l, sizeof l, "XY %d,%d", (int)dg.x, (int)dg.y); dg_text(px, stride, x0, y, l); y += 9 * DG_SC;
+    snprintf(l, sizeof l, "HOVER %u CANCEL %u", dg.hovers, dg.cancels); dg_text(px, stride, x0, y, l); y += 9 * DG_SC;
+    snprintf(l, sizeof l, "ACTION N %u LAST %uMS MAX %uMS", dg.taps[4], dg.hold_last[4], dg.hold_max[4]); dg_text(px, stride, x0, y, l); y += 9 * DG_SC;
+    snprintf(l, sizeof l, "DROP N %u LAST %uMS MAX %uMS", dg.taps[B_DROP], dg.hold_last[B_DROP], dg.hold_max[B_DROP]); dg_text(px, stride, x0, y, l); y += 9 * DG_SC;
+    snprintf(l, sizeof l, "TOOL 1 FINGER 2 PEN 3 MOUSE"); dg_text(px, stride, x0, y, l);
+}
+
+static void diag_second(uint64_t now) {
+    if (now - dg.sec_at < 1000) return;
+    dg.sec_at = now;
+    dg.ticks_s = dg.ticks; dg.frames_s = dg.frames; dg.tick_max_s = dg.tick_max;
+    dg.ticks = dg.frames = dg.tick_max = 0;
+    dirty = 1;
+}
+#endif
+
 /* ------------------------------------------------------------------ rendering */
 static ANativeWindow *window;
 
@@ -351,7 +467,15 @@ static uint32_t last_frame[GW * GH];
 static void present(void) {
     const uint32_t *src = rg_pixels();
     build_mask();
-    if (memcmp(last_frame, src, sizeof last_frame) != 0) { memcpy(last_frame, src, sizeof last_frame); dirty = 1; }
+    static uint64_t forced_at;                /* repaint at least once a second, whatever changed */
+    if (mono_ms() - forced_at > 1000) { forced_at = mono_ms(); dirty = 1; }
+    if (memcmp(last_frame, src, sizeof last_frame) != 0) {
+        memcpy(last_frame, src, sizeof last_frame);
+        dirty = 1;
+#ifdef RG_DIAG
+        dg.frames++;
+#endif
+    }
     if (!dirty || !window) return;
     ANativeWindow_Buffer buf;
     if (ANativeWindow_lock(window, &buf, NULL) != 0) return;
@@ -359,8 +483,6 @@ static void present(void) {
     uint32_t *px = (uint32_t *)buf.bits;
     for (int y = 0; y < BH; y++) {
         uint32_t *row = px + (size_t)y * buf.stride;
-        memset(row, 0, (size_t)game_x * 4);
-        memset(row + game_x + GW * SCALE, 0, (size_t)(bw - game_x - GW * SCALE) * 4);
         const uint32_t *s = last_frame + (y / SCALE) * GW;
         uint32_t *d = row + game_x;
         for (int x = 0; x < GW; x++) {
@@ -369,8 +491,14 @@ static void present(void) {
             d[2 * x] = v;
             d[2 * x + 1] = v;
         }
+        /* side bars: extend each row's edge pixel outward so the scene's background fills the screen */
+        for (int x = 0; x < game_x; x++) row[x] = d[0];
+        for (int x = game_x + GW * SCALE; x < bw; x++) row[x] = d[GW * SCALE - 1];
     }
     composite_controls(px, buf.stride);
+#ifdef RG_DIAG
+    diag_draw(px, buf.stride);
+#endif
     ANativeWindow_unlockAndPost(window);
     /* Android may hand back an older buffer next time (double buffering): draw two frames */
     static int again;
@@ -424,6 +552,26 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
         int idx = (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
         int ww = ANativeWindow_getWidth(window), wh = ANativeWindow_getHeight(window);
         size_t n = AMotionEvent_getPointerCount(ev);
+#ifdef RG_DIAG
+        {
+            float dx = AMotionEvent_getX(ev, 0) * bw / ww, dy = AMotionEvent_getY(ev, 0) * BH / wh;
+            dg.events++;
+            dg.act = masked;
+            dg.tool = AMotionEvent_getToolType(ev, 0);
+            dg.x = dx; dg.y = dy;
+            if (masked == AMOTION_EVENT_ACTION_HOVER_ENTER || masked == AMOTION_EVENT_ACTION_HOVER_MOVE ||
+                masked == AMOTION_EVENT_ACTION_HOVER_EXIT) dg.hovers++;
+            if (masked == AMOTION_EVENT_ACTION_CANCEL) dg.cancels++;
+            if (masked == AMOTION_EVENT_ACTION_DOWN && dg.show && dx >= dg_x() && dx < dg_x() + dg_w() && dy < 8 + dg_h() && hit(dx, dy) < 0) {
+                dg.show = 0;                       /* tap the overlay to hide it; tap its corner to bring it back */
+            } else if (masked == AMOTION_EVENT_ACTION_DOWN && !dg.show && dx < game_x + 120 && dy < 120 && hit(dx, dy) < 0) {
+                dg.show = 1;
+            }
+            if (masked != AMOTION_EVENT_ACTION_MOVE && masked != AMOTION_EVENT_ACTION_HOVER_MOVE)
+                host_log("diag: act=%d tool=%d x=%d y=%d btn=%d n=%d", masked, dg.tool, (int)dx, (int)dy, hit(dx, dy), (int)n);
+            dirty = 1;
+        }
+#endif
         for (size_t i = 0; i < n; i++) {
             int id = AMotionEvent_getPointerId(ev, i) & 15;
             float x = AMotionEvent_getX(ev, i) * bw / ww, y = AMotionEvent_getY(ev, i) * BH / wh;
@@ -439,6 +587,9 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
                 if (b >= 0) press(b, 1);
             }
         }
+#ifdef RG_DIAG
+        dg.last_btn = pointer_button[AMotionEvent_getPointerId(ev, 0) & 15];
+#endif
         return 1;
     }
     return 0;
@@ -535,6 +686,11 @@ void android_main(struct android_app *app) {
             if (drop_pending && t0 >= drop_release_at) drop_release();
             if (!rg_tick()) { ANativeActivity_finish(app->activity); }
             uint64_t t1 = mono_ms();
+#ifdef RG_DIAG
+            dg.ticks++;
+            if (t1 - t0 > dg.tick_max) dg.tick_max = (unsigned)(t1 - t0);
+            diag_second(t1);
+#endif
             audio_pump();
             if (!controls_visible && mono_ms() - last_pad_input > 30000) controls_visible = 1;
             present();
