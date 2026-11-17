@@ -39,6 +39,8 @@ MULTIPLAYER (2-4 players, LAN or one PC)
      number of players including the host (default 2).
   4. The others choose Quick Match and pick a hero; when enough players have
      joined, the match starts. The host plays too: their game is the server.
+  After a match the host presses F5 again (the title bar says so) and the
+  others choose Play Again.
   To try it alone on one PC, start the .exe several times (the second one
   can use: ResetGeneration-Revived.exe --nickname=Bob).
 

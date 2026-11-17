@@ -24,6 +24,7 @@ final class HostServer {
 
     static native boolean install();
     static native boolean menuReady();
+    static native boolean serving();
     static native int players();
     static native boolean host(String url, String room, int players);
     static native void pump();
@@ -115,6 +116,12 @@ final class HostServer {
             }
         }
         pump();
+        if (hosting && !serving()) {      // match over, or the host screen was left
+            hosting = false;
+            shownPlayers = -1;
+            System.out.println("HostServer: hosted game over");
+            Revived.setStatus("F5 = host a new game");
+        }
         if (hosting) {
             int n = players();
             if (n != shownPlayers) {

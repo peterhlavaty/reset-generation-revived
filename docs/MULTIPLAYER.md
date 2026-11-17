@@ -5,7 +5,7 @@ Status (2026-11-17):
 | Piece | State |
 |---|---|
 | **Hosted games (Windows build)** | **Works, 2–4 players** — F5 makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. See "Hosted games" |
-| Relay server (`server/`, Node + Cloudflare Worker) | **Done**, 18 tests (`npm test`) |
+| Relay server (`server/`, Node + Cloudflare Worker) | **Done**, 19 tests (`npm test`) |
 | Client: Windows (Java replacement for `SNAPMobileClient`) | **Done** — logs in to the relay with a nickname, no Arena login screen |
 | Client: native/Android (`native/rt/net.c`) | **Done** (plain `ws://` only) |
 | Casino system (login, casino enter, Quick Match queue, lock, matched-up) | **Done** — both players listed in "Players in Match", "Game starting…" |
@@ -33,19 +33,33 @@ in the real engine DLL what `native/rt/server.c` does for the recompiled one:
 
 Relay side: `serve` with `players` registers a hosted game with the casino; `matchmake()` fills
 hosted games first (once enough players are queued), and the node server's `--match-size`
-defaults to 0, so Quick Match never forms `QM_n` rooms that have no game server. After a match the
-host can press F5 again (new room name). The Java clients need no change.
+defaults to 0, so Quick Match never forms `QM_n` rooms that have no game server. When the host's
+engine closes the listener (match over, or the host left the host screen) rghost sends
+`{"t":"unserve"}`, so no one is matched into a dead room, and the title says "F5 = host a new
+game" (`host=auto` re-hosts by itself). Once a game server serves a room, the game room stops
+sending EVENT SEAT_LEAVE (the match reports leavers itself): a client still on its win screen that
+got it stayed on a black screen. The Java clients need no change.
+
+Engine bug fix (rghost.dll, applied in every instance, host or client): `PlaceTileUIState::enter`
+(`0x100b2c20`) sets the state's tile-layer grid (`this+0x84 = this->layer(2)`) only for players
+still in the game, but `update` (`0x100b5df0` -> `0x100b5290`) copies board snapshots into it for
+everyone. A player who had surrendered (player state 5) therefore wrote through an uninitialised
+pointer: a crash at `0x100b5311`/`0x100b5325` or a silently corrupted heap (black screen), seen
+for the last player to surrender in 3-4 player games. Both early exits of `enter` now set the grid
+first (a 26-byte signature check guards the patch).
 
 Verified on one PC with the real Windows build (`tools/lan_test.sh 2|3|4`): 2-, 3- and 4-player
 matches start; boards, items, heroes and health stay identical on all screens over many rounds;
-a client quitting mid-match leaves the host running. Not yet verified: a complete match up to the
-win screen and back to the casino. Known limits: the host cannot choose a hero; if the host quits
-the match ends for everyone; Android clients should work through the same relay but were not tested.
+a client quitting mid-match leaves the host running; when the players surrender one by one every
+client reaches the win screen, Battle Stats and the casino (2, 3 and 4 players, any order); the
+host then hosts again and "Play Again" starts the next match. Known limits: the host cannot choose
+a hero and has no name in the stats; if the host quits the match ends for everyone; Android
+clients should work through the same relay but were not tested.
 
 Test aids (Windows build): `--keys=T:KEY,...` presses keys T ms after start (`ESC`, `RETURN`,
 `UP`/`DOWN`/`LEFT`/`RIGHT`, `SPACE`, `F5`, or a hex VK), `--window_x=`/`--window_y=`,
-`--nickname=`, `--host=auto`, `--host_players=N`; `RT_NET_DEBUG=1` logs every 0x16 message in
-rghost (stderr).
+`--nickname=`, `--host=auto`, `--host_players=N`, `--dll_patch=false` (pristine engine DLL);
+`RT_NET_DEBUG=1` logs every 0x16 message in rghost (stderr).
 
 ## How online worked in 2008–2010
 

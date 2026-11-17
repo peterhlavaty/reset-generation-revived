@@ -302,7 +302,9 @@ public class Revived extends StandaloneClient {
         if (configFile != null) {
             File gameDir = new File(configFile.getParentFile(), "ResetGeneration");
             PakPatcher.ensureAll(gameDir, renderWidth, renderHeight);
-            DllPatcher.ensure(gameDir, renderWidth, renderHeight);
+            if (!opt("dll_patch", "true").equalsIgnoreCase("false")) {   // test aid: pristine engine
+                DllPatcher.ensure(gameDir, renderWidth, renderHeight);
+            }
         }
         ResetGeneration.SCREEN_W = renderWidth;
         ResetGeneration.SCREEN_H = renderHeight;

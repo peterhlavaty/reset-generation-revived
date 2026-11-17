@@ -68,3 +68,19 @@ test('a hosted game takes the next Quick Match players; without one nobody is ma
   host.onClose();                                                 // host quits: its offer is withdrawn
   assert.deepEqual(casino.hosted, []);
 });
+
+test('no SEAT_LEAVE events to the others once a game server serves the room', () => {
+  const { room, sent } = setup();
+  const a = { name: 'A' }, b = { name: 'B' };
+  room.join(a);
+  room.join(b);
+  room.packet(a, frame(CH_TABLE, new Writer().u8(0).u8(13).u32(7).bytes()));
+  room.packet(b, frame(CH_TABLE, new Writer().u8(0).u8(13).u32(8).bytes()));
+  sent.length = 0;
+  room.packet(a, frame(CH_TABLE, new Writer().u8(0).u8(14).u32(7).bytes()));   // REQUEST SEAT_LEAVE
+  assert.deepEqual(sent.filter(([c]) => c === b), []);                          // B is not told
+  assert.equal(sent.filter(([c]) => c === a).length, 1);                        // A gets its RESPONSE
+  room.leave(a);
+  assert.deepEqual(sent.filter(([c]) => c === b), []);
+  room.close();
+});

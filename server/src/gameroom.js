@@ -121,7 +121,7 @@ export class GameRoom {
     const p = this.players.get(client);
     this.players.delete(client);
     if (p?.announced) this.server?.ctl({ t: 'player_left', pid: p.sid });
-    if (p?.seat) this.event(SEAT_LEAVE, p.pid);
+    if (p?.seat) this.seatLeft(p.pid);
     if (!this.players.size) this.close();
   }
 
@@ -151,6 +151,7 @@ export class GameRoom {
 
   /** The game server process serves this room (see Relay.serve). */
   attachServer(link) {
+    this.served = true;
     this.server = link;
     for (const [c, p] of this.players) this.announce(c, p);
   }
@@ -225,7 +226,7 @@ export class GameRoom {
       case SEAT_LEAVE:
         p.seat = null;
         this.respond(client, action, 0, Number(pid));
-        this.event(SEAT_LEAVE, pid);
+        this.seatLeft(pid);
         break;
       default:
         this.respond(client, action, 0, 0);
@@ -238,6 +239,17 @@ export class GameRoom {
 
   sendEvent(client, action, pid) {
     this.send(client, frame(CH_TABLE, new Writer().u8(EVENT).u8(action).str(String(pid)).bytes()));
+  }
+
+  /**
+   * A player left its seat. With a game server the match reports leavers itself; an EVENT
+   * SEAT_LEAVE reaching a client that is still on its win screen leaves that client on a black
+   * screen (it never gets to Battle Stats or back to the casino), so the event is only sent while
+   * no game server serves the room (the "Players in Match" lobby).
+   */
+  seatLeft(pid) {
+    if (this.served) return;
+    this.event(SEAT_LEAVE, pid);
   }
 
   /** Tells every greeted player about a seat change. */

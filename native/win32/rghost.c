@@ -58,6 +58,7 @@ static CRITICAL_SECTION lock, send_lock;
 static ev *ev_head, *ev_tail;
 static SOCKET ws = INVALID_SOCKET;
 static volatile int ws_up;
+static volatile int serving;             /* host() until the engine closes our listener (l_close) */
 static char url[256], room[72];
 static int remote_players;
 
@@ -205,8 +206,10 @@ static int ws_connect(void) {
     char json[300];
     snprintf(json, sizeof json, "{\"t\":\"hello\",\"v\":1,\"name\":\"RGHost\"}");
     ws_send(1, json, strlen(json));
-    snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d}", room, remote_players);
-    ws_send(1, json, strlen(json));
+    if (serving) {
+        snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d}", room, remote_players);
+        ws_send(1, json, strlen(json));
+    }
     lg("hosting room %s on %s for %d remote player(s)", room, url, remote_players);
     return 1;
 }
@@ -271,7 +274,16 @@ static void *TC l_accept(void *t) {
     }
     return NULL;
 }
-static void TC l_close(void *t) { (void)t; }
+/* The engine's game server is gone (match over, or the host left the host screen): the relay
+ * must stop sending Quick Match players to this room. */
+static void TC l_close(void *t) {
+    (void)t;
+    lg("listener closed");
+    serving = 0;
+    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used) sess[i].closed = 1;   /* that game's players */
+    if (ws_up) ws_send(1, "{\"t\":\"unserve\"}", 15);
+}
+static void *TC c_dtor(void *t, uint32_t flags) { sess_t *s = sess_of(t); lg("conn of player %d destroyed", s ? s->pid : -1); return t; }
 
 /* conn.address(): callers only print it (string object at +0xc -> header -> char* at +0xc) */
 static int TC addr_nop(void *t, uint32_t a) { (void)t; (void)a; return 0; }
@@ -288,7 +300,10 @@ static void *TC c_address(void *t) {
 }
 static int TC c_state(void *t) { (void)t; return 3; }
 static int TC c_alive(void *t) { sess_t *s = sess_of(t); return s && !s->closed; }
-static void TC c_close(void *t) { sess_t *s = sess_of(t); if (s) s->closed = 1; }
+static void TC c_close(void *t) {
+    sess_t *s = sess_of(t);
+    if (s) { lg("engine closes the connection of player %d", s->pid); s->closed = 1; }
+}
 static int TC c_send(void *t, uint32_t ch, const uint8_t *ptr, uint32_t len) {
     sess_t *s = sess_of(t);
     if (s && ch == CH_GAME && len <= 1u << 20) {
@@ -348,17 +363,52 @@ static int hook_menu_ctor(void) {
     return 1;
 }
 
+/* Engine bug fix (all instances, not only hosts). PlaceTileUIState::enter (0x100b2c20) sets the
+ * state's tile-layer grid (this+0x84 = this->layer(2), 0x1008cbc0) only for a player that is
+ * still in the game; for one that has surrendered or been knocked out (player state 5) it returns
+ * early and leaves +0x84 uninitialised, yet update (0x100b5df0 -> 0x100b5290) still copies board
+ * snapshots into it. Depending on the stale heap value that crashes (access violation at
+ * 0x100b5311/0x100b5325) or silently corrupts the heap (black screen later), typically for the
+ * last player to surrender in a 3-4 player match. Both early exits now set +0x84 first. */
+static int fix_place_tile_enter(void) {
+    uint32_t site = A(0x100b2c66), done = A(0x100b2e37);
+    static const uint8_t expect[26] = {0x83, 0xf8, 0x05, 0x0f, 0x84, 0xc8, 0x01, 0x00, 0x00,   /* cmp eax,5; je done */
+                                       0x8b, 0x4e, 0x10, 0x8b, 0x51, 0x2c, 0x8b, 0x0c, 0x82,
+                                       0x85, 0xc9, 0x0f, 0x84, 0xb7, 0x01, 0x00, 0x00};      /* test ecx,ecx; je done */
+    if (memcmp((void *)(uintptr_t)site, expect, sizeof expect) != 0) { lg("PlaceTileUIState bytes differ; fix not applied"); return 0; }
+    uint8_t *t = (uint8_t *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return 0;
+    uint8_t *q = t;
+    uint32_t layer = A(0x1008cbc0);
+    *q++ = 0x50;                                                    /* push eax */
+    *q++ = 0x6a; *q++ = 0x02;                                       /* push 2 */
+    *q++ = 0x89; *q++ = 0xf1;                                       /* mov ecx, esi */
+    *q++ = 0xb8; memcpy(q, &layer, 4); q += 4;                      /* mov eax, layer */
+    *q++ = 0xff; *q++ = 0xd0;                                       /* call eax (thiscall, ret 4) */
+    *q++ = 0x89; *q++ = 0x86; *q++ = 0x84; *q++ = 0; *q++ = 0; *q++ = 0;   /* mov [esi+0x84], eax */
+    *q++ = 0x58;                                                    /* pop eax */
+    *q++ = 0x68; memcpy(q, &done, 4); q += 4;                       /* push done */
+    *q++ = 0xc3;                                                    /* ret */
+    FlushInstructionCache(GetCurrentProcess(), t, (size_t)(q - t));
+    int32_t r1 = (int32_t)((uint32_t)(uintptr_t)t - (site + 9));   /* je at site+3 */
+    int32_t r2 = (int32_t)((uint32_t)(uintptr_t)t - (site + 26));  /* je at site+20 */
+    patch(site + 5, &r1, 4);
+    patch(site + 22, &r2, 4);
+    return 1;
+}
+
 static int installed;
 static int install(void) {
     if (installed) return installed > 0;
     HMODULE m = GetModuleHandleA("ResetGeneration-Win32-Web.dll");
     if (!m) { lg("engine DLL not loaded"); installed = -1; return 0; }
     delta = (uint32_t)(uintptr_t)m - IMAGE_BASE;
+    if (fix_place_tile_enter()) lg("engine fix: PlaceTileUIState layer for players out of the game");
     for (int i = 0; i < 40; i++) listener_vt[i] = conn_vt[i] = addr_vt[i] = bad_slots[i];
     listener_vt[0] = (void *)any_dtor;
     listener_vt[0x4c / 4] = (void *)l_accept;
     listener_vt[0x5c / 4] = (void *)l_close;
-    conn_vt[0] = (void *)any_dtor;
+    conn_vt[0] = (void *)c_dtor;
     conn_vt[0x14 / 4] = (void *)c_address;
     conn_vt[0x18 / 4] = (void *)c_state;
     conn_vt[0x2c / 4] = (void *)c_alive;
@@ -425,6 +475,8 @@ JNIEXPORT jint JNICALL Java_rg_HostServer_players(JNIEnv *env, jclass c) {
     return n;
 }
 
+JNIEXPORT jboolean JNICALL Java_rg_HostServer_serving(JNIEnv *env, jclass c) { (void)env; (void)c; return serving != 0; }
+
 JNIEXPORT jboolean JNICALL Java_rg_HostServer_menuReady(JNIEnv *env, jclass c) { (void)env; (void)c; return menu_base != 0; }
 
 JNIEXPORT jboolean JNICALL Java_rg_HostServer_host(JNIEnv *env, jclass c, jstring jurl, jstring jroom, jint players) {
@@ -447,6 +499,7 @@ JNIEXPORT jboolean JNICALL Java_rg_HostServer_host(JNIEnv *env, jclass c, jstrin
         lg("hosting room %s again", room);
     }
     hosting = 1;
+    serving = 1;
     return JNI_TRUE;
 }
 

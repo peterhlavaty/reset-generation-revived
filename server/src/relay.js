@@ -93,6 +93,7 @@ export class Relay {
       case 'move': return this.enter(c, m.room, 'move');
       case 'leave': return this.leave(c, 'left');
       case 'serve': return this.serve(c, m.room, m.players);
+      case 'unserve': return c.serves ? this.unserve(c) : undefined;
       case 'rooms': return c.ctl({ t: 'rooms', rooms: this.roomList() });
       default: return c.ctl({ t: 'error', op: m.t, code: 'unknown_type' });
     }
