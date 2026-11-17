@@ -204,7 +204,7 @@ export class Casino {
       this.startMatch(this.queue.splice(0, h.players), h.room);
     }
     if (this.hosted.length) return;    // players wait for the hosted game
-    while (this.queue.length >= this.matchSize) {
+    while (this.matchSize > 0 && this.queue.length >= this.matchSize) {
       this.startMatch(this.queue.splice(0, this.matchSize), `QM_${this.nextTable++}`);
     }
   }

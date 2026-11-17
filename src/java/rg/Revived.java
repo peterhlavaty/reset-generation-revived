@@ -54,8 +54,23 @@ public class Revived extends StandaloneClient {
     private boolean fullscreen = false;
     private Rectangle windowedBounds = null;
 
+    static Revived instance;
+
+    /** Shown in the window title (e.g. the hosting state). */
+    static void setStatus(final String status) {
+        SwingUtilities.invokeLater(new Runnable() {
+            @Override
+            public void run() {
+                if (instance != null) {
+                    instance.setTitle("Reset Generation" + (status == null || status.isEmpty() ? "" : " - " + status));
+                }
+            }
+        });
+    }
+
     Revived(String title) {
         super(title);
+        instance = this;
         try {
             java.net.URL icon = Revived.class.getResource("/revived/icon.png");
             if (icon != null) {

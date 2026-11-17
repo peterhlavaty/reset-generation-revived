@@ -171,6 +171,7 @@ export class Relay {
     const key = roomName.toLowerCase();
     if (c.room) this.leave(c, 'left');
     if (this.servers.has(key) && this.servers.get(key) !== c) return c.ctl({ t: 'error', op: 'serve', room: roomName, code: 'taken' });
+    if (c.serves && c.serves !== key) this.unserve(c);      // a host's next game
     this.servers.set(key, c);
     c.serves = key;
     this.log(`${c.name} serves ${roomName}`);

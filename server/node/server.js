@@ -12,7 +12,10 @@ const PORT = Number(arg('port', process.env.PORT ?? 8787));
 const HOST = arg('host', process.env.HOST ?? '0.0.0.0');
 const IDLE_MS = 60_000;      // clients ping every 15 s
 const quiet = process.argv.includes('--quiet');
-const MATCH_SIZE = Number(arg('match-size', process.env.MATCH_SIZE ?? 2));   // players per Quick Match (1 for testing)
+// Players per automatic Quick Match room. 0 (default): Quick Match only fills games hosted by a
+// player (F5 in the Windows build; the host's engine is the game server). N > 0: also form QM_n
+// rooms of N players, which need a separate game server (rgtest --server, docs/MULTIPLAYER.md).
+const MATCH_SIZE = Number(arg('match-size', process.env.MATCH_SIZE ?? 0));
 
 const relay = new Relay({
   log: quiet ? () => {} : (s) => console.log(new Date().toISOString(), s),

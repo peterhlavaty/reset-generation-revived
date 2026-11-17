@@ -22,7 +22,7 @@
 #include <windows.h>
 
 #define TC __attribute__((thiscall))
-#define MAX_SESS 8
+#define MAX_SESS 64                /* slots are never reused: old connections may still be polled */
 #define CH_GAME 0x16
 #define IMAGE_BASE 0x10000000u
 
@@ -216,8 +216,9 @@ typedef struct { int used, pid, accepted, closed; uint8_t *obj; ev *in_head, *in
 static sess_t sess[MAX_SESS];
 
 static sess_t *by_pid(int pid) {
-    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used && sess[i].pid == pid) return &sess[i];
-    return NULL;
+    sess_t *r = NULL;     /* the newest session with this pid */
+    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used && sess[i].pid == pid) r = &sess[i];
+    return r;
 }
 static sess_t *sess_of(void *obj) { uint32_t i = ((uint32_t *)obj)[1]; return i < MAX_SESS ? &sess[i] : NULL; }
 
@@ -365,9 +366,7 @@ static int install(void) {
     conn_vt[0x68 / 4] = (void *)c_send;
     conn_vt[0x7c / 4] = (void *)c_recv;
     addr_vt[0x14 / 4] = (void *)addr_nop;
-    uint32_t slot = A(0x10188b68), fn = (uint32_t)(uintptr_t)acc_set_controller;
-    if (LD32(slot) != A(0x100df500)) { lg("acceptor vtable differs; not installed"); installed = -1; return 0; }
-    patch(slot, &fn, 4);
+    if (LD32(A(0x10188b68)) != A(0x100df500)) { lg("acceptor vtable differs; not installed"); installed = -1; return 0; }
     if (!hook_menu_ctor()) { installed = -1; return 0; }
     lg("installed (engine base %08x)", A(IMAGE_BASE));
     installed = 1;
@@ -378,6 +377,9 @@ static int install(void) {
  * length selects the mission and the player count) and make it the current screen. */
 static int host_game(int players) {
     if (!menu_base) { lg("menu not ready yet"); return 0; }
+    /* the acceptor's setController (vtable slot 1) -> our listener; only the LAN host screen uses it */
+    static int acc_patched;
+    if (!acc_patched) { uint32_t fn = (uint32_t)(uintptr_t)acc_set_controller; patch(A(0x10188b68), &fn, 4); acc_patched = 1; }
     uint32_t ctx = LD32(menu_base + 0x10);
     void *list = eng_new(0xc);
     for (int i = 0; i < players; i++) {
@@ -396,6 +398,12 @@ static int host_game(int players) {
 static int hosting;
 static DWORD last_ping, retry;
 
+/* A match is running while a remote player's connection is alive. */
+static int match_live(void) {
+    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used && sess[i].accepted && !sess[i].closed) return 1;
+    return 0;
+}
+
 JNIEXPORT jboolean JNICALL Java_rg_HostServer_install(JNIEnv *env, jclass c) {
     (void)env; (void)c;
     static int once;
@@ -409,11 +417,19 @@ JNIEXPORT jboolean JNICALL Java_rg_HostServer_install(JNIEnv *env, jclass c) {
     return (jboolean)install();
 }
 
+/* remote players connected to the current game */
+JNIEXPORT jint JNICALL Java_rg_HostServer_players(JNIEnv *env, jclass c) {
+    (void)env; (void)c;
+    int n = 0;
+    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used && !sess[i].closed) n++;
+    return n;
+}
+
 JNIEXPORT jboolean JNICALL Java_rg_HostServer_menuReady(JNIEnv *env, jclass c) { (void)env; (void)c; return menu_base != 0; }
 
 JNIEXPORT jboolean JNICALL Java_rg_HostServer_host(JNIEnv *env, jclass c, jstring jurl, jstring jroom, jint players) {
     (void)c;
-    if (hosting || installed <= 0) return JNI_FALSE;
+    if (installed <= 0 || match_live()) return JNI_FALSE;
     const char *u = (*env)->GetStringUTFChars(env, jurl, NULL), *r = (*env)->GetStringUTFChars(env, jroom, NULL);
     snprintf(url, sizeof url, "%s", u);
     snprintf(room, sizeof room, "%s", r);
@@ -422,7 +438,14 @@ JNIEXPORT jboolean JNICALL Java_rg_HostServer_host(JNIEnv *env, jclass c, jstrin
     if (players < 2) players = 2;
     if (players > 4) players = 4;
     remote_players = players - 1;
+    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used) sess[i].closed = 1;    /* a previous game's players */
     if (!host_game(players)) return JNI_FALSE;
+    if (hosting && ws_up) {      /* hosting again: offer the room on the open relay connection */
+        char json[300];
+        snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d}", room, remote_players);
+        ws_send(1, json, strlen(json));
+        lg("hosting room %s again", room);
+    }
     hosting = 1;
     return JNI_TRUE;
 }
@@ -437,6 +460,7 @@ JNIEXPORT void JNICALL Java_rg_HostServer_pump(JNIEnv *env, jclass c) {
     while ((e = pop_ev())) {
         sess_t *s = by_pid(e->pid);
         if (e->kind == EV_JOIN) {
+            if (s && s->closed) s = NULL;      /* the same relay pid in a new game */
             if (!s) {
                 for (int i = 0; i < MAX_SESS && !s; i++) if (!sess[i].used) s = &sess[i];
                 if (s) { memset(s, 0, sizeof *s); s->used = 1; s->pid = e->pid; lg("player %d joined", e->pid); }

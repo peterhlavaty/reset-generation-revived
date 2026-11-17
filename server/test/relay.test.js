@@ -13,7 +13,7 @@ before(async () => {
   if (url) return;
   const port = 20000 + Math.floor(Math.random() * 20000);
   const script = fileURLToPath(new URL('../node/server.js', import.meta.url));
-  proc = spawn(process.execPath, [script, '--port', String(port), '--host', '127.0.0.1', '--quiet'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  proc = spawn(process.execPath, [script, '--port', String(port), '--host', '127.0.0.1', '--quiet', '--match-size', '2'], { stdio: ['ignore', 'pipe', 'inherit'] });
   await new Promise((resolve) => proc.stdout.on('data', (d) => { if (String(d).includes('listening')) resolve(); }));
   url = `ws://127.0.0.1:${port}/ws`;
 });

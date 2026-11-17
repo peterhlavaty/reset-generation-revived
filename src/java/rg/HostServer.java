@@ -19,10 +19,12 @@ final class HostServer {
     private static boolean loaded, installed, hosting;
     private static volatile boolean requested;
     private static long start;
+    private static int games, wanted, shownPlayers = -1;
     private static final List<long[]> keys = new ArrayList<long[]>();
 
     static native boolean install();
     static native boolean menuReady();
+    static native int players();
     static native boolean host(String url, String room, int players);
     static native void pump();
 
@@ -98,14 +100,27 @@ final class HostServer {
         }
         if (!installed) return;
         boolean auto = Revived.opt("host", "").equalsIgnoreCase("auto") && t > 15000;
-        if (!hosting && (requested || auto) && menuReady()) {
+        if ((requested || (auto && !hosting)) && menuReady()) {
             requested = false;
             int players = Math.max(2, Math.min(4, Revived.optInt("host_players", 2)));
             String nick = com.redlynx.mt.snapmobile.SNAPMobileClient.nickname;
-            String room = "HOST_" + (nick == null ? "game" : nick);
-            hosting = host(com.redlynx.mt.snapmobile.SNAPMobileClient.relayUrl, room, players);
-            System.out.println("HostServer: hosting " + room + " for " + players + " players: " + hosting);
+            String room = "HOST_" + (nick == null ? "game" : nick) + "_" + (++games);
+            if (host(com.redlynx.mt.snapmobile.SNAPMobileClient.relayUrl, room, players)) {
+                hosting = true;
+                wanted = players - 1;
+                shownPlayers = -1;
+                System.out.println("HostServer: hosting " + room + " for " + players + " players");
+            } else {
+                System.out.println("HostServer: cannot host now (a hosted match is running?)");
+            }
         }
         pump();
+        if (hosting) {
+            int n = players();
+            if (n != shownPlayers) {
+                shownPlayers = n;
+                Revived.setStatus(n < wanted ? "hosting, waiting for players " + n + "/" + wanted + " (others: Quick Match)" : "hosting");
+            }
+        }
     }
 }

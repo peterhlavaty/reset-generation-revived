@@ -45,3 +45,26 @@ test('the server hears about a player once it is seated; messages are routed bot
   assert.deepEqual(ctl[1], { t: 'player_left', pid: 1 });
   room.close();
 });
+
+test('a hosted game takes the next Quick Match players; without one nobody is matched', async () => {
+  const { Relay } = await import('../src/relay.js');
+  const relay = new Relay({ matchSize: 0 });
+  const casino = relay.rooms.get('casinosystem').bot;
+  const started = [];
+  casino.startMatch = (group, room) => started.push([group.map((q) => q.client.name), room]);
+  const q = (name) => casino.queue.push({ client: { name }, ch: 0x12 });
+  q('Bob');
+  casino.matchmake();
+  assert.deepEqual(started, []);                                  // no host yet: Bob waits
+  const host = relay.connect(() => {}, () => {});
+  host.onText(JSON.stringify({ t: 'hello', v: 1, name: 'RGHost' }));
+  host.onText(JSON.stringify({ t: 'serve', room: 'HOST_Ann', players: 2 }));
+  assert.deepEqual(started, []);                                  // needs two players
+  q('Cid');
+  casino.matchmake();
+  assert.deepEqual(started, [[['Bob', 'Cid'], 'HOST_Ann']]);
+  assert.deepEqual(casino.hosted, []);
+  host.onText(JSON.stringify({ t: 'serve', room: 'HOST_Ann2', players: 1 }));
+  host.onClose();                                                 // host quits: its offer is withdrawn
+  assert.deepEqual(casino.hosted, []);
+});

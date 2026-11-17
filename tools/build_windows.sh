@@ -47,6 +47,9 @@ for f in "$G"/ResetGeneration/*; do
   esac
 done
 cp "$R/src/dist/revived.ini" "$OUT/$APP/app/revived.ini"
+# 6. rghost.dll: "host a game" (F5) support, 32-bit like the engine (llvm-mingw, i686 target).
+CC32=${CC32:-$(ls -d /c/dev/toolchains/llvm-mingw-*-ucrt-x86_64 | tail -1)/bin/i686-w64-mingw32-clang}
+"$CC32" -O2 -Wall -Wno-ignored-attributes -shared -static -I"$JDK/include" -I"$JDK/include/win32"   "$R/native/win32/rghost.c" -o "$OUT/$APP/app/rghost.dll" -lws2_32 -Wl,--kill-at
 cp "$R/src/dist/README.txt" "$OUT/$APP/README.txt"
 echo "Built $OUT/$APP"
 du -sh "$OUT/$APP"
