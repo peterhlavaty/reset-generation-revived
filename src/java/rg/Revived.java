@@ -90,6 +90,9 @@ public class Revived extends StandaloneClient {
         this.setMinimumSize(new Dimension(320, 200));
         this.pack();
         this.setLocationRelativeTo(null);
+        if (!opt("window_x", "").isEmpty()) {
+            this.setLocation(optInt("window_x", 0), optInt("window_y", 0));
+        }
         if (startMaximized) {
             this.setExtendedState(JFrame.MAXIMIZED_BOTH);
         }

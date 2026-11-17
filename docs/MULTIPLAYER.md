@@ -1,16 +1,51 @@
 # Multiplayer: our own server for Quick Match / Online
 
-Status (2026-10-17):
+Status (2026-11-17):
 
 | Piece | State |
 |---|---|
-| Relay server (`server/`, Node + Cloudflare Worker) | **Done**, 15 tests (`npm test`) |
+| **Hosted games (Windows build)** | **Works, 2–4 players** — F5 makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. See "Hosted games" |
+| Relay server (`server/`, Node + Cloudflare Worker) | **Done**, 18 tests (`npm test`) |
 | Client: Windows (Java replacement for `SNAPMobileClient`) | **Done** — logs in to the relay with a nickname, no Arena login screen |
 | Client: native/Android (`native/rt/net.c`) | **Done** (plain `ws://` only) |
 | Casino system (login, casino enter, Quick Match queue, lock, matched-up) | **Done** — both players listed in "Players in Match", "Game starting…" |
 | Game room bot (`server/src/gameroom.js`: handshake, seating on 0x15, forwarding) | **Done** — both players seated in a shared room |
 | Game server (channel 0x16: world setup, then the match) | **Phase 0 works**: a headless second engine instance (`rgtest --server`) serves M1..M4 and the client shows the match screen; a crash in the first game event is open (see "Phase 0 result") |
 | Friendly arenas, rankings, statistics, achievements, friends | Answered with empty/OK replies so the client does not stall; not implemented |
+
+## Hosted games (Windows build) — working multiplayer
+
+The shortest path to a real match: no second engine instance and no recompiler. The original
+game had a **LAN host mode**: the host screen `0x100caa80` runs the server-mode controller and the
+host plays as local player 0; clients joined over `tcp://`, which this build lacks. `rghost.dll`
+(`native/win32/rghost.c`, a 32-bit JNI helper that `rg.HostServer` loads into the game's JVM) does
+in the real engine DLL what `native/rt/server.c` does for the recompiled one:
+
+* at start: hooks the menu flow constructor `0x1008f500` (inline `jmp` to a trampoline that
+  records `ECX`). The engine DLL is usually relocated, so every address is rebased;
+* on **F5** (or `host=auto`): patches the TCP acceptor's `setController` (vtable `0x10188b64`,
+  slot 1) to install a fake listener, builds the LAN host screen with a hero list of
+  `host_players` entries and makes it the current screen;
+* connects to the relay as `RGHost` and sends `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1}`.
+  Each `player_joined` becomes a connection object (`accept`); channel 0x16 travels as
+  `[u16 pid][zlib message]` exactly as in the Phase 0 design. `HostServer.pump()` runs on the
+  engine thread after every tick.
+
+Relay side: `serve` with `players` registers a hosted game with the casino; `matchmake()` fills
+hosted games first (once enough players are queued), and the node server's `--match-size`
+defaults to 0, so Quick Match never forms `QM_n` rooms that have no game server. After a match the
+host can press F5 again (new room name). The Java clients need no change.
+
+Verified on one PC with the real Windows build (`tools/lan_test.sh 2|3|4`): 2-, 3- and 4-player
+matches start; boards, items, heroes and health stay identical on all screens over many rounds;
+a client quitting mid-match leaves the host running. Not yet verified: a complete match up to the
+win screen and back to the casino. Known limits: the host cannot choose a hero; if the host quits
+the match ends for everyone; Android clients should work through the same relay but were not tested.
+
+Test aids (Windows build): `--keys=T:KEY,...` presses keys T ms after start (`ESC`, `RETURN`,
+`UP`/`DOWN`/`LEFT`/`RIGHT`, `SPACE`, `F5`, or a hex VK), `--window_x=`/`--window_y=`,
+`--nickname=`, `--host=auto`, `--host_players=N`; `RT_NET_DEBUG=1` logs every 0x16 message in
+rghost (stderr).
 
 ## How online worked in 2008–2010
 
@@ -105,7 +140,8 @@ currently answered with empty OK responses.
 ```bash
 cd server
 npm install
-npm start                       # ws://0.0.0.0:8787/ws   (--log-packets to hex-dump traffic)
+npm start                       # ws://0.0.0.0:8787/ws   (--log-packets to hex-dump traffic;
+                                #   --match-size N also forms QM_n rooms for rgtest --server)
 npm test
 npx wrangler login && npx wrangler deploy     # Cloudflare (Durable Object), wss://…workers.dev/ws
 ```

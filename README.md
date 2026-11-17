@@ -7,7 +7,7 @@ Windows in widescreen HD, to Android, and back online with our own server.
 |---|---|
 | Windows 10/11, widescreen HD, fullscreen | **Playable** — `tools/build_windows.sh` → `dist/ResetGeneration-Revived/ResetGeneration-Revived.exe` |
 | Android (phones, tablets, Chromebooks; touch + gamepad) | **Playable test build** — `tools/build_android.sh` → `dist/ResetGeneration-Revived-<version>.apk` (sideload) |
-| Multiplayer server | **Partly working** — login, casino and Quick Match matchmaking work; the match itself does not start yet |
+| Multiplayer (Windows, LAN or one PC, own relay) | **Playable** — one player hosts with F5 (their engine is the game server), the others join with Quick Match; 2–4 players. Android: matchmaking only |
 
 ## Start here
 
@@ -27,6 +27,7 @@ src/assets/, src/dist/           icon, default revived.ini, player README
 native/rt/                       runtime for the recompiled engine: memory, Win32 + JNI shims, engine API, net client
 native/android/                  Android NativeActivity host (touch controls, gamepad, audio), manifest, icons
 native/host/desktop/             rgtest: headless desktop test driver for the recompiled engine
+native/win32/                    rghost.dll: "host a game" for the Windows build (32-bit JNI helper)
 server/                          multiplayer relay + casino matchmaker (Node server and Cloudflare Worker)
 tools/                           build scripts, recompiler (tools/recomp), Ghidra export, extractors, test drivers
 tools/emu/                       the engine under Unicorn emulation (oracle for the recompiler)
@@ -42,10 +43,15 @@ tools/build_windows.sh            # Windows: 32-bit JDK 17 (see docs/WINDOWS_POR
 tools/ghidra_export.sh            # once: Ghidra analysis + P-code export of the engine DLL
 tools/build_android.sh            # Android APK: Android SDK/NDK (see docs/NATIVE_PORT.md)
 cd server && npm install && npm start    # multiplayer relay on ws://localhost:8787/ws
+tools/lan_test.sh 2                      # local demo from dist/: relay + host + clients (2-4 players)
 ```
 
+Multiplayer in short: run the relay, press **F5** in the main menu of one game (the host; player
+count = `host_players` in `revived.ini`), choose **Quick Match** in the others. Details:
+`docs/MULTIPLAYER.md`, "Hosted games".
+
 Toolchains are portable installs under `C:\dev\toolchains` (Temurin 17 x86 and 21 x64,
-Ghidra 12, llvm-mingw, Android SDK with NDK 29); native build outputs go to `C:\dev\rgbuild`
+Ghidra 12, llvm-mingw — also needed by the Windows build for `rghost.dll`, Android SDK with NDK 29); native build outputs go to `C:\dev\rgbuild`
 (outside OneDrive).
 
 ## Game files and decompiled code
