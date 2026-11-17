@@ -107,6 +107,12 @@ public class Revived extends StandaloneClient {
 
     /** Launcher-level hotkeys; returns true if the event was consumed. */
     boolean handleHotkey(KeyEvent e) {
+        if (e.getKeyCode() == KeyEvent.VK_F5) {
+            if (e.getID() == KeyEvent.KEY_PRESSED) {
+                HostServer.request();
+            }
+            return true;
+        }
         boolean toggle = e.getKeyCode() == KeyEvent.VK_F11
                 || (e.getKeyCode() == KeyEvent.VK_ENTER && e.isAltDown());
         if (!toggle) {

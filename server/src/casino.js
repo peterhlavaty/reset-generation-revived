@@ -126,6 +126,7 @@ export class Casino {
     this.locking = new Map();     // client -> match waiting for LOCK_PLAYER_IN_GAME answers
     this.nextTable = 1;
     this.matchSize = 2;
+    this.hosted = [];             // host players' games waiting for players: {room, players}
     this.pingSeq = 1;
     this.timer = null;
   }
@@ -175,6 +176,18 @@ export class Casino {
     }
   }
 
+  /** A host player's game (its engine is the game server) takes the next `players` players. */
+  addHosted(room, players) {
+    this.removeHosted(room.toLowerCase());
+    this.hosted.push({ room, players });
+    this.log(`casino: hosted game ${room} for ${players} player(s)`);
+    this.matchmake();
+  }
+
+  removeHosted(key) {
+    this.hosted = this.hosted.filter((h) => h.room.toLowerCase() !== key);
+  }
+
   /**
    * Forms a match once enough players are queued. The "Players in Match" screen is up while a
    * player waits; it lists the others named by EVENT CASINO_MATCHMAKING. A full group is
@@ -186,9 +199,18 @@ export class Casino {
    *   3. once all have answered (or after a timeout), EVENT CASINO_MATCHED_UP with the room.
    */
   matchmake() {
+    while (this.hosted.length && this.queue.length >= this.hosted[0].players) {
+      const h = this.hosted.shift();
+      this.startMatch(this.queue.splice(0, h.players), h.room);
+    }
+    if (this.hosted.length) return;    // players wait for the hosted game
     while (this.queue.length >= this.matchSize) {
-      const group = this.queue.splice(0, this.matchSize);
-      const room = `QM_${this.nextTable++}`;
+      this.startMatch(this.queue.splice(0, this.matchSize), `QM_${this.nextTable++}`);
+    }
+  }
+
+  startMatch(group, room) {
+    {
       this.log(`casino: matched ${group.map((q) => q.client.name).join(', ')} -> ${room}`);
       for (const q of group) {
         for (const o of group) {

@@ -92,7 +92,7 @@ export class Relay {
       case 'join': return this.enter(c, m.room, 'join');
       case 'move': return this.enter(c, m.room, 'move');
       case 'leave': return this.leave(c, 'left');
-      case 'serve': return this.serve(c, m.room);
+      case 'serve': return this.serve(c, m.room, m.players);
       case 'rooms': return c.ctl({ t: 'rooms', rooms: this.roomList() });
       default: return c.ctl({ t: 'error', op: m.t, code: 'unknown_type' });
     }
@@ -166,7 +166,7 @@ export class Relay {
    * matchmade room: it is not a player and is not seated. The room's bot routes the match
    * channel (0x16) between the players and it (docs/MULTIPLAYER.md).
    */
-  serve(c, roomName) {
+  serve(c, roomName, players) {
     if (typeof roomName !== 'string' || !ROOM_RE.test(roomName)) return c.ctl({ t: 'error', op: 'serve', code: 'bad_room' });
     const key = roomName.toLowerCase();
     if (c.room) this.leave(c, 'left');
@@ -176,6 +176,10 @@ export class Relay {
     this.log(`${c.name} serves ${roomName}`);
     c.ctl({ t: 'serving', room: roomName });
     this.rooms.get(key)?.bot?.attachServer(this.serverLink(c));
+    // A host player's game (rg.HostServer): Quick Match fills its room with `players` players.
+    if (Number.isInteger(players) && players > 0 && !this.rooms.has(key)) {
+      this.rooms.get('casinosystem').bot.addHosted(roomName, players);
+    }
   }
 
   serverLink(c) {
@@ -183,6 +187,7 @@ export class Relay {
   }
 
   unserve(c) {
+    this.rooms.get('casinosystem').bot.removeHosted(c.serves);
     this.servers.delete(c.serves);
     this.rooms.get(c.serves)?.bot?.detachServer();
     c.serves = null;

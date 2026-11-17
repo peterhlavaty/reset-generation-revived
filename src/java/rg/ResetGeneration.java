@@ -371,7 +371,24 @@ SNAPMobileSSOProvider {
         }
         this.isRunning = this.gameEngine.tick();
         this.smClient.tick();
+        if (this.pendingRelease != 0) {
+            this.eventListener.onKeyReleasedJava(System.currentTimeMillis(), this.pendingRelease, this.keyCharOf(this.pendingRelease), 1);
+            this.pendingRelease = 0;
+        }
+        HostServer.tick(this);
         return this.isRunning;
+    }
+
+    private int pendingRelease;
+
+    private char keyCharOf(int vk) {
+        return vk == 0x0a || vk == 0x1b || vk == 0x20 ? (char) vk : (char) 0xffff;
+    }
+
+    /** Test aid (HostServer --keys): press now, release on the next tick. */
+    void injectKey(int vk) {
+        this.eventListener.onKeyPressedJava(System.currentTimeMillis(), vk, this.keyCharOf(vk), 1);
+        this.pendingRelease = vk;
     }
 
     public boolean isRunning() {
