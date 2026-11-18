@@ -15,25 +15,28 @@ mkdir -p "$B/classes" "$B/jar" "$B/input" "$OUT"
 # 1. Pristine game files (game/ = the 2020 standalone without its old JRE).
 G="$R/game"
 
-# 2. Compile the Revived launcher + patched classes against the original jars.
+# 2. Compile the Revived launcher + patched classes against the original jars and Netty (the
+#    built-in LAN relay; tools/fetch_deps.sh downloads it with pinned checksums).
+DEPS=$("$R/tools/fetch_deps.sh")
+DEPCP=""; for f in $DEPS; do DEPCP="$DEPCP;$(w "$f")"; done
 (cd "$R/src/java" && "$JDK/bin/javac" -nowarn --release 17 -encoding UTF-8 \
-  -cp "$(w $G/ResetGeneration.jar);$(w $G/lib/rg-signed.jar)" \
+  -cp "$(w $G/ResetGeneration.jar);$(w $G/lib/rg-signed.jar)$DEPCP" \
   -d "$(w $B/classes)" $(find . -name '*.java'))
 
 # 3. Original jar contents, overlaid with our classes, plus the icon.
 (cd "$B/jar" && unzip -q -o "$G/ResetGeneration.jar" && rm -rf META-INF)
 cp -r "$B/classes/." "$B/jar/"
 mkdir -p "$B/jar/revived" && cp "$R/src/assets/icon.png" "$B/jar/revived/icon.png"
-printf 'Main-Class: rg.Revived\nClass-Path: rg-signed.jar\n' > "$B/manifest.txt"
+printf 'Main-Class: rg.Revived\nClass-Path: rg-signed.jar%s\n' "$(for f in $DEPS; do printf ' %s' "$(basename "$f")"; done)" > "$B/manifest.txt"
 "$JDK/bin/jar" --create --file "$(w $B/input/ResetGenerationRevived.jar)" --manifest "$(w $B/manifest.txt)" -C "$(w $B/jar)" .
-cp "$G/lib/rg-signed.jar" "$B/input/"
+cp "$G/lib/rg-signed.jar" $DEPS "$B/input/"
 
 # 4. Self-contained app image: ResetGeneration.exe + trimmed 32-bit runtime.
 "$JDK/bin/jpackage" --type app-image --name "$APP" --dest "$(w $OUT)" \
   --input "$(w $B/input)" --main-jar ResetGenerationRevived.jar --main-class rg.Revived \
   --icon "$(w $R/src/assets/icon.ico)" --app-version 1.0.0 \
   --vendor "Reset Generation Revived" --description "Reset Generation (RedLynx/Nokia, 2008) for modern Windows" \
-  --add-modules java.base,java.desktop,java.net.http,jdk.jsobject \
+  --add-modules java.base,java.desktop,java.net.http,jdk.jsobject,java.logging,jdk.unsupported \
   --jlink-options "--strip-debug --no-header-files --no-man-pages --compress=2" \
   --java-options "-Dsun.java2d.uiScale=1" --java-options "-Xss1m"
 

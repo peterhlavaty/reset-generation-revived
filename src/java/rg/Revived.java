@@ -134,7 +134,7 @@ public class Revived extends StandaloneClient {
         boolean toggle = e.getKeyCode() == KeyEvent.VK_F11
                 || (e.getKeyCode() == KeyEvent.VK_ENTER && e.isAltDown());
         if (!toggle) {
-            return false;
+            return HostServer.pickerEvent(e);      // the F5 player-count picker takes the keys
         }
         if (e.getID() == KeyEvent.KEY_PRESSED) {
             SwingUtilities.invokeLater(new Runnable() {
@@ -272,7 +272,8 @@ public class Revived extends StandaloneClient {
      * dead N-Gage Arena. There are no accounts: the nickname is generated once and saved.
      */
     static void configureOnline() {
-        com.redlynx.mt.snapmobile.SNAPMobileClient.relayUrl = opt("server", "ws://127.0.0.1:8787/ws");
+        String server = opt("server", "auto");
+        com.redlynx.mt.snapmobile.SNAPMobileClient.relayUrl = server.isEmpty() ? "auto" : server;
         String nick = opt("nickname", "");
         if (!com.redlynx.mt.snapmobile.SMArenaValidator.isValidArenaUsername(nick)) {
             nick = "Player" + (1000 + new java.util.Random().nextInt(9000));

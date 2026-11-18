@@ -5,8 +5,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Minimal JSON reader/writer for the relay's small control messages. */
-final class Json {
+/** Minimal JSON reader/writer for the relay's small control messages (client and rg.relay). */
+public final class Json {
     private final String s;
     private int i;
 
@@ -16,7 +16,7 @@ final class Json {
 
     /** Parses a JSON object; null if the text is not one. Numbers become Double. */
     @SuppressWarnings("unchecked")
-    static Map<String, Object> parseObject(String text) {
+    public static Map<String, Object> parseObject(String text) {
         try {
             Json p = new Json(text);
             Object v = p.value();
@@ -27,7 +27,56 @@ final class Json {
         }
     }
 
-    static String quote(String v) {
+    /** Writes a Map, List, String, Number, Boolean or null (integral numbers without a fraction). */
+    public static String write(Object v) {
+        StringBuilder b = new StringBuilder();
+        write(b, v);
+        return b.toString();
+    }
+
+    private static void write(StringBuilder b, Object v) {
+        if (v == null) {
+            b.append("null");
+        } else if (v instanceof String) {
+            b.append(quote((String) v));
+        } else if (v instanceof Number) {
+            double d = ((Number) v).doubleValue();
+            if (d == Math.rint(d) && !Double.isInfinite(d) && Math.abs(d) < 1e15) {
+                b.append((long) d);
+            } else {
+                b.append(Double.isFinite(d) ? String.valueOf(d) : "null");
+            }
+        } else if (v instanceof Boolean) {
+            b.append(v.toString());
+        } else if (v instanceof Map) {
+            b.append('{');
+            boolean first = true;
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) v).entrySet()) {
+                if (!first) {
+                    b.append(',');
+                }
+                first = false;
+                b.append(quote(String.valueOf(e.getKey()))).append(':');
+                write(b, e.getValue());
+            }
+            b.append('}');
+        } else if (v instanceof Iterable) {
+            b.append('[');
+            boolean first = true;
+            for (Object o : (Iterable<?>) v) {
+                if (!first) {
+                    b.append(',');
+                }
+                first = false;
+                write(b, o);
+            }
+            b.append(']');
+        } else {
+            b.append(quote(v.toString()));
+        }
+    }
+
+    public static String quote(String v) {
         StringBuilder b = new StringBuilder("\"");
         for (int k = 0; k < v.length(); k++) {
             char c = v.charAt(k);

@@ -6,6 +6,7 @@ Status (2026-11-17):
 |---|---|
 | **Hosted games (Windows build)** | **Works, 2–4 players** — F5 makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. See "Hosted games" |
 | Relay server (`server/`, Node + Cloudflare Worker) | **Done**, 19 tests (`npm test`) |
+| Built-in LAN relay (Windows, `src/java/rg/relay/`, Netty) | **Done** — the host's game runs it, clients find it by UDP broadcast (`server=auto`, the default); see "Built-in LAN relay" |
 | Client: Windows (Java replacement for `SNAPMobileClient`) | **Done** — logs in to the relay with a nickname, no Arena login screen |
 | Client: native/Android (`native/rt/net.c`) | **Done** (plain `ws://` only) |
 | Casino system (login, casino enter, Quick Match queue, lock, matched-up) | **Done** — both players listed in "Players in Match", "Game starting…" |
@@ -65,6 +66,32 @@ host then hosts again and "Play Again" starts the next match. The host's chosen 
 the select, Random, or `host_hero=`) is the one every screen shows, and the host's nickname
 appears in Battle Stats. Known limits: if the host quits the match ends for everyone; Android
 clients should work through the same relay but were not tested.
+
+### Built-in LAN relay (no setup)
+
+With `server=auto` (the default) nobody runs `server/` or types an address:
+
+* **F5** first shows a Java2D overlay drawn into the engine's backbuffer
+  (`HostServer.drawPicker`, called from `ResetGeneration.drawBuffer`): number of players 2–4
+  (Left/Right or 2–4, Enter, Esc). Keys reach it through Revived's key dispatcher and are kept
+  from the engine; the choice is saved as `host_players`. Then the engine's hero select.
+* The host's game then starts `rg.relay.LanRelay` (once per process): Netty on TCP 8787 (HTTP
+  `GET /status`, WebSocket `/ws`) and a UDP responder on 8787, all on one event-loop thread, so
+  the relay code (`Relay`, `Casino`, `GameRoom` — a line-by-line port of `server/src/relay.js`,
+  `casino.js`, `gameroom.js`; keep them in sync) needs no locks. `rghost` connects to
+  `ws://127.0.0.1:8787/ws` as before. If 8787 is taken by another relay (`/status` answers),
+  that one is used; by anything else, hosting fails with a message in the title bar.
+* Clients: `SNAPMobileClient` login calls `LanDiscovery.find` (up to 20 s): it broadcasts
+  `RGR-DISCOVER 1` to every interface's broadcast address, 255.255.255.255 and 127.0.0.1 each
+  second; hosts answer `RGR-HOST 1 <port> <waiting hosted games> <host nick>`. A host with a
+  waiting game wins; otherwise the first answer, 1.5 s later. Nothing found → the engine's
+  "cannot connect" error.
+* While the overlay is shown the launcher taps Right (a no-op in the main menu; Shift is Back)
+  when it opens and every 10 s: the main menu otherwise replays the intro after ~35 s without
+  input. The key that closes the overlay is kept from the engine until released.
+* Windows Firewall asks once, on the host only (inbound TCP/UDP 8787).
+
+A manual `server=ws://…` still works everywhere (internet play through `server/` or the Worker).
 
 Test aids (Windows build): `--keys=T:KEY,...` presses keys T ms after start (`ESC`, `RETURN`,
 `UP`/`DOWN`/`LEFT`/`RIGHT`, `SPACE`, `F5`, or a hex VK), `--window_x=`/`--window_y=`,
@@ -171,7 +198,8 @@ npm test
 npx wrangler login && npx wrangler deploy     # Cloudflare (Durable Object), wss://…workers.dev/ws
 ```
 
-Clients: Windows `app\revived.ini` → `server=ws://<host>:8787/ws`, `nickname=…`.
+Clients: Windows `app\revived.ini` → `server=ws://<host>:8787/ws`, `nickname=…` (default
+`server=auto`: LAN play through the host's built-in relay, see "Built-in LAN relay").
 Android: `files/revived.ini` in the app's storage (or the APK's built-in default,
 `tools/build_android.sh SERVER=ws://…`). The native client speaks `ws://` only for now, so
 Android needs a self-hosted server (LAN or a VPS) until TLS is added; the Java client supports

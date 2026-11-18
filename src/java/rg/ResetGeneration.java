@@ -556,6 +556,7 @@ SNAPMobileSSOProvider {
                 this.replayPlayerScreen.draw(this.backBuffer.getBackbufferGraphics());
             }
             this.updateOverlay();
+            HostServer.drawPicker(this.backBuffer.getBackbufferGraphics(), this.screenWidth, this.screenHeight);
             this.present(g2, this.backBuffer.getBackBuffer());
             this.backBuffer.swap();
         }

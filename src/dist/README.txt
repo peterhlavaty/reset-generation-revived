@@ -29,21 +29,21 @@ HOW TO PLAY (short)
 SETTINGS
   See app\revived.ini (resolution, fullscreen, scaling filter).
 
-MULTIPLAYER (2-4 players, LAN or one PC)
-  1. Someone runs the relay server (needs Node.js, from the project's server/
-     folder):  npm install  then  npm start   (listens on port 8787).
-  2. Every player sets server= in app\revived.ini to that PC, e.g.
-     server=ws://192.168.1.20:8787/ws   (ws://127.0.0.1:8787/ws on the same PC).
-  3. The host presses F5 in the main menu and picks a hero (Esc cancels;
-     host_hero= in revived.ini skips the choice). The title bar shows
-     "hosting, waiting for players". host_players= in revived.ini sets the
-     number of players including the host (default 2).
-  4. The others choose Quick Match and pick a hero; when enough players have
-     joined, the match starts. The host plays too: their game is the server.
+MULTIPLAYER (2-4 players, LAN or one PC; nothing to install or type in)
+  1. The host presses F5 in the main menu, chooses the number of players
+     (Left/Right, Enter) and a hero (Esc cancels). The first time, Windows
+     asks to allow the game on the network: allow it (private networks), the
+     host's game is the server (port 8787). The title bar then shows
+     "hosting on <address>, waiting for players".
+  2. The others choose Quick Match and pick a hero: their game finds the host
+     on the network by itself. When enough players have joined, the match
+     starts. The host plays too.
   After a match the host presses F5 again (the title bar says so) and the
   others choose Play Again.
   To try it alone on one PC, start the .exe several times (the second one
   can use: ResetGeneration-Revived.exe --nickname=Bob).
+  Over the internet: run your own relay (the project's server/ folder) and
+  set server= in app\revived.ini on every PC.
 
 NOTES
   * If the host quits, the match ends for everyone. "Online" (friendly casinos,

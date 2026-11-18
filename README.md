@@ -7,7 +7,7 @@ Windows in widescreen HD, to Android, and back online with our own server.
 |---|---|
 | Windows 10/11, widescreen HD, fullscreen | **Playable** — `tools/build_windows.sh` → `dist/ResetGeneration-Revived/ResetGeneration-Revived.exe` |
 | Android (phones, tablets, Chromebooks; touch + gamepad) | **Playable test build** — `tools/build_android.sh` → `dist/ResetGeneration-Revived-<version>.apk` (sideload) |
-| Multiplayer (Windows, LAN or one PC, own relay) | **Playable** — one player hosts with F5 (their engine is the game server), the others join with Quick Match; 2–4 players. Android: matchmaking only |
+| Multiplayer (Windows, LAN or one PC, built-in relay) | **Playable** — one player presses F5 and picks 2–4 players (their game is the server and relay), the others choose Quick Match and find the host on the LAN by themselves. Android: matchmaking only |
 
 ## Start here
 
@@ -22,6 +22,7 @@ Windows in widescreen HD, to Android, and back online with our own server.
 ```
 game/                            the original game files (engine DLL, jars, data paks), included with permission
 src/java/rg/                     Windows launcher + patched wrapper classes; rg.PatchTool for build-time data patches
+src/java/rg/relay/               built-in LAN relay + casino (Java/Netty port of server/) and LAN discovery
 src/java/com/redlynx/...         replacement online client (talks to our relay instead of N-Gage Arena)
 src/assets/, src/dist/           icon, default revived.ini, player README
 native/rt/                       runtime for the recompiled engine: memory, Win32 + JNI shims, engine API, net client
@@ -42,13 +43,16 @@ Reset.Generation.n-gage          original N-Gage 2.0 package (reference only, DR
 tools/build_windows.sh            # Windows: 32-bit JDK 17 (see docs/WINDOWS_PORT.md)
 tools/ghidra_export.sh            # once: Ghidra analysis + P-code export of the engine DLL
 tools/build_android.sh            # Android APK: Android SDK/NDK (see docs/NATIVE_PORT.md)
-cd server && npm install && npm start    # multiplayer relay on ws://localhost:8787/ws
-tools/lan_test.sh 2                      # local demo from dist/: relay + host + clients (2-4 players)
+tools/lan_test.sh 2                      # local demo from dist/: host + clients (2-4 players)
+cd server && npm install && npm start    # optional standalone relay (internet play) on :8787
 ```
 
-Multiplayer in short: run the relay, press **F5** in the main menu of one game (the host picks a
-hero; player count = `host_players` in `revived.ini`), choose **Quick Match** in the others. Details:
-`docs/MULTIPLAYER.md`, "Hosted games".
+`tools/fetch_deps.sh` (called by the build and run scripts) downloads Netty, the only library the
+launcher uses, into `build/deps/` with pinned checksums.
+
+Multiplayer in short: press **F5** in the main menu of one game, choose the number of players and a
+hero; choose **Quick Match** in the others. The host's game runs the relay, the others find it on
+the LAN (`server=auto`). Details: `docs/MULTIPLAYER.md`, "Hosted games".
 
 Toolchains are portable installs under `C:\dev\toolchains` (Temurin 17 x86 and 21 x64,
 Ghidra 12, llvm-mingw — also needed by the Windows build for `rghost.dll`, Android SDK with NDK 29); native build outputs go to `C:\dev\rgbuild`

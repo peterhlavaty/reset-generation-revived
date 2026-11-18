@@ -24,11 +24,15 @@ with permission; keep them pristine (patch at build/launch time, never in place)
   `tools/recomp/recomp.py` → C. Code only reachable through vtables/stored callbacks must be
   recovered by the export's pre-pass; an "unknown address" fatal means a missed entry point.
 * Online: the engine waits for the room's server to speak first; `CasinoSystem` is served by
-  the casino bot in `server/src/casino.js`. The in-room protocol (seating, match) is not done.
+  the casino bot in `server/src/casino.js`. Matches run on the hosting player's engine (`rghost.dll`).
+  The Windows build has a Java/Netty port of the relay + casino built in (`src/java/rg/relay/`,
+  started by the host; clients find it by UDP broadcast on 8787, `server=auto`): keep it in sync
+  with `server/src/{relay,casino,gameroom}.js`.
 
 ## Tools
 
-* `tools/build_windows.sh` — full release build into `dist/`.
+* `tools/build_windows.sh` — full release build into `dist/`. `tools/fetch_deps.sh` — Netty jars
+  (pinned sha256) into `build/deps/`, used by the build and run scripts.
 * `tools/build_android.sh` — APK into `dist/` (NDK + aapt2, no Gradle). `tools/build_native_desktop.sh`
   — `C:\dev\rgbuild\rgtest.exe`, headless test driver (`EXTRA_CFLAGS=-DRT_CALLTRACE`,
   `RECOMP_ARGS="--trace addr,…"` for debugging). Native build output stays in `C:\dev\rgbuild`
