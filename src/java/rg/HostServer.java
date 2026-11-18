@@ -38,6 +38,7 @@ final class HostServer {
     private static final List<long[]> keys = new ArrayList<long[]>();
 
     static native boolean install();
+    static native boolean chdir(String dir);
     static native boolean menuReady();
     static native int state();          // 0 idle, 1 choosing a hero, 2 serving
     static native int players();
@@ -70,7 +71,40 @@ final class HostServer {
         return hosting;
     }
 
+    private static int dll;   // 0 not tried, 1 loaded, -1 missing
+
     private static boolean load() {
+        if (dll == 0) {
+            dll = loadDll() ? 1 : -1;
+        }
+        return dll > 0;
+    }
+
+    /**
+     * The home directory to give the engine. Its file API is ANSI and gets the path as UTF-8, so a
+     * game folder with non-ASCII characters (a user name like "Hlavatý") makes it crash: then that
+     * folder becomes the process's current directory and the engine gets a relative path.
+     */
+    static String engineHome(String home) {
+        boolean ascii = true;
+        for (int i = 0; i < home.length(); i++) {
+            ascii &= home.charAt(i) < 0x80;
+        }
+        if (ascii) {
+            return home;
+        }
+        try {
+            if (load() && chdir(new File(home).getAbsolutePath())) {
+                System.out.println("HostServer: non-ASCII game folder, the engine uses it as the current directory");
+                return home.endsWith("\\") || home.endsWith("/") ? ".\\" : ".";
+            }
+        } catch (UnsatisfiedLinkError e) {
+            System.out.println("HostServer: rghost.dll is too old for a non-ASCII game folder");
+        }
+        return home;
+    }
+
+    private static boolean loadDll() {
         List<File> tries = new ArrayList<File>();
         String prop = System.getProperty("rg.hostdll");
         if (prop != null) tries.add(new File(prop));

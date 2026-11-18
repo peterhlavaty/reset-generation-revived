@@ -18,6 +18,9 @@ with permission; keep them pristine (patch at build/launch time, never in place)
 * The engine only draws when ahead of its 32 fps schedule (frame limiter on `timeGetTime`);
   hosts must supply time and let `Sleep()` advance it.
 * No floating point in the engine's hot code (fixed-point).
+* The engine's file API is ANSI (`CreateFileA`) and gets its home directory as UTF-8: a non-ASCII
+  game folder crashes it, so `HostServer.engineHome` makes that folder the current directory
+  (`rghost.dll`) and passes a relative home.
 * The engine's clock must start small: it misbehaves with large `timeGetTime` values (long
   uptimes), so hosts rebase it (`rt_now_ms` starts at 5,000,000).
 * Android/native = **static recompilation**: Ghidra P-code (`tools/ghidra_export.sh`) →

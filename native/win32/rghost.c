@@ -606,6 +606,21 @@ JNIEXPORT jint JNICALL Java_rg_HostServer_state(JNIEnv *env, jclass c) { (void)e
 
 JNIEXPORT jboolean JNICALL Java_rg_HostServer_menuReady(JNIEnv *env, jclass c) { (void)env; (void)c; return menu_base != 0; }
 
+/* The engine opens its files with the ANSI API (CreateFileA etc.) under the home directory that
+ * Java passes it as UTF-8, so a non-ASCII game folder (C:\Users\Hlavatý\...) cannot be opened.
+ * HostServer.engineHome() then makes that folder the process's current directory (wide API) and
+ * gives the engine a relative home. */
+JNIEXPORT jboolean JNICALL Java_rg_HostServer_chdir(JNIEnv *env, jclass c, jstring jdir) {
+    (void)c;
+    jsize n = (*env)->GetStringLength(env, jdir);
+    WCHAR *w = calloc((size_t)n + 1, sizeof(WCHAR));
+    if (!w) return JNI_FALSE;
+    (*env)->GetStringRegion(env, jdir, 0, n, (jchar *)w);
+    BOOL ok = SetCurrentDirectoryW(w);
+    free(w);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
 /* hero: 0..9 = that hero, -1 = random, -2 = the host chooses in the hero select */
 JNIEXPORT jboolean JNICALL Java_rg_HostServer_host(JNIEnv *env, jclass c, jstring jurl, jstring jroom, jint players,
                                                    jstring jname, jint hero) {

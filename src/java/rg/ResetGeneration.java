@@ -270,7 +270,7 @@ SNAPMobileSSOProvider {
         }
         this.gameEngine = NativeGameEngine.getInstance();
         this.gameEngine.loadNativeLibs(dllList);
-        this.gameEngine.setHomeDirectory(homeDirectory);
+        this.gameEngine.setHomeDirectory(HostServer.engineHome(homeDirectory));
         this.eventListener = new NativeInputEventListener();
         this.soundOutputDevice = new NativeSoundOutputDevice();
     }

@@ -56,3 +56,6 @@ CC32=${CC32:-$(ls -d /c/dev/toolchains/llvm-mingw-*-ucrt-x86_64 | tail -1)/bin/i
 cp "$R/src/dist/README.txt" "$OUT/$APP/README.txt"
 echo "Built $OUT/$APP"
 du -sh "$OUT/$APP"
+# 7. The same folder as one zip to copy to other PCs (unzip, double-click the .exe).
+rm -f "$OUT/$APP.zip"
+py -I "$R/tools/zip_dir.py" "$OUT/$APP" "$OUT/$APP.zip" && echo "Packed $OUT/$APP.zip"
