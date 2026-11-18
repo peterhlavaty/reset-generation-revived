@@ -397,6 +397,69 @@ static int fix_place_tile_enter(void) {
     return 1;
 }
 
+/* ------------------------------------------------------------------ the host's hero and name */
+/* The LAN host screen's entry (0x100ca920) gives the host (player 0) a random hero:
+ * 0x100ca9ce xor edx,edx; mov ecx,10; div ecx (edx = rand()%10, then mov ebp,edx at 0x100ca9d9).
+ * It then builds the host's player setup (0x10042040: +0 name string, left empty; +4 hero id;
+ * +8 hero object) and hands it to the controller at 0x100caa30..0x100caa3a (vt+0x6c), which sends
+ * it to every client. Two detours: the roll keeps its RNG call but takes host_hero when that is
+ * 0..9, and the setup gets the host's nickname (otherwise "Player" / empty in the end screens). */
+static volatile uint32_t host_hero = 0xffffffffu;   /* 0..9 = that hero, anything else = random */
+static char host_name[64];
+
+typedef void *(TC *str_assign_fn)(void *str, const char *s);       /* 0x100f10b0, ret 4 */
+static void __cdecl host_setup_fix(uint8_t *screen, uint8_t *setup) {
+    (void)screen;
+    if (setup && host_name[0]) ((str_assign_fn)P(0x100f10b0))(setup, host_name);
+}
+
+/* E9 rel32 at q (q is where the bytes will execute) */
+static uint8_t *jmp_to(uint8_t *q, uint32_t target) {
+    *q = 0xe9;
+    int32_t rel = (int32_t)(target - ((uint32_t)(uintptr_t)q + 5));
+    memcpy(q + 1, &rel, 4);
+    return q + 5;
+}
+
+static int patch_host_player(void) {
+    uint32_t roll = A(0x100ca9ce), give = A(0x100caa30);
+    static const uint8_t roll_bytes[13] = {0x33, 0xd2, 0xb9, 0x0a, 0, 0, 0, 0xf7, 0xf1,  /* xor edx,edx; mov ecx,10; div ecx */
+                                           0x6a, 0x14, 0x8b, 0xea};                      /* push 0x14; mov ebp,edx */
+    static const uint8_t give_bytes[13] = {0x8b, 0x4e, 0x14, 0x8b, 0x01,                 /* mov ecx,[esi+0x14]; mov eax,[ecx] */
+                                           0x6a, 0x00, 0x57, 0x6a, 0x00, 0xff, 0x50, 0x6c};  /* push 0; push edi; push 0; call [eax+0x6c] */
+    if (memcmp((void *)(uintptr_t)roll, roll_bytes, 13) || memcmp((void *)(uintptr_t)give, give_bytes, 13)) {
+        lg("LAN host entry bytes differ; the host keeps a random hero");
+        return 0;
+    }
+    uint8_t *t = (uint8_t *)VirtualAlloc(NULL, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return 0;
+    uint8_t *q = t, *t2;
+    uint32_t hh = (uint32_t)(uintptr_t)&host_hero, fn = (uint32_t)(uintptr_t)host_setup_fix;
+    memcpy(q, roll_bytes, 9); q += 9;                               /* the original roll -> edx */
+    *q++ = 0x8b; *q++ = 0x0d; memcpy(q, &hh, 4); q += 4;            /* mov ecx,[host_hero] */
+    *q++ = 0x83; *q++ = 0xf9; *q++ = 0x09;                          /* cmp ecx,9 */
+    *q++ = 0x77; *q++ = 0x02;                                       /* ja +2 (unsigned: keep the roll) */
+    *q++ = 0x8b; *q++ = 0xd1;                                       /* mov edx,ecx */
+    q = jmp_to(q, roll + 9);                                        /* -> push 0x14 */
+    t2 = q;
+    *q++ = 0x60;                                                    /* pushad */
+    *q++ = 0x57; *q++ = 0x56;                                       /* push edi (setup); push esi (screen) */
+    *q++ = 0xb8; memcpy(q, &fn, 4); q += 4; *q++ = 0xff; *q++ = 0xd0;   /* call host_setup_fix */
+    *q++ = 0x83; *q++ = 0xc4; *q++ = 0x08;                          /* add esp,8 */
+    *q++ = 0x61;                                                    /* popad */
+    memcpy(q, give_bytes, 5); q += 5;                               /* the 5 bytes replaced at give */
+    q = jmp_to(q, give + 5);
+    FlushInstructionCache(GetCurrentProcess(), t, (size_t)(q - t));
+    uint8_t j[9] = {0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
+    int32_t rel = (int32_t)((uint32_t)(uintptr_t)t - (roll + 5));
+    memcpy(j + 1, &rel, 4);
+    patch(roll, j, 9);
+    rel = (int32_t)((uint32_t)(uintptr_t)t2 - (give + 5));
+    memcpy(j + 1, &rel, 4);
+    patch(give, j, 5);
+    return 1;
+}
+
 static int installed;
 static int install(void) {
     if (installed) return installed > 0;
@@ -404,6 +467,7 @@ static int install(void) {
     if (!m) { lg("engine DLL not loaded"); installed = -1; return 0; }
     delta = (uint32_t)(uintptr_t)m - IMAGE_BASE;
     if (fix_place_tile_enter()) lg("engine fix: PlaceTileUIState layer for players out of the game");
+    patch_host_player();
     for (int i = 0; i < 40; i++) listener_vt[i] = conn_vt[i] = addr_vt[i] = bad_slots[i];
     listener_vt[0] = (void *)any_dtor;
     listener_vt[0x4c / 4] = (void *)l_accept;
@@ -424,9 +488,8 @@ static int install(void) {
 }
 
 /* What the menus would do for "host a LAN game": build the LAN host screen (a hero list whose
- * length selects the mission and the player count) and make it the current screen. */
-static int host_game(int players) {
-    if (!menu_base) { lg("menu not ready yet"); return 0; }
+ * length selects the mission and the player count; the values are not used). */
+static void *build_host_screen(int players) {
     /* the acceptor's setController (vtable slot 1) -> our listener; only the LAN host screen uses it */
     static int acc_patched;
     if (!acc_patched) { uint32_t fn = (uint32_t)(uintptr_t)acc_set_controller; patch(A(0x10188b68), &fn, 4); acc_patched = 1; }
@@ -439,14 +502,77 @@ static int host_game(int players) {
     }
     void *screen = eng_new(0x3c);
     ((host_screen_ctor_fn)P(0x100caa80))(screen, ctx, list);
-    ((set_screen_fn)(uintptr_t)LD32(LD32(menu_base) + 0x14))((void *)(uintptr_t)menu_base, screen);
-    lg("host screen %p for %d players", screen, players);
-    return 1;
+    lg("host screen %p for %d players, host hero %d", screen, players, (int)host_hero);
+    return screen;
 }
 
 /* ------------------------------------------------------------------ JNI (rg.HostServer) */
 static int hosting;
+static volatile int picking;             /* the host's hero select is up */
 static DWORD last_ping, retry;
+
+/* The LAN host screen is up: offer the room on the relay (pump connects the first time). */
+static void start_serving(void) {
+    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used) sess[i].closed = 1;    /* a previous game's players */
+    if (hosting && ws_up) {      /* hosting again: offer the room on the open relay connection */
+        char json[300];
+        snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d}", room, remote_players);
+        ws_send(1, json, strlen(json));
+        lg("hosting room %s again", room);
+    }
+    hosting = 1;
+    serving = 1;
+}
+
+/* The host picks a hero in the engine's own hero select (HeroSelectionScreen, ctor 0x100dcff0,
+ * the one Skirmish uses: (ctx, std::string *out, bool popOnSelect), 0xb8 bytes). The instance
+ * gets a private copy of its 13-slot vtable (0x101888e0) whose onSelect (slot 11, 0x100dc7e0) and
+ * onBack (slot 12, 0x100dbfc0) run here; the shared code, Skirmish and the arena stay untouched. */
+typedef void (TC *hs_ctor_fn)(void *self, uint32_t ctx, void *out, int pop_on_select);
+typedef void (TC *this_fn)(void *self);
+typedef void (TC *this_int_fn)(void *self, int v);
+typedef void (TC *str_ctor_fn)(void *s, const char *c, int enc);
+static void *hs_vt[13], *hs_str;
+static volatile int hs_done, pick_players;
+
+static void TC hs_on_select(void *self) {
+    if (hs_done) return;
+    hs_done = 1;
+    ((this_fn)P(0x100dc7e0))(self);            /* resolves Random; popOnSelect = 0, so no pop */
+    int hero = *(int *)((uint8_t *)self + 0x68);
+    host_hero = (hero >= 0 && hero <= 9) ? (uint32_t)hero : 0xffffffffu;
+    picking = 0;
+    void *lan = build_host_screen(pick_players);
+    ((set_screen_fn)P(0x1008f0e0))(self, lan);  /* Screen::replaceTop: the select goes, the LAN host screen comes */
+    start_serving();
+}
+
+static void TC hs_on_back(void *self) {
+    if (hs_done) return;
+    hs_done = 1;
+    picking = 0;
+    lg("hosting cancelled");
+    ((this_fn)P(0x100dbfc0))(self);            /* back to the menu */
+}
+
+static int show_hero_select(int players) {
+    if (!hs_str) { hs_str = eng_new(4); ((str_ctor_fn)P(0x100f0e10))(hs_str, "", 0); }   /* ours; the screen never frees it */
+    uint32_t ctx = LD32(menu_base + 0x10);
+    void *hs = eng_new(0xb8);
+    ((hs_ctor_fn)P(0x100dcff0))(hs, ctx, hs_str, 0);
+    ((this_fn)P(0x100dd5b0))(hs);              /* the ten heroes, Plumber first */
+    ((this_int_fn)P(0x100dd340))(hs, -2);      /* and Random */
+    memcpy(hs_vt, (void *)(uintptr_t)A(0x101888e0), sizeof hs_vt);   /* already relocated */
+    hs_vt[11] = (void *)hs_on_select;
+    hs_vt[12] = (void *)hs_on_back;
+    *(void ***)hs = hs_vt;
+    hs_done = 0;
+    pick_players = players;
+    picking = 1;
+    ((set_screen_fn)(uintptr_t)LD32(LD32(menu_base) + 0x14))((void *)(uintptr_t)menu_base, hs);
+    lg("hero select %p", hs);
+    return 1;
+}
 
 /* A match is running while a remote player's connection is alive. */
 static int match_live(void) {
@@ -475,31 +601,33 @@ JNIEXPORT jint JNICALL Java_rg_HostServer_players(JNIEnv *env, jclass c) {
     return n;
 }
 
-JNIEXPORT jboolean JNICALL Java_rg_HostServer_serving(JNIEnv *env, jclass c) { (void)env; (void)c; return serving != 0; }
+/* 0 = not hosting, 1 = the host is choosing a hero, 2 = serving (waiting for players or playing) */
+JNIEXPORT jint JNICALL Java_rg_HostServer_state(JNIEnv *env, jclass c) { (void)env; (void)c; return picking ? 1 : serving ? 2 : 0; }
 
 JNIEXPORT jboolean JNICALL Java_rg_HostServer_menuReady(JNIEnv *env, jclass c) { (void)env; (void)c; return menu_base != 0; }
 
-JNIEXPORT jboolean JNICALL Java_rg_HostServer_host(JNIEnv *env, jclass c, jstring jurl, jstring jroom, jint players) {
+/* hero: 0..9 = that hero, -1 = random, -2 = the host chooses in the hero select */
+JNIEXPORT jboolean JNICALL Java_rg_HostServer_host(JNIEnv *env, jclass c, jstring jurl, jstring jroom, jint players,
+                                                   jstring jname, jint hero) {
     (void)c;
-    if (installed <= 0 || match_live()) return JNI_FALSE;
+    if (installed <= 0 || match_live() || picking || serving) return JNI_FALSE;
+    if (!menu_base) { lg("menu not ready yet"); return JNI_FALSE; }
     const char *u = (*env)->GetStringUTFChars(env, jurl, NULL), *r = (*env)->GetStringUTFChars(env, jroom, NULL);
+    const char *n = (*env)->GetStringUTFChars(env, jname, NULL);
     snprintf(url, sizeof url, "%s", u);
     snprintf(room, sizeof room, "%s", r);
+    snprintf(host_name, sizeof host_name, "%s", n);
     (*env)->ReleaseStringUTFChars(env, jurl, u);
     (*env)->ReleaseStringUTFChars(env, jroom, r);
+    (*env)->ReleaseStringUTFChars(env, jname, n);
     if (players < 2) players = 2;
     if (players > 4) players = 4;
     remote_players = players - 1;
-    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used) sess[i].closed = 1;    /* a previous game's players */
-    if (!host_game(players)) return JNI_FALSE;
-    if (hosting && ws_up) {      /* hosting again: offer the room on the open relay connection */
-        char json[300];
-        snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d}", room, remote_players);
-        ws_send(1, json, strlen(json));
-        lg("hosting room %s again", room);
-    }
-    hosting = 1;
-    serving = 1;
+    if (hero == -2) return (jboolean)show_hero_select(players);
+    host_hero = (hero >= 0 && hero <= 9) ? (uint32_t)hero : 0xffffffffu;
+    void *screen = build_host_screen(players);
+    ((set_screen_fn)(uintptr_t)LD32(LD32(menu_base) + 0x14))((void *)(uintptr_t)menu_base, screen);
+    start_serving();
     return JNI_TRUE;
 }
 

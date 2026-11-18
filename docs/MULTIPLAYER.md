@@ -24,8 +24,11 @@ in the real engine DLL what `native/rt/server.c` does for the recompiled one:
 * at start: hooks the menu flow constructor `0x1008f500` (inline `jmp` to a trampoline that
   records `ECX`). The engine DLL is usually relocated, so every address is rebased;
 * on **F5** (or `host=auto`): patches the TCP acceptor's `setController` (vtable `0x10188b64`,
-  slot 1) to install a fake listener, builds the LAN host screen with a hero list of
-  `host_players` entries and makes it the current screen;
+  slot 1) to install a fake listener. F5 first shows the engine's own hero select
+  (`HeroSelectionScreen`, ctor `0x100dcff0`, the ten heroes plus Random) with a private copy of
+  its vtable (`0x101888e0`) whose onSelect/onBack (slots 11/12) run in rghost: Select replaces it
+  with the LAN host screen, Back cancels. `host_hero=NAME|RANDOM` (and `host=auto`, default random)
+  skip the select. The LAN host screen gets a hero list of `host_players` entries;
 * connects to the relay as `RGHost` and sends `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1}`.
   Each `player_joined` becomes a connection object (`accept`); channel 0x16 travels as
   `[u16 pid][zlib message]` exactly as in the Phase 0 design. `HostServer.pump()` runs on the
@@ -40,6 +43,12 @@ game" (`host=auto` re-hosts by itself). Once a game server serves a room, the ga
 sending EVENT SEAT_LEAVE (the match reports leavers itself): a client still on its win screen that
 got it stayed on a black screen. The Java clients need no change.
 
+The host's hero and name: the LAN host screen's entry (`0x100ca920`) rolls the host's hero
+(`rand() % 10` at `0x100ca9ce`) and hands the host's player setup, name left empty, to the
+controller (`0x100caa30`, vt+0x6c), which sends it to every client. rghost detours both (13-byte
+signature checks): the roll keeps its RNG call but takes the chosen hero, and the setup gets the
+host's nickname, so the end screens say "Host Wins" instead of a blank name.
+
 Engine bug fix (rghost.dll, applied in every instance, host or client): `PlaceTileUIState::enter`
 (`0x100b2c20`) sets the state's tile-layer grid (`this+0x84 = this->layer(2)`) only for players
 still in the game, but `update` (`0x100b5df0` -> `0x100b5290`) copies board snapshots into it for
@@ -52,13 +61,15 @@ Verified on one PC with the real Windows build (`tools/lan_test.sh 2|3|4`): 2-, 
 matches start; boards, items, heroes and health stay identical on all screens over many rounds;
 a client quitting mid-match leaves the host running; when the players surrender one by one every
 client reaches the win screen, Battle Stats and the casino (2, 3 and 4 players, any order); the
-host then hosts again and "Play Again" starts the next match. Known limits: the host cannot choose
-a hero and has no name in the stats; if the host quits the match ends for everyone; Android
+host then hosts again and "Play Again" starts the next match. The host's chosen hero (picked in
+the select, Random, or `host_hero=`) is the one every screen shows, and the host's nickname
+appears in Battle Stats. Known limits: if the host quits the match ends for everyone; Android
 clients should work through the same relay but were not tested.
 
 Test aids (Windows build): `--keys=T:KEY,...` presses keys T ms after start (`ESC`, `RETURN`,
 `UP`/`DOWN`/`LEFT`/`RIGHT`, `SPACE`, `F5`, or a hex VK), `--window_x=`/`--window_y=`,
-`--nickname=`, `--host=auto`, `--host_players=N`, `--dll_patch=false` (pristine engine DLL);
+`--nickname=`, `--host=auto`, `--host_players=N`, `--host_hero=NAME|RANDOM`, `--dll_patch=false`
+(pristine engine DLL);
 `RT_NET_DEBUG=1` logs every 0x16 message in rghost (stderr).
 
 ## How online worked in 2008–2010

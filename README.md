@@ -46,8 +46,8 @@ cd server && npm install && npm start    # multiplayer relay on ws://localhost:8
 tools/lan_test.sh 2                      # local demo from dist/: relay + host + clients (2-4 players)
 ```
 
-Multiplayer in short: run the relay, press **F5** in the main menu of one game (the host; player
-count = `host_players` in `revived.ini`), choose **Quick Match** in the others. Details:
+Multiplayer in short: run the relay, press **F5** in the main menu of one game (the host picks a
+hero; player count = `host_players` in `revived.ini`), choose **Quick Match** in the others. Details:
 `docs/MULTIPLAYER.md`, "Hosted games".
 
 Toolchains are portable installs under `C:\dev\toolchains` (Temurin 17 x86 and 21 x64,

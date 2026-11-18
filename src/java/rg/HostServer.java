@@ -10,23 +10,39 @@ import java.util.List;
  * The engine-side work is in rghost.dll (native/win32/rghost.c); everything here runs on the
  * engine thread from {@link ResetGeneration#tickRG()}.
  *
- * Start hosting with F5 in the main menu (players = host_players in revived.ini, default 2), or
- * automatically with host_players=N plus host=auto / --host=auto. Test aid: --keys=T:KEY,... sends
+ * Start hosting with F5 in the main menu (players = host_players in revived.ini, default 2): the
+ * host first picks a hero in the engine's hero select (or host_hero=NAME / RANDOM skips it). Or
+ * automatically with host_players=N plus host=auto / --host=auto (hero: host_hero, default
+ * random). Test aid: --keys=T:KEY,... sends
  * key presses T milliseconds after start (KEY = ESC, RETURN, UP, DOWN, LEFT, RIGHT, SPACE,
  * F5 or a hex virtual-key code).
  */
 final class HostServer {
     private static boolean loaded, installed, hosting;
     private static volatile boolean requested;
-    private static long start;
+    private static long start, nextAuto;
     private static int games, wanted, shownPlayers = -1;
     private static final List<long[]> keys = new ArrayList<long[]>();
 
     static native boolean install();
     static native boolean menuReady();
-    static native boolean serving();
+    static native int state();          // 0 idle, 1 choosing a hero, 2 serving
     static native int players();
-    static native boolean host(String url, String room, int players);
+    static native boolean host(String url, String room, int players, String name, int hero);
+
+    /** Engine hero ids (0x100941c0). */
+    private static final String[] HEROES = {"HEDGEHOG", "PLUMBER", "CYBORG", "LEVEL_50_ELF", "BABE_GUNNER",
+            "MONSTER_TRAINER", "SCIFI_KNIGHT", "NINJA", "DR_LOVEBOMBER", "AGGRESSOR"};
+
+    /** host_hero option: a hero name or id -> 0..9, RANDOM -> -1, anything else -> dflt. */
+    static int heroOption(int dflt) {
+        String v = Revived.opt("host_hero", "").trim().toUpperCase();
+        if (v.equals("RANDOM")) return -1;
+        for (int i = 0; i < HEROES.length; i++) {
+            if (HEROES[i].equals(v) || String.valueOf(i).equals(v)) return i;
+        }
+        return dflt;
+    }
     static native void pump();
 
     private HostServer() {
@@ -101,28 +117,38 @@ final class HostServer {
         }
         if (!installed) return;
         boolean auto = Revived.opt("host", "").equalsIgnoreCase("auto") && t > 15000;
-        if ((requested || (auto && !hosting)) && menuReady()) {
+        if ((requested || (auto && !hosting && t >= nextAuto)) && menuReady()) {
+            boolean byKey = requested;
             requested = false;
             int players = Math.max(2, Math.min(4, Revived.optInt("host_players", 2)));
             String nick = com.redlynx.mt.snapmobile.SNAPMobileClient.nickname;
             String room = "HOST_" + (nick == null ? "game" : nick) + "_" + (++games);
-            if (host(com.redlynx.mt.snapmobile.SNAPMobileClient.relayUrl, room, players)) {
+            int hero = heroOption(byKey ? -2 : -1);
+            if (host(com.redlynx.mt.snapmobile.SNAPMobileClient.relayUrl, room, players, nick == null ? "" : nick, hero)) {
                 hosting = true;
                 wanted = players - 1;
                 shownPlayers = -1;
-                System.out.println("HostServer: hosting " + room + " for " + players + " players");
+                System.out.println("HostServer: hosting " + room + " for " + players + " players"
+                        + (hero == -2 ? " (choosing a hero)" : hero >= 0 ? " as " + HEROES[hero] : ""));
             } else {
-                System.out.println("HostServer: cannot host now (a hosted match is running?)");
+                nextAuto = t + 2000;
+                System.out.println("HostServer: cannot host now (already hosting, or a hosted match is running)");
             }
         }
         pump();
-        if (hosting && !serving()) {      // match over, or the host screen was left
+        int st = hosting ? state() : 0;
+        if (hosting && st == 0) {      // match over, hero select or host screen left
             hosting = false;
             shownPlayers = -1;
             System.out.println("HostServer: hosted game over");
             Revived.setStatus("F5 = host a new game");
         }
-        if (hosting) {
+        if (hosting && st == 1) {
+            if (shownPlayers != -2) {
+                shownPlayers = -2;
+                Revived.setStatus("hosting: choose your hero (Esc = cancel)");
+            }
+        } else if (hosting) {
             int n = players();
             if (n != shownPlayers) {
                 shownPlayers = n;

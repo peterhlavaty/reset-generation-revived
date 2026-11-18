@@ -34,7 +34,8 @@ MULTIPLAYER (2-4 players, LAN or one PC)
      folder):  npm install  then  npm start   (listens on port 8787).
   2. Every player sets server= in app\revived.ini to that PC, e.g.
      server=ws://192.168.1.20:8787/ws   (ws://127.0.0.1:8787/ws on the same PC).
-  3. The host presses F5 in the main menu. The title bar shows
+  3. The host presses F5 in the main menu and picks a hero (Esc cancels;
+     host_hero= in revived.ini skips the choice). The title bar shows
      "hosting, waiting for players". host_players= in revived.ini sets the
      number of players including the host (default 2).
   4. The others choose Quick Match and pick a hero; when enough players have
