@@ -22,7 +22,7 @@
 #include <windows.h>
 
 #define TC __attribute__((thiscall))
-#define MAX_SESS 64                /* slots are never reused: old connections may still be polled */
+#define MAX_SESS 4096              /* slots are never reused: the engine never frees a connection */
 #define CH_GAME 0x16
 #define IMAGE_BASE 0x10000000u
 
@@ -52,7 +52,7 @@ static void *eng_new(uint32_t n) { void *p = ((new_fn)P(0x1014f476))(n); memset(
 
 /* ------------------------------------------------------------------ relay link (WebSocket) */
 typedef struct ev { struct ev *next; int kind, pid, len; uint8_t data[]; } ev;
-enum { EV_JOIN, EV_LEAVE, EV_DATA, EV_CLOSED };
+enum { EV_JOIN, EV_LEAVE, EV_LOST, EV_DATA, EV_CLOSED };
 
 static CRITICAL_SECTION lock, send_lock;
 static ev *ev_head, *ev_tail;
@@ -141,8 +141,13 @@ static DWORD WINAPI reader(void *arg) {
             msg[len] = 0;
             char t[24];
             json_str((char *)msg, "t", t, sizeof t);
-            if (!strcmp(t, "player_joined")) push_ev(EV_JOIN, json_int((char *)msg, "pid", -1), NULL, 0);
-            else if (!strcmp(t, "player_left")) push_ev(EV_LEAVE, json_int((char *)msg, "pid", -1), NULL, 0);
+            if (!strcmp(t, "player_joined")) {
+                char name[32];
+                json_str((char *)msg, "name", name, sizeof name);
+                push_ev(EV_JOIN, json_int((char *)msg, "pid", -1), name, (int)strlen(name) + 1);
+            }
+            else if (!strcmp(t, "player_left"))
+                push_ev(json_int((char *)msg, "lost", 0) ? EV_LOST : EV_LEAVE, json_int((char *)msg, "pid", -1), NULL, 0);
             else if (!strcmp(t, "pong")) {}
             else lg("relay %s", (char *)msg);
         } else if (op == 2) {
@@ -215,15 +220,26 @@ static int ws_connect(void) {
 }
 
 /* ------------------------------------------------------------------ sessions */
-typedef struct { int used, pid, accepted, closed; uint8_t *obj; ev *in_head, *in_tail; } sess_t;
+typedef struct {
+    int used, pid, accepted, closed;
+    uint8_t *obj;
+    ev *in_head, *in_tail;
+    char name[32];          /* relay nickname */
+    int key, slot;          /* the engine's player key and seat (0 = not yet known) */
+    int checked;            /* rejoin: looked for a held seat */
+    int away;               /* the relay connection dropped; the engine is not told (seat held) */
+    DWORD away_since;
+    int heir_of;            /* rejoin: index + 1 of the held session this one takes over */
+} sess_t;
 static sess_t sess[MAX_SESS];
+static int nsess;                        /* slots handed out so far */
 
 static sess_t *by_pid(int pid) {
     sess_t *r = NULL;     /* the newest session with this pid */
-    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used && sess[i].pid == pid) r = &sess[i];
+    for (int i = 0; i < nsess; i++) if (sess[i].used && sess[i].pid == pid) r = &sess[i];
     return r;
 }
-static sess_t *sess_of(void *obj) { uint32_t i = ((uint32_t *)obj)[1]; return i < MAX_SESS ? &sess[i] : NULL; }
+static sess_t *sess_of(void *obj) { uint32_t i = ((uint32_t *)obj)[1]; return i < (uint32_t)nsess ? &sess[i] : NULL; }
 
 static void to_player(sess_t *s, const uint8_t *data, uint32_t len) {
     uint8_t *buf = (uint8_t *)malloc((size_t)len + 2);
@@ -251,8 +267,10 @@ static void *listener_vt[40], *conn_vt[40], *addr_vt[40];
 static uint32_t listener_obj[8] = {(uint32_t)(uintptr_t)listener_vt};
 
 /* acceptor (0x100df500): setController(controller) -> our listener instead of tcp://:12345 */
+static uint32_t srv_ctrl;               /* the engine's server controller (pending joins at +0x94) */
 static int TC acc_set_controller(uint8_t *acc, uint32_t ctrl) {
     *(uint32_t *)(acc + 4) = ctrl;
+    srv_ctrl = ctrl;
     *(uint32_t *)(acc + 8) = (uint32_t)(uintptr_t)listener_obj;
     acc[0x18] = 1;
     lg("controller %08x attached to the acceptor %p", ctrl, acc);
@@ -261,7 +279,9 @@ static int TC acc_set_controller(uint8_t *acc, uint32_t ctrl) {
 static void *TC any_dtor(void *t, uint32_t flags) { (void)flags; return t; }
 static void *TC l_accept(void *t) {
     (void)t;
-    for (int i = 0; i < MAX_SESS; i++) {
+    static DWORD polled;
+    if (getenv("RT_NET_DEBUG") && GetTickCount() - polled > 10000) { polled = GetTickCount(); lg("accept polled"); }
+    for (int i = 0; i < nsess; i++) {
         sess_t *s = &sess[i];
         if (s->used && !s->accepted) {
             s->accepted = 1;
@@ -280,7 +300,7 @@ static void TC l_close(void *t) {
     (void)t;
     lg("listener closed");
     serving = 0;
-    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used) sess[i].closed = 1;   /* that game's players */
+    for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;   /* that game's players */
     if (ws_up) ws_send(1, "{\"t\":\"unserve\"}", 15);
 }
 static void *TC c_dtor(void *t, uint32_t flags) { sess_t *s = sess_of(t); lg("conn of player %d destroyed", s ? s->pid : -1); return t; }
@@ -304,11 +324,17 @@ static void TC c_close(void *t) {
     sess_t *s = sess_of(t);
     if (s) { lg("engine closes the connection of player %d", s->pid); s->closed = 1; }
 }
+static uint32_t pending_entry(sess_t *s);
+static void take_over(sess_t *s);
 static int TC c_send(void *t, uint32_t ch, const uint8_t *ptr, uint32_t len) {
     sess_t *s = sess_of(t);
-    if (s && ch == CH_GAME && len <= 1u << 20) {
+    /* not to a closed session (its relay pid may belong to a player who has come back since), nor
+     * to one whose player is away (see track_seats) */
+    if (s && !s->closed && !s->away && ch == CH_GAME && len <= 1u << 20) {
         if (getenv("RT_NET_DEBUG")) lg("-> player %d: %u bytes", s->pid, len);
         to_player(s, ptr, len);
+        /* handshake state 4 sends the battle state, then gives up registering a key it has */
+        if (s->heir_of) { uint32_t ent = pending_entry(s); if (ent && LD32(ent + 4) == 4) take_over(s); }
     }
     return 1;
 }
@@ -460,6 +486,210 @@ static int patch_host_player(void) {
     return 1;
 }
 
+/* Engine bug fix (all instances). The online user object (context service 0x39, vtable
+ * 0x1017b020) is owned by the app context, but a casino room also puts it in its member map,
+ * keyed by the player id the server gave (0x10047573). Leaving removes only the current id
+ * (0x100482c0 -> 0x1000aee0), then deletes every remaining member (0x10095030 -> 0x10094e50).
+ * If the id ever changed (a server that hands out a new id per casino visit), the stale entry
+ * deletes the context's user object, and the next use of it (0x100ecf90, on the next tick after
+ * a dropped connection) jumps through freed memory. The member delete in that loop
+ * (0x10094eac: mov edx,[ecx]; push 1; call [edx]) now skips the context's own object. */
+static int fix_member_clear(void) {
+    uint32_t site = A(0x10094eac), ctxp = A(0x101b828c);
+    static const uint8_t expect[8] = {0x8b, 0x11, 0x6a, 0x01, 0xff, 0x12, 0x46, 0x3b};
+    if (memcmp((void *)(uintptr_t)site, expect, sizeof expect) != 0) { lg("member clear bytes differ; fix not applied"); return 0; }
+    uint8_t *t = (uint8_t *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return 0;
+    uint8_t *q = t;
+    *q++ = 0xa1; memcpy(q, &ctxp, 4); q += 4;                       /* mov eax,[context] */
+    *q++ = 0x85; *q++ = 0xc0;                                       /* test eax,eax */
+    *q++ = 0x74; *q++ = 0x08;                                       /* jz del */
+    *q++ = 0x3b; *q++ = 0x88; *q++ = 0xe4; *q++ = 0; *q++ = 0; *q++ = 0;   /* cmp ecx,[eax+0xe4] */
+    *q++ = 0x74; *q++ = 0x06;                                       /* je skip */
+    *q++ = 0x8b; *q++ = 0x11; *q++ = 0x6a; *q++ = 0x01; *q++ = 0xff; *q++ = 0x12;   /* del: the original delete */
+    *q++ = 0xc3;                                                    /* skip: ret */
+    FlushInstructionCache(GetCurrentProcess(), t, (size_t)(q - t));
+    uint8_t c[6] = {0xe8, 0, 0, 0, 0, 0x90};                        /* call t; nop (returns to inc esi) */
+    int32_t rel = (int32_t)((uint32_t)(uintptr_t)t - (site + 5));
+    memcpy(c + 1, &rel, 4);
+    patch(site, c, 6);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ rejoining players
+ * The engine takes players into a running match (its acceptor is polled all match long; the
+ * handshake in 0x1000d8c0 sends the battle state), but always as a new player with the next free
+ * key (0x10023f40) and seat (0x10024c60): a player who came back to a 3-player match became
+ * player 4, with no base and no hero, and their game crashed on their first move (0x100b4a90 finds
+ * no hero). Giving them their old key and seat is not enough either: once the engine has seen the
+ * connection drop (a leave command, 0x1005c530) it sends that player nothing any more.
+ *
+ * So when a player's relay connection drops mid-match the engine is not told: the session stays
+ * "connected" (messages to it are dropped) for HOLD_MS, like a player who does not move. If they
+ * come back (same name) in that time, their new connection does the normal handshake, but with the
+ * old key and seat: the seat is preset in the pending join before state 3 (which then skips the
+ * seat search) and the key comes from key_alloc. The engine sends the battle state on the new
+ * connection, does not register it (0x1005c340 skips a key it already has) and goes on using the
+ * old connection object for that player, which from then on talks to the new relay player id.
+ * The handshake would also dispatch a join command for the player (0x1000cc70, type 0xc); applied
+ * to a player who is already in the game it replaces their player object and record (0x10010010,
+ * 0x10027450) with empty ones on every machine, which crashed the other players a minute later.
+ * But the player coming back needs it (without it their game stays black). So it goes only to
+ * them (ctrl_command): the host's game does not apply it and no one else gets it. And on their
+ * machine (rghost.dll is loaded by every Windows game) client_join keeps the player objects the
+ * battle state already has (their game died a few minutes after the join without it).
+ * Pending joins: ctrl+0x94, list of {prev, next, entry}; entry = {conn wrapper, state, info,
+ * key +0xc, seat +0x10}; our connection object is at wrapper+0x7c. */
+#define HOLD_MS 180000
+static volatile int force_key;
+static int rejoin_off;                   /* the hooks below could not be installed */
+typedef int(TC *key_pool_fn)(void *pool);
+static int TC key_alloc(uint8_t *pool) {
+    int k;
+    if (force_key > 0) { k = force_key; force_key = 0; }
+    else k = ((key_pool_fn)P(0x10023eb0))(pool);
+    ((uint8_t *)(uintptr_t)LD32(pool + 0x1c))[k] = 1;
+    return k;
+}
+/* the server controller's command dispatch (vtable 0x101779a0 slot 9, 0x1000e150): takes a
+ * reference-counted command by value and releases it */
+static volatile int drop_join_key;
+typedef void(TC *ctrl_cmd_fn)(void *ctrl, void *cmd);
+typedef int(TC *obj_int_fn)(void *obj);
+typedef void(TC *obj_unref_fn)(void *obj, int flag);
+typedef void(TC *obj_delete_fn)(void *obj, int flags);
+typedef void(TC *broadcast_fn)(void *sessions, void *cmd);
+static void TC ctrl_command(void *ctrl, void *cmd) {
+    uint32_t c = (uint32_t)(uintptr_t)cmd;
+    if (drop_join_key > 0 && cmd && ((obj_int_fn)P(0x1000ce50))(cmd) == 0xc && (int)LD32(c + 0x44) == drop_join_key) {
+        /* the command's recipients (player keys): array at +0x24, count at +0x2c */
+        static uint32_t only[1];
+        uint32_t keys = LD32(c + 0x24), n = LD32(c + 0x2c);
+        only[0] = (uint32_t)drop_join_key;
+        *(volatile uint32_t *)(uintptr_t)(c + 0x24) = (uint32_t)(uintptr_t)only;
+        *(volatile uint32_t *)(uintptr_t)(c + 0x2c) = 1;
+        ((broadcast_fn)P(0x1005c1d0))((void *)(uintptr_t)LD32((uint32_t)(uintptr_t)ctrl + 0x8c), cmd);
+        *(volatile uint32_t *)(uintptr_t)(c + 0x24) = keys;
+        *(volatile uint32_t *)(uintptr_t)(c + 0x2c) = n;
+        lg("join command for key %d sent only to that player (coming back; %u recipients)", drop_join_key, n);
+        drop_join_key = 0;
+        ((obj_unref_fn)P(0x100f3e70))(cmd, 0);
+        if (!((obj_int_fn)P(0x10112570))(cmd)) ((obj_delete_fn)(uintptr_t)LD32(LD32((uint32_t)(uintptr_t)cmd)))(cmd, 1);
+        return;
+    }
+    ((ctrl_cmd_fn)P(0x1000e150))(ctrl, cmd);
+}
+static int hook_ctrl_command(void) {
+    uint32_t slot = A(0x101779c4);
+    if (LD32(slot) != A(0x1000e150)) return 0;
+    uint32_t fn = (uint32_t)(uintptr_t)ctrl_command;
+    patch(slot, &fn, 4);
+    return 1;
+}
+/* The client controller's join handler (vtable 0x10188d18 slot 0x58, 0x100e16a0): for a key and seat
+ * that are already in the game (records: game+0x1c -> +0xc count, +0x10 array by key; player
+ * objects: game+0x14 -> +0x2c array by seat), put the old objects back after it. */
+typedef void(TC *join_fn)(void *ctrl, void *cmd);
+static uint32_t *join_rec(uint32_t g, int key) {
+    uint32_t recs = LD32(g + 0x1c);
+    return recs && key > 0 && key < (int)LD32(recs + 0xc) && LD32(recs + 0x10) ? (uint32_t *)(uintptr_t)(LD32(recs + 0x10) + 4u * key) : NULL;
+}
+static uint32_t *join_seat(uint32_t g, int seat) {
+    uint32_t seats = LD32(g + 0x14);
+    return seats && seat > 0 && seat <= 4 && LD32(seats + 0x2c) ? (uint32_t *)(uintptr_t)(LD32(seats + 0x2c) + 4u * seat) : NULL;
+}
+static void TC client_join(void *ctrl, void *cmd) {
+    uint32_t g = (uint32_t)(uintptr_t)ctrl, c = (uint32_t)(uintptr_t)cmd;
+    int key = cmd ? (int)LD32(c + 0x44) : 0, seat = cmd ? (int)LD32(c + 0x48) : 0;
+    uint32_t *r = join_rec(g, key), *p = join_seat(g, seat);
+    uint32_t old_rec = r ? *r : 0, old_player = p ? *p : 0;
+    ((join_fn)P(0x100e16a0))(ctrl, cmd);          /* releases cmd */
+    if (old_rec && old_player && (r = join_rec(g, key)) && (p = join_seat(g, seat))) {
+        *r = old_rec;
+        *p = old_player;
+        lg("back in a match: key %d, seat %d kept", key, seat);
+    }
+}
+static int hook_client_join(void) {
+    uint32_t slot = A(0x10188d70);
+    if (LD32(slot) != A(0x100e16a0)) return 0;
+    uint32_t fn = (uint32_t)(uintptr_t)client_join;
+    patch(slot, &fn, 4);
+    return 1;
+}
+static int hook_key_alloc(void) {
+    uint32_t site = A(0x10023f40);
+    /* push esi; mov esi, ecx; call 0x10023eb0; mov ecx, [esi+0x1c]; mov byte [eax+ecx], 1; pop esi; ret */
+    static const uint8_t head[4] = {0x56, 0x8b, 0xf1, 0xe8}, tail[9] = {0x8b, 0x4e, 0x1c, 0xc6, 0x04, 0x08, 0x01, 0x5e, 0xc3};
+    if (memcmp((void *)(uintptr_t)site, head, 4) || memcmp((void *)(uintptr_t)(site + 8), tail, 9)) return 0;
+    uint8_t j[5] = {0xe9};
+    int32_t rel = (int32_t)((uint32_t)(uintptr_t)key_alloc - (site + 5));
+    memcpy(j + 1, &rel, 4);
+    patch(site, j, 5);
+    return 1;
+}
+/* the pending join of a session, or 0 */
+static uint32_t pending_entry(sess_t *s) {
+    if (!srv_ctrl || !s->obj) return 0;
+    for (uint32_t node = LD32(srv_ctrl + 0x94); node; node = LD32(node + 4)) {
+        uint32_t ent = LD32(node + 8);
+        if (ent && LD32(ent) && (uint8_t *)(uintptr_t)LD32(LD32(ent) + 0x7c) == s->obj) return ent;
+    }
+    return 0;
+}
+static void free_queue(sess_t *s) {
+    while (s->in_head) { ev *n = s->in_head->next; free(s->in_head); s->in_head = n; }
+    s->in_tail = NULL;
+}
+/* The new connection has its battle state: the held session now belongs to it. */
+static void take_over(sess_t *s) {
+    sess_t *old = &sess[s->heir_of - 1];
+    s->heir_of = 0;
+    lg("player %d (%s) is back in the match (was player %d)", s->pid, s->name, old->pid);
+    free_queue(old);
+    old->pid = s->pid;
+    old->away = 0;
+    old->in_head = s->in_head;           /* anything the new connection sent after its handshake */
+    old->in_tail = s->in_tail;
+    s->in_head = s->in_tail = NULL;
+    s->used = 0;                         /* by_pid finds the held session now */
+}
+static void track_seats(void) {
+    DWORD now = GetTickCount();
+    for (int i = 0; i < nsess; i++) {
+        sess_t *s = &sess[i];
+        if (s->used && s->away && now - s->away_since > HOLD_MS) {
+            s->away = 0;
+            s->closed = 1;
+            lg("player %d (%s) did not come back; the engine is told", s->pid, s->name);
+        }
+        if (!s->used || s->closed || s->key || !s->accepted) continue;
+        uint32_t ent = pending_entry(s);
+        if (!ent) continue;
+        uint32_t st = LD32(ent + 4), key = LD32(ent + 0xc), slot = LD32(ent + 0x10);
+        if (st == 3 && slot == 0 && !s->checked && s->name[0]) {
+            s->checked = 1;
+            for (int j = 0; j < nsess; j++) {
+                sess_t *o = &sess[j];
+                if (o != s && o->used && o->away && o->key > 0 && o->slot > 0 && !_stricmp(o->name, s->name)) {
+                    o->away_since = now;         /* do not give the seat up during the handshake */
+                    s->heir_of = j + 1;
+                    *(volatile uint32_t *)(uintptr_t)(ent + 0x10) = (uint32_t)o->slot;
+                    force_key = o->key;
+                    drop_join_key = o->key;
+                    lg("player %d (%s) comes back: key %d, seat %d", s->pid, s->name, o->key, o->slot);
+                    break;
+                }
+            }
+        }
+        if (st == 4 && key) {
+            s->key = (int)key;
+            s->slot = (int)slot;
+            lg("player %d (%s) is key %u, seat %u", s->pid, s->name, key, slot);
+        }
+    }
+}
+
 static int installed;
 static int install(void) {
     if (installed) return installed > 0;
@@ -468,6 +698,9 @@ static int install(void) {
     delta = (uint32_t)(uintptr_t)m - IMAGE_BASE;
     if (fix_place_tile_enter()) lg("engine fix: PlaceTileUIState layer for players out of the game");
     patch_host_player();
+    if (fix_member_clear()) lg("engine fix: online user kept out of the casino member clear");
+    if (!hook_client_join()) lg("engine differs; going back into a match is not safe");
+    if (!hook_key_alloc() || !hook_ctrl_command()) { rejoin_off = 1; lg("engine differs; players who lose the connection are not held"); }
     for (int i = 0; i < 40; i++) listener_vt[i] = conn_vt[i] = addr_vt[i] = bad_slots[i];
     listener_vt[0] = (void *)any_dtor;
     listener_vt[0x4c / 4] = (void *)l_accept;
@@ -513,7 +746,7 @@ static DWORD last_ping, retry;
 
 /* The LAN host screen is up: offer the room on the relay (pump connects the first time). */
 static void start_serving(void) {
-    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used) sess[i].closed = 1;    /* a previous game's players */
+    for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;    /* a previous game's players */
     if (hosting && ws_up) {      /* hosting again: offer the room on the open relay connection */
         char json[300];
         snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d}", room, remote_players);
@@ -576,7 +809,7 @@ static int show_hero_select(int players) {
 
 /* A match is running while a remote player's connection is alive. */
 static int match_live(void) {
-    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used && sess[i].accepted && !sess[i].closed) return 1;
+    for (int i = 0; i < nsess; i++) if (sess[i].used && sess[i].accepted && !sess[i].closed) return 1;
     return 0;
 }
 
@@ -597,7 +830,7 @@ JNIEXPORT jboolean JNICALL Java_rg_HostServer_install(JNIEnv *env, jclass c) {
 JNIEXPORT jint JNICALL Java_rg_HostServer_players(JNIEnv *env, jclass c) {
     (void)env; (void)c;
     int n = 0;
-    for (int i = 0; i < MAX_SESS; i++) if (sess[i].used && !sess[i].closed) n++;
+    for (int i = 0; i < nsess; i++) if (sess[i].used && !sess[i].closed) n++;
     return n;
 }
 
@@ -652,18 +885,34 @@ JNIEXPORT void JNICALL Java_rg_HostServer_pump(JNIEnv *env, jclass c) {
     DWORD now = GetTickCount();
     if (!ws_up && ws == INVALID_SOCKET && (now - retry > 2000 || !retry)) { retry = now ? now : 1; ws_connect(); }
     if (ws_up && now - last_ping > 15000) { last_ping = now; ws_send(1, "{\"t\":\"ping\"}", 12); }
+    track_seats();
     ev *e;
     while ((e = pop_ev())) {
         sess_t *s = by_pid(e->pid);
         if (e->kind == EV_JOIN) {
             if (s && s->closed) s = NULL;      /* the same relay pid in a new game */
             if (!s) {
-                for (int i = 0; i < MAX_SESS && !s; i++) if (!sess[i].used) s = &sess[i];
-                if (s) { memset(s, 0, sizeof *s); s->used = 1; s->pid = e->pid; lg("player %d joined", e->pid); }
+                if (nsess < MAX_SESS) s = &sess[nsess++];
+                else lg("FATAL: no player slot left");
+                if (s) {
+                    memset(s, 0, sizeof *s);
+                    s->used = 1;
+                    s->pid = e->pid;
+                    if (e->len > 0) snprintf(s->name, sizeof s->name, "%.*s", e->len, (const char *)e->data);
+                    lg("player %d (%s) joined", e->pid, s->name);
+                }
             }
             free(e);
-        } else if (e->kind == EV_LEAVE) {
-            if (s) { s->closed = 1; lg("player %d left", e->pid); }
+        } else if (e->kind == EV_LEAVE || e->kind == EV_LOST) {
+            if (s && e->kind == EV_LOST && serving && !rejoin_off && s->key > 0 && !s->closed) {
+                s->away = 1;            /* the seat is held: see track_seats */
+                s->away_since = GetTickCount();
+                free_queue(s);
+                lg("player %d (%s) lost the connection; seat %d held", e->pid, s->name, s->slot);
+            } else if (s) {
+                s->closed = 1;
+                lg("player %d left", e->pid);
+            }
             free(e);
         } else if (e->kind == EV_DATA && s) {
             e->next = NULL;
@@ -672,7 +921,7 @@ JNIEXPORT void JNICALL Java_rg_HostServer_pump(JNIEnv *env, jclass c) {
         } else if (e->kind == EV_CLOSED) {
             lg("relay connection lost");
             if (ws != INVALID_SOCKET) { closesocket(ws); ws = INVALID_SOCKET; }
-            for (int i = 0; i < MAX_SESS; i++) if (sess[i].used) sess[i].closed = 1;
+            for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;
             free(e);
         } else free(e);
     }

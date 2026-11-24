@@ -21,6 +21,7 @@ export const PROTOCOL_VERSION = 1;
 export const MAX_PACKET = 2048;          // the engine's shared net buffer
 export const MAX_ROOM_MEMBERS = 4;       // createGameRoom(name, null, 4, ...)
 export const MAX_NAME = 15;              // SMArenaValidator
+export const STALE_MS = 20_000;         // clients ping every 15 s: a connection silent for longer is presumed dead
 // Permanent lobby rooms the original SNAP server provided. The engine joins "CasinoSystem"
 // first and does its matchmaking with the casino bot there, then moves to a game room.
 export const LOBBY_ROOMS = { CasinoSystem: 1000 };
@@ -35,6 +36,7 @@ class Client {
     this.close = close;
     this.name = null;
     this.room = null;
+    this.lost = false;          // leaving its room because the connection dropped
     this.lastSeen = Date.now();
   }
   ctl(msg) {
@@ -55,7 +57,8 @@ export class Relay {
     this.stats = { packets: 0, bytes: 0, connections: 0 };
     for (const [name, max] of Object.entries(LOBBY_ROOMS)) {
       this.rooms.set(name.toLowerCase(), { key: name.toLowerCase(), name, members: new Set(), created: this.now(), max, permanent: true,
-        bot: new Casino({ send: (client, bytes) => client.send(bytes), log, expectRoom: (n, k) => this.expectRoom(n, k) }) });
+        bot: new Casino({ send: (client, bytes) => client.send(bytes), log, expectRoom: (n, k) => this.expectRoom(n, k),
+          isServed: (n) => this.servers.has(n.toLowerCase()) }) });
     }
     this.rooms.get('casinosystem').bot.matchSize = matchSize;
   }
@@ -107,7 +110,17 @@ export class Relay {
     if (typeof m.name !== 'string' || !NAME_RE.test(m.name)) {
       return c.ctl({ t: 'error', op: 'hello', code: 'bad_name' });
     }
-    // Names are display names only (no accounts yet); make them unique per server.
+    // Names are display names only (no accounts yet); make them unique per server. A connection
+    // with this name that has been silent for longer than a ping interval is the same player
+    // whose game crashed or lost the network: it is dropped, so they keep their name (and can go
+    // back into their match, see Casino.droppedOut).
+    for (const o of [...this.clients.values()]) {
+      if (o !== c && !o.serves && o.name?.toLowerCase() === m.name.toLowerCase() && o.lastSeen < this.now() - STALE_MS) {
+        this.log(`replacing silent connection ${o.id} of ${o.name}`);
+        this.disconnect(o);
+        try { o.close(4002, 'replaced'); } catch { /* already gone */ }
+      }
+    }
     let name = m.name;
     const taken = new Set([...this.clients.values()].filter((o) => o !== c && o.name).map((o) => o.name.toLowerCase()));
     for (let i = 2; taken.has(name.toLowerCase()); i++) {
@@ -189,9 +202,11 @@ export class Relay {
   }
 
   unserve(c) {
-    this.rooms.get('casinosystem').bot.removeHosted(c.serves);
+    this.rooms.get('casinosystem').bot.gameOver(c.serves);
     this.servers.delete(c.serves);
-    this.rooms.get(c.serves)?.bot?.detachServer();
+    const room = this.rooms.get(c.serves);
+    room?.bot?.detachServer();
+    if (room && room.members.size === 0 && !room.permanent) this.removeRoom(room);
     c.serves = null;
   }
 
@@ -216,15 +231,25 @@ export class Relay {
     if (!room) return reason === 'left' ? c.ctl({ t: 'left', room: null }) : undefined;
     room.members.delete(c);
     c.greeted?.delete(room);
+    c.lost = reason === 'disconnected';
     if (room.bot) room.bot.leave(c);
+    if (room.bot && !room.permanent && c.name) {      // a game room: may the player come back?
+      const casino = this.rooms.get('casinosystem').bot;
+      if (reason === 'disconnected') casino.droppedOut(room.key, c.name);
+      else casino.leftGame(room.key, c.name);
+    }
     c.room = null;
     if (reason === 'left') c.ctl({ t: 'left', room: room.name });
     for (const o of room.members) o.ctl({ t: 'peer_left', room: room.name, name: c.name, reason });
-    if (room.members.size === 0 && !room.permanent) {
-      clearTimeout(room.startTimer);
-      this.rooms.delete(room.key);
-      this.log(`room - ${room.name}`);
-    }
+    // a hosted match stays while its host serves it: a player whose connection dropped may come back
+    if (room.members.size === 0 && !room.permanent && !this.servers.has(room.key)) this.removeRoom(room);
+  }
+
+  removeRoom(room) {
+    clearTimeout(room.startTimer);
+    room.bot?.close?.();
+    this.rooms.delete(room.key);
+    this.log(`room - ${room.name}`);
   }
 
   onBinary(c, bytes) {

@@ -1,0 +1,2 @@
+src/dist/*.cmd text eol=crlf
+src/dist/*.ps1 text eol=crlf

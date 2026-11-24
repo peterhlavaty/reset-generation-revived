@@ -40,6 +40,21 @@ MULTIPLAYER (2-4 players, LAN or one PC; nothing to install or type in)
      starts. The host plays too.
   After a match the host presses F5 again (the title bar says so) and the
   others choose Play Again.
+  If the others cannot find the host ("Could not connect"), double-click
+  LAN-Setup.cmd on the host PC and confirm the administrator prompt. It
+  opens port 8787 (TCP and UDP) in Windows Firewall to the local network
+  only, in any network type, and removes rules that block the game (made
+  when the firewall question was cancelled). Once per PC is enough;
+  "LAN-Setup.cmd -Remove" undoes it. An antivirus with its own firewall
+  (ESET, Norton, McAfee...) replaces Windows Firewall: LAN-Setup.cmd warns
+  about it, and the game (or port 8787) has to be allowed in that program.
+  A VPN can also hide the PC from the local network: turn it off.
+  If a player's game crashes or loses the connection during a match, the
+  host keeps their place for 3 minutes (their turns time out meanwhile):
+  that player starts the game again with the same name and chooses
+  Online -> Quick Match. They go back into the same match, with the same
+  colour, hero and board. If they do not, the match goes on without them.
+  (If the host quits, the match ends for everyone.)
   To try it alone on one PC, start the .exe several times (the second one
   can use: ResetGeneration-Revived.exe --nickname=Bob).
   Over the internet: run your own relay (the project's server/ folder) and

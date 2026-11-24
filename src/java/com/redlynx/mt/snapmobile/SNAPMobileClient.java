@@ -2,6 +2,8 @@ package com.redlynx.mt.snapmobile;
 
 import com.redlynx.mt.snapmobile.actions.SMAction;
 import com.redlynx.mt.snapmobile.actions.SMActionInit;
+import com.redlynx.mt.snapmobile.actions.SMActionLogin;
+import com.redlynx.mt.snapmobile.actions.SMActionLoginManual;
 import com.redlynx.mt.snapmobile.actions.SMActionLogout;
 import com.redlynx.mt.snapmobile.events.SMEvent;
 import com.redlynx.mt.snapmobile.events.SMEventConnectedToGameroom;
@@ -36,13 +38,24 @@ public class SNAPMobileClient implements Runnable {
     /** How long Quick Match looks for a hosted game on the LAN. */
     private static final long AUTO_FIND_MS = 20000;
     public static String nickname = null;
-    /** -Drg.netdebug=true prints every action, event and relay reply to stdout. */
+    /** -Drg.netdebug=true prints every action, event, relay reply and game packet to stdout. */
     static final boolean DEBUG = Boolean.getBoolean("rg.netdebug");
+    private static final long DEBUG_START = System.currentTimeMillis();
 
     static void debug(String s) {
         if (DEBUG) {
-            System.out.println("net: " + s);
+            long t = System.currentTimeMillis() - DEBUG_START;
+            System.out.println("net: " + t / 1000 + "." + t / 100 % 10 + " " + s);
         }
+    }
+
+    /** "len: hex" of a game packet (the first 48 bytes). */
+    static String hex(byte[] d) {
+        StringBuilder b = new StringBuilder().append(d.length).append(':');
+        for (int i = 0; i < d.length && i < 48; i++) {
+            b.append(' ').append(Character.forDigit((d[i] >> 4) & 15, 16)).append(Character.forDigit(d[i] & 15, 16));
+        }
+        return d.length > 48 ? b.append(" ...").toString() : b.toString();
     }
 
     public static final int WEB_SERVICE_AUTH_FAILURE = 965;
@@ -59,9 +72,11 @@ public class SNAPMobileClient implements Runnable {
     private ServerCommBridge serverCommBridge = new ServerCommBridge();
     private final Object actionLock = new Object();
     private final Object eventLock = new Object();
-    String gameRoomID;
-    String gameRoomName;
-    boolean isInGameRoom;
+    volatile String gameRoomID;
+    volatile String gameRoomName;
+    volatile boolean isInGameRoom;
+    /** The room enterRoom is waiting for (see onRelayJoined). */
+    private volatile String entering;
     private final LinkedList<SMEvent> eventsQueue = new LinkedList<SMEvent>();
     private final LinkedList<SMAction> actionsQueue = new LinkedList<SMAction>();
     boolean isRunning;
@@ -148,13 +163,15 @@ public class SNAPMobileClient implements Runnable {
         if (this.isInGameRoom && !name.equalsIgnoreCase(this.gameRoomName)) {
             this.leaveRoomInternal(this.gameRoomName);
         }
-        Map<String, Object> reply = r.request("{\"t\":\"" + op + "\",\"room\":" + Json.quote(name) + "}", "joined");
+        Map<String, Object> reply;
+        this.entering = name;
+        try {
+            reply = r.request("{\"t\":\"" + op + "\",\"room\":" + Json.quote(name) + "}", "joined");
+        } finally {
+            this.entering = null;
+        }
         if (reply != null && "joined".equals(reply.get("t"))) {
-            this.isInGameRoom = true;
-            this.gameRoomName = name;
-            this.gameRoomID = name;
-            this.addEvent(new SMEventConnectedToGameroom());
-            return true;
+            return true;    // onRelayJoined entered the room
         }
         SMLog.printf("Relay " + op + "(" + name + ") failed: " + (reply == null ? "timeout" : reply.get("code")) + "\n");
         this.isInGameRoom = false;
@@ -189,8 +206,29 @@ public class SNAPMobileClient implements Runnable {
         this.addEvent(new SMEventDisconnectedFromGameroom(roomname));
     }
 
+    /**
+     * Called on the WebSocket thread for the relay's "joined", before the packets right behind it.
+     * The casino and game rooms greet a joiner at once; when the room was only entered by the
+     * action thread after the reply, a greeting could arrive first and be dropped. Without the
+     * casino's hello the engine never starts its keep-alive and drops the connection 20 s later
+     * ("Connection..."), which happened now and then when coming back to the casino after a match.
+     */
+    void onRelayJoined() {
+        String name = this.entering;
+        if (name != null) {
+            this.entering = null;
+            this.gameRoomName = name;
+            this.gameRoomID = name;
+            this.isInGameRoom = true;
+            this.addEvent(new SMEventConnectedToGameroom());
+        }
+    }
+
     /** Called on the WebSocket thread for every game packet from another room member. */
     void onRelayPacket(byte[] data) {
+        if (DEBUG) {
+            debug("recv " + hex(data));
+        }
         if (this.isInGameRoom && data.length <= NETBUFFER_SIZE) {
             this.addEvent(new SMEventDataReceived(data, this.gameRoomName));
         }
@@ -370,17 +408,36 @@ public class SNAPMobileClient implements Runnable {
             if (action instanceof SMActionLogout) {
                 this.logoutQueued = true;
             }
+            if (action instanceof SMActionLoginManual || action instanceof SMActionLogin) {
+                // A new attempt (NativeSNAPMobileInterface.login(), engine thread, before the engine
+                // polls getLoginScreenStatus). The engine logs in with login() and never calls
+                // startLoginScreen(), which is what reset these: an earlier "no host found" kept
+                // reporting "cannot connect" at once, and an earlier logout reported "cancelled",
+                // so the client could not get online again until it was restarted.
+                this.loginErrorState = ERROR_LOGIN_NO_ERROR;
+                this.loginCancelled = false;
+            }
             this.actionsQueue.add(action);
             this.actionLock.notify();
         }
     }
 
+    /**
+     * The connection is gone: drop the pending actions and log out. A logout that is already
+     * queued (e.g. the engine's own, from another thread) is kept: clearing it while logoutQueued
+     * stayed set used to drop every later action and login for good.
+     */
     private void handleError(int errorCode) {
-        synchronized (this.actionLock) {
-            this.actionsQueue.clear();
-        }
         this.addEvent(new SMEventDisconnectedFromNAF(errorCode));
-        this.addAction(new SMActionLogout(false), false);
+        synchronized (this.actionLock) {
+            this.actionsQueue.removeIf(a -> !(a instanceof SMActionLogout));
+            if (this.actionsQueue.isEmpty()) {
+                debug("action SMActionLogout (connection lost)");
+                this.logoutQueued = true;
+                this.actionsQueue.add(new SMActionLogout(false));
+                this.actionLock.notify();
+            }
+        }
     }
 
     public void retryJoinRoom(String name) {

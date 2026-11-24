@@ -33,3 +33,19 @@ test('a queued player who disconnects is announced with EVENT CASINO_CANCEL_MATC
   assert.equal(r.str(), aId);
   assert.equal(sent.filter(([c]) => c === a).length, 0); // the leaving player gets nothing
 });
+
+test('a player coming back to the casino keeps their id; a second connection with the same name does not', () => {
+  const casino = new Casino({ send: () => {} });
+  const a = { name: 'A' }, b = { name: 'B' };
+  casino.join(a);
+  casino.join(b);
+  const aId = casino.profile(a).id;
+  casino.leave(a);                                       // a goes to a match ...
+  const a2 = { name: 'A' };
+  casino.join(a2);                                       // ... and comes back on a new connection
+  assert.equal(casino.profile(a2).id, aId);              // the engine keys its member map by this id
+  const a3 = { name: 'A' };
+  casino.join(a3);                                       // same name while a2 is still here
+  assert.notEqual(casino.profile(a3).id, aId);
+  assert.notEqual(casino.profile(a3).id, casino.profile(b).id);
+});

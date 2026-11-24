@@ -68,6 +68,7 @@ static item *pop(queue *q) { item *it = q->head; if (it) { q->head = it->next; i
 static int logged_in, cancelled, logout_queued, login_in_progress, err_state, credentials_ok;
 static int in_room, join_retries;
 static char room[72];
+static char entering[72];            /* the room enter_room is waiting for: see enter_room */
 
 static void add_event(item *it) { pthread_mutex_lock(&lock); push(&events, it); pthread_mutex_unlock(&lock); }
 
@@ -147,12 +148,15 @@ static void on_disconnect(int gen) {
     pthread_mutex_unlock(&lock);
     if (was) {
         host_log("net: relay connection lost");
-        pthread_mutex_lock(&lock);
-        item *it;
-        while ((it = pop(&actions))) free(it);
-        pthread_mutex_unlock(&lock);
         add_event(mk(E_NAF, 0, NULL, NULL, 0));
-        add_action(mk(A_LOGOUT, 0, NULL, NULL, 0), 1);
+        /* drop the pending actions but keep a queued logout (e.g. the engine's own) */
+        pthread_mutex_lock(&lock);
+        queue keep = {NULL, NULL};
+        item *it;
+        while ((it = pop(&actions))) { it->next = NULL; if (it->kind == A_LOGOUT) push(&keep, it); else free(it); }
+        actions = keep;
+        if (!actions.head) { logout_queued = 1; push(&actions, mk(A_LOGOUT, 0, NULL, NULL, 0)); pthread_cond_signal(&action_cv); }
+        pthread_mutex_unlock(&lock);
     }
 }
 
@@ -175,6 +179,12 @@ static void *reader(void *arg) {
             json_str((char *)msg, "t", t, sizeof t);
             if (!strcmp(t, "pong") || !strcmp(t, "peer_joined") || !strcmp(t, "peer_left")) continue;
             pthread_mutex_lock(&lock);
+            if (!strcmp(t, "joined") && entering[0]) {   /* before the packets behind it */
+                snprintf(room, sizeof room, "%s", entering);
+                in_room = 1;
+                entering[0] = 0;
+                push(&events, mk(E_CONNECTED, 0, NULL, NULL, 0));
+            }
             snprintf(reply, sizeof reply, "%s", (char *)msg);
             reply_seq++;
             pthread_cond_broadcast(&reply_cv);
@@ -301,14 +311,18 @@ static int enter_room(const char *op, const char *name) {
         in_room = 0;
     }
     snprintf(json, sizeof json, "{\"t\":\"%s\",\"room\":\"%s\"}", op, name);
-    if (request(json, "joined", out, sizeof out)) {
-        pthread_mutex_lock(&lock);
-        snprintf(room, sizeof room, "%s", name);
-        in_room = 1;
-        pthread_mutex_unlock(&lock);
-        add_event(mk(E_CONNECTED, 0, NULL, NULL, 0));
-        return 1;
-    }
+    /* The reader enters the room on the relay's "joined", not this thread after the reply: the
+       casino and game rooms greet a joiner right behind it, and a greeting dropped as "not in a
+       room" left the engine without the casino's hello, so it never started its keep-alive and
+       dropped the connection 20 s later ("Connection..."). */
+    pthread_mutex_lock(&lock);
+    snprintf(entering, sizeof entering, "%s", name);
+    pthread_mutex_unlock(&lock);
+    int ok = request(json, "joined", out, sizeof out);
+    pthread_mutex_lock(&lock);
+    entering[0] = 0;
+    pthread_mutex_unlock(&lock);
+    if (ok) return 1;
     char code[32];
     json_str(out, "code", code, sizeof code);
     host_log("net: %s(%s) failed: %s", op, name, code[0] ? code : "timeout");
@@ -436,7 +450,15 @@ int net_login_status(void) {
 }
 int net_login_cancelled(void) { return cancelled; }
 int net_is_logged_in(void) { return logged_in; }
-int net_login(void) { add_action(mk(A_LOGIN, 0, NULL, NULL, 0), 1); return 1; }
+/* A new attempt: the engine logs in with login() and never calls startLoginScreen(), so an
+ * earlier failure ("cannot connect") or logout ("cancelled") must not answer for this one. */
+int net_login(void) {
+    err_state = 0;
+    cancelled = 0;
+    login_in_progress = 1;
+    add_action(mk(A_LOGIN, 0, NULL, NULL, 0), 1);
+    return 1;
+}
 void net_logout(void) { add_action(mk(A_LOGOUT, 0, NULL, NULL, 0), 1); cancelled = 1; }
 void net_room(const char *op, const char *name) {
     if (!name) return;

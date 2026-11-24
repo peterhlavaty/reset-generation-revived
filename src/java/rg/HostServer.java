@@ -35,7 +35,11 @@ final class HostServer {
     private static String lanAddress;
     private static long start, nextAuto, lastNudge;
     private static int games, wanted, shownPlayers = -1;
+    /** All players had joined: the match is running (a player who drops does not reopen it). */
+    private static boolean matchStarted;
     private static final List<long[]> keys = new ArrayList<long[]>();
+    /** --perflog=N: every N seconds print the tick rate, the slowest tick and the Java heap. */
+    private static long perfEvery = -1, perfStart, perfTicks, perfLast, perfWorst;
 
     static native boolean install();
     static native boolean chdir(String dir);
@@ -60,6 +64,31 @@ final class HostServer {
     static native void pump();
 
     private HostServer() {
+    }
+
+    private static void perf() {
+        if (perfEvery < 0) {
+            perfEvery = Revived.optInt("perflog", 0) * 1000L;
+        }
+        if (perfEvery == 0) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (perfStart == 0) {
+            perfStart = perfLast = now;
+        }
+        perfWorst = Math.max(perfWorst, now - perfLast);
+        perfLast = now;
+        perfTicks++;
+        if (now - perfStart >= perfEvery) {
+            Runtime r = Runtime.getRuntime();
+            System.out.printf("perf: %.1f ticks/s, slowest %d ms, heap %d/%d MB, threads %d%n",
+                    perfTicks * 1000.0 / (now - perfStart), perfWorst, (r.totalMemory() - r.freeMemory()) >> 20,
+                    r.maxMemory() >> 20, Thread.activeCount());
+            perfStart = now;
+            perfTicks = 0;
+            perfWorst = 0;
+        }
     }
 
     /** F5 (AWT thread): host at the next engine tick. */
@@ -171,6 +200,7 @@ final class HostServer {
         hosting = true;
         wanted = players - 1;
         shownPlayers = -1;
+        matchStarted = false;
         System.out.println("HostServer: hosting " + room + " for " + players + " players"
                 + (hero == -2 ? " (choosing a hero)" : hero >= 0 ? " as " + HEROES[hero] : ""));
         return true;
@@ -283,6 +313,7 @@ final class HostServer {
 
     /** Called once per engine tick, after the engine's own tick. */
     static void tick(ResetGeneration rg) {
+        perf();
         if (!loaded) {
             loaded = true;
             start = System.currentTimeMillis();
@@ -347,10 +378,19 @@ final class HostServer {
             }
         } else if (hosting) {
             int n = players();
+            if (n >= wanted && !matchStarted) {
+                matchStarted = true;
+                shownPlayers = -1;
+            }
             if (n != shownPlayers) {
                 shownPlayers = n;
-                Revived.setStatus(n < wanted ? "hosting" + (lanAddress == null ? "" : " on " + lanAddress)
-                        + ", waiting for players " + n + "/" + wanted + " (others: Quick Match)" : "hosting");
+                if (matchStarted) {
+                    Revived.setStatus(n < wanted ? "hosting: match running, " + n + "/" + wanted + " players still connected"
+                            : "hosting: match running");
+                } else {
+                    Revived.setStatus("hosting" + (lanAddress == null ? "" : " on " + lanAddress)
+                            + ", waiting for players " + n + "/" + wanted + " (others: Quick Match)");
+                }
             }
         }
     }

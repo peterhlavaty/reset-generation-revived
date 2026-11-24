@@ -97,7 +97,9 @@ final class GameRoom implements Relay.Bot {
     public void leave(Relay.Client client) {
         Player p = this.players.remove(client);
         if (p != null && p.announced && this.server != null) {
-            this.server.ctl(Relay.msg("t", "player_left", "pid", p.sid));
+            // lost: the connection dropped (not a normal leave); the host holds the seat for a while
+            this.server.ctl(client.lost ? Relay.msg("t", "player_left", "pid", p.sid, "lost", 1)
+                    : Relay.msg("t", "player_left", "pid", p.sid));
         }
         if (p != null && p.seat != null) {
             this.seatLeft(p.pid);

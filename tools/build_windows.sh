@@ -54,6 +54,8 @@ cp "$R/src/dist/revived.ini" "$OUT/$APP/app/revived.ini"
 CC32=${CC32:-$(ls -d /c/dev/toolchains/llvm-mingw-*-ucrt-x86_64 | tail -1)/bin/i686-w64-mingw32-clang}
 "$CC32" -O2 -Wall -Wno-ignored-attributes -shared -static -I"$JDK/include" -I"$JDK/include/win32"   "$R/native/win32/rghost.c" -o "$OUT/$APP/app/rghost.dll" -lws2_32 -Wl,--kill-at
 cp "$R/src/dist/README.txt" "$OUT/$APP/README.txt"
+cp "$R/src/dist/LAN-Setup.cmd" "$OUT/$APP/LAN-Setup.cmd"           # firewall setup for hosting
+cp "$R/src/dist/lan-setup.ps1" "$OUT/$APP/app/lan-setup.ps1"
 echo "Built $OUT/$APP"
 du -sh "$OUT/$APP"
 # 7. The same folder as one zip to copy to other PCs (unzip, double-click the .exe).

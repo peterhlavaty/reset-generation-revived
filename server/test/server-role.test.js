@@ -84,3 +84,102 @@ test('no SEAT_LEAVE events to the others once a game server serves the room', ()
   assert.deepEqual(sent.filter(([c]) => c === b), []);
   room.close();
 });
+
+test('a player whose connection dropped in a hosted match goes back into it with Quick Match', async () => {
+  const { Relay } = await import('../src/relay.js');
+  const relay = new Relay({ matchSize: 0 });
+  const casino = relay.rooms.get('casinosystem').bot;
+  const player = (name) => {
+    const p = relay.connect(() => {}, () => {});
+    p.onText(JSON.stringify({ t: 'hello', v: 1, name }));
+    p.onText(JSON.stringify({ t: 'join', room: 'CasinoSystem' }));
+    return p;
+  };
+  const quickMatch = (p) => p.onBinary(frame(0x12, new Writer().u8(0).u8(9).str('PLUMBER').str('FALSE').bytes()));
+  const host = relay.connect(() => {}, () => {});
+  host.onText(JSON.stringify({ t: 'hello', v: 1, name: 'RGHost' }));
+  host.onText(JSON.stringify({ t: 'serve', room: 'HOST_Ann', players: 1 }));
+  const bob = player('Bob');
+  quickMatch(bob);
+  casino.locked(bob.client);                                     // Bob answers LOCK_PLAYER_IN_GAME
+  bob.onText(JSON.stringify({ t: 'move', room: 'HOST_Ann' }));
+  assert.equal(bob.client.room.name, 'HOST_Ann');
+  const started = [];
+  casino.startMatch = (group, room) => started.push([group.map((q) => q.client.name), room]);
+  bob.onClose();                                                 // Bob's game crashes mid-match
+  const cid = player('Cid');
+  quickMatch(cid);                                               // someone else: waits for a new game
+  assert.deepEqual(started, []);
+  const bob2 = player('Bob');
+  quickMatch(bob2);                                              // Bob is back: straight into his match
+  assert.deepEqual(started, [[['Bob'], 'HOST_Ann']]);
+  quickMatch(bob2);                                              // only once per drop
+  assert.equal(started.length, 1);
+  // not sent back: a player who left the match the normal way (surrendered), one who comes back too
+  // late, anyone after the match ended
+  casino.running.set('host_ann', 'HOST_Ann');
+  casino.droppedOut('host_ann', 'Dan');
+  casino.leftGame('host_ann', 'Dan');
+  quickMatch(player('Dan'));
+  const { REJOIN_MS } = await import('../src/casino.js');
+  casino.droppedOut('host_ann', 'Fay');
+  casino.dropped.get('host_ann').set('fay', Date.now() - REJOIN_MS - 1);   // too late: the host gave the seat up
+  quickMatch(player('Fay'));
+  casino.droppedOut('host_ann', 'Eve');
+  host.onText(JSON.stringify({ t: 'unserve' }));                 // match over
+  quickMatch(player('Eve'));
+  assert.equal(started.length, 1);
+});
+
+test('a new connection takes over the name of a silent one (the same player after a crash)', async () => {
+  const { Relay } = await import('../src/relay.js');
+  let now = 1_000_000;
+  const relay = new Relay({ matchSize: 0, now: () => now });
+  const replies = [];
+  const hello = (name) => {
+    const p = relay.connect((m) => replies.push(m), () => {});
+    p.onText(JSON.stringify({ t: 'hello', v: 1, name }));
+    return p;
+  };
+  const a = hello('Bob');
+  now += 5_000;
+  const b = hello('Bob');                                        // the first one is alive: renamed
+  assert.equal(b.client.name, 'Bob2');
+  b.onClose();
+  now += 30_000;                                                  // a has been silent for 35 s
+  const c = hello('Bob');
+  assert.equal(c.client.name, 'Bob');
+  assert.equal(relay.clients.has(a.client.id), false);
+});
+
+test('the game server is told when a player was lost (dropped connection), so it can hold the seat', () => {
+  const { room, ctl } = setup();
+  const a = { name: 'A' }, b = { name: 'B' };
+  room.join(a);
+  room.join(b);
+  room.packet(a, frame(CH_TABLE, new Writer().u8(0).u8(13).u32(7).bytes()));
+  room.packet(b, frame(CH_TABLE, new Writer().u8(0).u8(13).u32(8).bytes()));
+  room.leave(a);                                        // a normal leave
+  b.lost = true;
+  room.leave(b);                                        // b's connection dropped
+  assert.deepEqual(ctl.slice(2), [{ t: 'player_left', pid: 1 }, { t: 'player_left', pid: 2, lost: 1 }]);
+  room.close();
+});
+
+test('a hosted match room stays while its host serves it, so its last player can come back', async () => {
+  const { Relay } = await import('../src/relay.js');
+  const relay = new Relay({ matchSize: 0 });
+  const host = relay.connect(() => {}, () => {});
+  host.onText(JSON.stringify({ t: 'hello', v: 1, name: 'RGHost' }));
+  host.onText(JSON.stringify({ t: 'serve', room: 'HOST_Ann', players: 1 }));
+  relay.expectRoom('HOST_Ann', 1);
+  const bob = relay.connect(() => {}, () => {});
+  bob.onText(JSON.stringify({ t: 'hello', v: 1, name: 'Bob' }));
+  bob.onText(JSON.stringify({ t: 'join', room: 'HOST_Ann' }));
+  const room = relay.rooms.get('host_ann');
+  assert.ok(room?.bot);
+  bob.onClose();                                                 // a 2-player match: the only client drops
+  assert.equal(relay.rooms.get('host_ann'), room);               // the room and its game server stay
+  host.onText(JSON.stringify({ t: 'unserve' }));                 // match over
+  assert.equal(relay.rooms.has('host_ann'), false);
+});

@@ -120,7 +120,8 @@ export class GameRoom {
   leave(client) {
     const p = this.players.get(client);
     this.players.delete(client);
-    if (p?.announced) this.server?.ctl({ t: 'player_left', pid: p.sid });
+    // lost: the connection dropped (not a normal leave); the host holds the seat for a while
+    if (p?.announced) this.server?.ctl(client.lost ? { t: 'player_left', pid: p.sid, lost: 1 } : { t: 'player_left', pid: p.sid });
     if (p?.seat) this.seatLeft(p.pid);
     if (!this.players.size) this.close();
   }

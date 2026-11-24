@@ -116,17 +116,24 @@ export function hex(b) { return Array.from(b, (x) => x.toString(16).padStart(2, 
  * Matchmaker bot for the CasinoSystem room. `send(client, bytes)` delivers a packet to one
  * player. Requests it does not understand are logged so the protocol can be extended.
  */
+/** How long a dropped player may come back: the host holds the seat for 180 s (rghost HOLD_MS). */
+export const REJOIN_MS = 170_000;
+
 export class Casino {
-  constructor({ send, log = () => {}, expectRoom = () => {} }) {
+  constructor({ send, log = () => {}, expectRoom = () => {}, isServed = () => false }) {
     this.send = send;
     this.expectRoom = expectRoom;
+    this.isServed = isServed;
     this.log = log;
     this.players = new Map();     // client -> {name, state}
     this.queue = [];              // clients waiting in Quick Match (CASINO_MATCHMAKING)
     this.locking = new Map();     // client -> match waiting for LOCK_PLAYER_IN_GAME answers
     this.nextTable = 1;
+    this.ids = new Map();         // nickname -> player id
     this.matchSize = 2;
     this.hosted = [];             // host players' games waiting for players: {room, players}
+    this.running = new Map();     // hosted matches being played: room key -> room name
+    this.dropped = new Map();     // room key -> Map of (lower-case) names that lost the connection in it -> when
     this.pingSeq = 1;
     this.timer = null;
   }
@@ -141,8 +148,7 @@ export class Casino {
   }
 
   join(client) {
-    this.nextPlayerId = (this.nextPlayerId ?? 0) + 1;
-    this.players.set(client, { name: client.name, state: 'joined', id: this.nextPlayerId });
+    this.players.set(client, { name: client.name, state: 'joined', id: this.playerId(client.name) });
     // The client starts its casino session once the room's server has spoken. Like a peer,
     // the server opens with a transport hello (ch 2: 00) and its keep-alive timeout.
     this.send(client, frame(CH_CONTROL, Uint8Array.of(0)));
@@ -151,6 +157,21 @@ export class Casino {
       this.timer = setInterval(() => this.keepAlive(), KEEPALIVE_MS);
       this.timer.unref?.();
     }
+  }
+
+  /** A player keeps their id when they come back to the casino (after a match). The engine keys
+   *  the casino's member map by it and only removes the current id on leave: a changed id leaves
+   *  a stale entry holding the engine's own user object, which it deletes when the connection
+   *  drops, and then crashes. */
+  playerId(name) {
+    let id = this.ids.get(name);
+    if (id !== undefined && [...this.players.values()].some((p) => p.id === id)) id = undefined;
+    if (id === undefined) {
+      this.nextPlayerId = (this.nextPlayerId ?? 0) + 1;
+      id = this.nextPlayerId;
+      this.ids.set(name, id);
+    }
+    return id;
   }
 
   /** Pings every player so the engine does not time the casino out. */
@@ -186,6 +207,41 @@ export class Casino {
 
   removeHosted(key) {
     this.hosted = this.hosted.filter((h) => h.room.toLowerCase() !== key);
+  }
+
+  /** The host's game server is gone (match over): no one can come back into it. */
+  gameOver(key) {
+    this.removeHosted(key);
+    this.running.delete(key);
+    this.dropped.delete(key);
+  }
+
+  /**
+   * A player's connection dropped while in a hosted match (not a normal leave): the next time
+   * they ask for Quick Match they go back into it, the host's engine takes them in again.
+   */
+  droppedOut(key, name) {
+    if (!this.running.has(key)) return;
+    if (!this.dropped.has(key)) this.dropped.set(key, new Map());
+    this.dropped.get(key).set(name.toLowerCase(), Date.now());
+    this.log(`casino: ${name} dropped out of ${this.running.get(key)} (may rejoin)`);
+  }
+
+  /** A player left a hosted match the normal way (surrendered, match over): no rejoin. */
+  leftGame(key, name) {
+    this.dropped.get(key)?.delete(name.toLowerCase());
+  }
+
+  /** The running hosted match this player dropped out of (in the last REJOIN_MS), or null. */
+  rejoinRoom(client) {
+    const name = client.name.toLowerCase();
+    for (const [key, names] of this.dropped) {
+      const t = names.get(name);
+      if (t === undefined) continue;
+      names.delete(name);
+      if (Date.now() - t <= REJOIN_MS) return this.running.get(key);
+    }
+    return null;
   }
 
   /**
@@ -246,6 +302,7 @@ export class Casino {
     for (const q of match.group) this.locking.delete(q.client);
     const { room } = match;
     this.expectRoom(room, group.length, group.map((q) => this.profile(q.client)));
+    if (this.isServed(room)) this.running.set(room.toLowerCase(), room);
     group.forEach((q, i) => {
       const b = `naf://rg.com:80/${room}?hosted=${i === 0 ? 'yes' : 'no'}`;
       this.reply(q.client, EVENT, 31, (w) => writeTable(w.str(MATCHMAKER.name),
@@ -310,6 +367,12 @@ export class Casino {
         this.queue = this.queue.filter((q) => q.client !== client);
         const waiting = this.queue.map((q) => this.profile(q.client));
         this.respond(client, 9, 0, 0, (w) => { w.u8(waiting.length); for (const m of waiting) w.kv(m); return w; }, ch);
+        const back = this.rejoinRoom(client);
+        if (back) {
+          this.log(`casino: ${client.name} rejoins ${back}`);
+          this.startMatch([{ client, hero, flag, ch }], back);
+          break;
+        }
         this.queue.push({ client, hero, flag, ch });
         this.notifyQueue(client, 9);
         this.matchmake();

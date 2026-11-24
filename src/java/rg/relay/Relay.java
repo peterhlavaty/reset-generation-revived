@@ -28,6 +28,8 @@ final class Relay {
     static final int MAX_PACKET = 2048;          // the engine's shared net buffer
     static final int MAX_ROOM_MEMBERS = 4;
     static final int MAX_NAME = 15;
+    /** Clients ping every 15 s: a connection silent for longer is presumed dead (see hello). */
+    static final long STALE_MS = 20000;
     private static final Pattern NAME_RE = Pattern.compile("^[A-Za-z0-9_]{1,15}$");
     private static final Pattern ROOM_RE = Pattern.compile("^[\\x20-\\x7e]{1,64}$");
 
@@ -55,6 +57,7 @@ final class Relay {
         String name;
         Room room;
         String serves;           // key of the room this client serves as game server
+        boolean lost;            // leaving its room because the connection dropped
         long lastSeen;
         final Set<Room> greeted = new HashSet<Room>();
 
@@ -220,8 +223,23 @@ final class Relay {
             c.ctl(msg("t", "error", "op", "hello", "code", "bad_name"));
             return;
         }
-        // Names are display names only (no accounts); make them unique per server.
+        // Names are display names only (no accounts); make them unique per server. A connection
+        // with this name that has been silent for longer than a ping interval is the same player
+        // whose game crashed or lost the network: it is dropped, so they keep their name (and can
+        // go back into their match, see Casino.droppedOut).
         String base = (String) n, name = base;
+        long stale = System.currentTimeMillis() - STALE_MS;
+        for (Client o : new ArrayList<Client>(this.clients.values())) {
+            if (o != c && o.serves == null && base.equalsIgnoreCase(o.name) && o.lastSeen < stale) {
+                this.log("replacing silent connection " + o.id + " of " + o.name);
+                this.disconnect(o);
+                try {
+                    o.transport.close(4002, "replaced");
+                } catch (RuntimeException e) {
+                    // already gone
+                }
+            }
+        }
         Set<String> taken = new HashSet<String>();
         for (Client o : this.clients.values()) {
             if (o != c && o.name != null) {
@@ -352,12 +370,19 @@ final class Relay {
         };
     }
 
+    boolean isServed(String room) {
+        return this.servers.containsKey(room.toLowerCase());
+    }
+
     private void unserve(Client c) {
-        this.casino.removeHosted(c.serves);
+        this.casino.gameOver(c.serves);
         this.servers.remove(c.serves);
         Room room = this.rooms.get(c.serves);
         if (room != null && room.bot instanceof GameRoom) {
             ((GameRoom) room.bot).detachServer();
+        }
+        if (room != null && room.members.isEmpty() && !room.permanent) {
+            this.removeRoom(room);
         }
         c.serves = null;
     }
@@ -387,8 +412,16 @@ final class Relay {
         }
         room.members.remove(c);
         c.greeted.remove(room);
+        c.lost = reason.equals("disconnected");
         if (room.bot != null) {
             room.bot.leave(c);
+        }
+        if (room.bot instanceof GameRoom && c.name != null) {
+            if (reason.equals("disconnected")) {
+                this.casino.droppedOut(room.key, c.name);
+            } else {
+                this.casino.leftGame(room.key, c.name);
+            }
         }
         c.room = null;
         if (reason.equals("left")) {
@@ -397,16 +430,21 @@ final class Relay {
         for (Client o : new ArrayList<Client>(room.members)) {
             o.ctl(msg("t", "peer_left", "room", room.name, "name", c.name, "reason", reason));
         }
-        if (room.members.isEmpty() && !room.permanent) {
-            if (room.startTimer != null) {
-                room.startTimer.cancel(false);
-            }
-            if (room.bot instanceof GameRoom) {
-                ((GameRoom) room.bot).close();
-            }
-            this.rooms.remove(room.key);
-            this.log("room - " + room.name);
+        // a hosted match stays while its host serves it: a player whose connection dropped may come back
+        if (room.members.isEmpty() && !room.permanent && !this.servers.containsKey(room.key)) {
+            this.removeRoom(room);
         }
+    }
+
+    private void removeRoom(Room room) {
+        if (room.startTimer != null) {
+            room.startTimer.cancel(false);
+        }
+        if (room.bot instanceof GameRoom) {
+            ((GameRoom) room.bot).close();
+        }
+        this.rooms.remove(room.key);
+        this.log("room - " + room.name);
     }
 
     private void onBinary(Client c, byte[] bytes) {

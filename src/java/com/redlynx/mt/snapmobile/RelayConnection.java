@@ -73,6 +73,9 @@ final class RelayConnection implements WebSocket.Listener {
     }
 
     boolean sendPacket(byte[] data) {
+        if (SNAPMobileClient.DEBUG) {
+            SNAPMobileClient.debug("send " + SNAPMobileClient.hex(data));
+        }
         return this.send(null, data);
     }
 
@@ -160,6 +163,9 @@ final class RelayConnection implements WebSocket.Listener {
             SNAPMobileClient.debug("relay < " + s);
             if (m != null) {
                 Object t = m.get("t");
+                if ("joined".equals(t)) {
+                    this.client.onRelayJoined();     // before the packets that follow it
+                }
                 if (!"pong".equals(t) && !"peer_joined".equals(t) && !"peer_left".equals(t)) {
                     this.replies.offer(m);
                 }

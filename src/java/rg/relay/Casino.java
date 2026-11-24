@@ -70,6 +70,12 @@ final class Casino implements Relay.Bot {
     private List<Waiting> queue = new ArrayList<Waiting>();       // clients in Quick Match
     private final Map<Relay.Client, Match> locking = new HashMap<Relay.Client, Match>();
     private final List<Hosted> hosted = new ArrayList<Hosted>();  // host players' games waiting
+    private final Map<String, Integer> ids = new HashMap<String, Integer>();   // nickname -> player id
+    /** Hosted matches being played (room key -> room name) and who lost the connection in them. */
+    private final Map<String, String> running = new HashMap<String, String>();
+    private final Map<String, Map<String, Long>> dropped = new HashMap<String, Map<String, Long>>();
+    /** How long a dropped player may come back: the host holds the seat for 180 s (rghost HOLD_MS). */
+    static final long REJOIN_MS = 170000;
     private int nextTable = 1, nextPlayerId, pingSeq = 1;
     private ScheduledFuture<?> timer;
     int matchSize;
@@ -101,7 +107,7 @@ final class Casino implements Relay.Bot {
     @Override
     public void join(Relay.Client client) {
         Player p = new Player();
-        p.id = ++this.nextPlayerId;
+        p.id = this.playerId(client.name);
         this.players.put(client, p);
         // The client starts its casino session once the room's server has spoken. Like a peer,
         // the server opens with a transport hello (ch 2: 00) and its keep-alive timeout.
@@ -110,6 +116,29 @@ final class Casino implements Relay.Bot {
         if (this.timer == null) {
             this.timer = this.relay.sched.scheduleAtFixedRate(this::keepAlive, KEEPALIVE_MS, KEEPALIVE_MS, TimeUnit.MILLISECONDS);
         }
+    }
+
+    /**
+     * A player keeps their id when they come back to the casino (after a match). The engine keys
+     * the casino's member map by it and only removes the current id on leave: a changed id leaves
+     * a stale entry holding the engine's own user object, which it deletes when the connection
+     * drops, and then crashes.
+     */
+    private int playerId(String name) {
+        Integer id = this.ids.get(name);
+        if (id != null) {
+            for (Player other : this.players.values()) {
+                if (other.id == id) {          // the name is in use by another connection
+                    id = null;
+                    break;
+                }
+            }
+        }
+        if (id == null) {
+            id = ++this.nextPlayerId;
+            this.ids.put(name, id);
+        }
+        return id;
     }
 
     /** Pings every player so the engine does not time the casino out. */
@@ -181,6 +210,43 @@ final class Casino implements Relay.Bot {
 
     void removeHosted(String key) {
         this.hosted.removeIf(h -> h.room.toLowerCase().equals(key));
+    }
+
+    /** The host's game server is gone (match over): no one can come back into it. */
+    void gameOver(String key) {
+        this.removeHosted(key);
+        this.running.remove(key);
+        this.dropped.remove(key);
+    }
+
+    /**
+     * A player's connection dropped while in a hosted match (not a normal leave): the next time
+     * they ask for Quick Match they go back into it, the host's engine takes them in again.
+     */
+    void droppedOut(String key, String name) {
+        if (this.running.containsKey(key)) {
+            this.dropped.computeIfAbsent(key, k -> new HashMap<String, Long>()).put(name.toLowerCase(), System.currentTimeMillis());
+            this.relay.log("casino: " + name + " dropped out of " + this.running.get(key) + " (may rejoin)");
+        }
+    }
+
+    /** A player left a hosted match the normal way (surrendered, match over): no rejoin. */
+    void leftGame(String key, String name) {
+        Map<String, Long> d = this.dropped.get(key);
+        if (d != null) {
+            d.remove(name.toLowerCase());
+        }
+    }
+
+    /** The running hosted match this player dropped out of, or null. */
+    private String rejoinRoom(Relay.Client client) {
+        for (Map.Entry<String, Map<String, Long>> e : this.dropped.entrySet()) {
+            Long t = e.getValue().remove(client.name.toLowerCase());
+            if (t != null && System.currentTimeMillis() - t <= REJOIN_MS) {
+                return this.running.get(e.getKey());
+            }
+        }
+        return null;
     }
 
     /**
@@ -270,6 +336,9 @@ final class Casino implements Relay.Bot {
             profiles.add(this.profile(q.client));
         }
         this.relay.expectRoom(room, group.size(), profiles);
+        if (this.relay.isServed(room)) {
+            this.running.put(room.toLowerCase(), room);
+        }
         final int n = group.size();
         for (int i = 0; i < n; i++) {
             Waiting q = group.get(i);
@@ -369,6 +438,14 @@ final class Casino implements Relay.Bot {
                         w.kv(m);
                     }
                 }, ch);
+                String back = this.rejoinRoom(client);
+                if (back != null) {
+                    this.relay.log("casino: " + client.name + " rejoins " + back);
+                    List<Waiting> alone = new ArrayList<Waiting>();
+                    alone.add(new Waiting(client, ch));
+                    this.startMatch(alone, back);
+                    break;
+                }
                 this.queue.add(new Waiting(client, ch));
                 this.notifyQueue(client, 9);
                 this.matchmake();

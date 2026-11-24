@@ -58,6 +58,16 @@ pointer: a crash at `0x100b5311`/`0x100b5325` or a silently corrupted heap (blac
 for the last player to surrender in 3-4 player games. Both early exits of `enter` now set the grid
 first (a 26-byte signature check guards the patch).
 
+Second engine fix (same place): the online user object (context service 0x39, vtable
+`0x1017b020`) belongs to the app context, yet a casino room also puts it in its member map under
+the player id from the profile (`0x10047573`). Leaving the room removes only the current id
+(`0x100482c0` -> `0x1000aee0`) and then deletes every remaining member (`0x10094e50`). When the
+id had changed between casino visits (our casino used to hand out a new id per join, so after any
+match), the stale entry deleted the context's user object; the next tick after a dropped
+connection called through it (`0x100ecf90`) and the client crashed a few seconds after losing the
+relay. The member delete at `0x10094eac` now skips the context's own object, and the casino keeps
+a player's id per nickname (`Casino.playerId`, `casino.js` `playerId`), which alone also avoids it.
+
 Verified on one PC with the real Windows build (`tools/lan_test.sh 2|3|4`): 2-, 3- and 4-player
 matches start; boards, items, heroes and health stay identical on all screens over many rounds;
 a client quitting mid-match leaves the host running; when the players surrender one by one every
@@ -89,7 +99,14 @@ With `server=auto` (the default) nobody runs `server/` or types an address:
 * While the overlay is shown the launcher taps Right (a no-op in the main menu; Shift is Back)
   when it opens and every 10 s: the main menu otherwise replays the intro after ~35 s without
   input. The key that closes the overlay is kept from the engine until released.
-* Windows Firewall asks once, on the host only (inbound TCP/UDP 8787).
+* Windows Firewall asks once, on the host only (inbound TCP/UDP 8787). If that prompt was
+  cancelled (Windows then adds inbound Block rules for the exe, which win over any Allow) or the
+  rule only covers the other network type, clients time out. `LAN-Setup.cmd` in the release
+  (`src/dist/LAN-Setup.cmd` -> `app\lan-setup.ps1`, self-elevating) removes those Block rules and
+  allows TCP/UDP 8787 from `LocalSubnet` in every profile (rule group "Reset Generation
+  Revived"; `-Remove` deletes it). A third-party firewall (ESET, Norton...; listed in
+  `root/SecurityCenter2 FirewallProduct`) replaces Windows Firewall and drops the connections
+  silently: the script warns and says where to allow the game. A VPN client can hide the PC too.
 
 A manual `server=ws://…` still works everywhere (internet play through `server/` or the Worker).
 
@@ -97,7 +114,66 @@ Test aids (Windows build): `--keys=T:KEY,...` presses keys T ms after start (`ES
 `UP`/`DOWN`/`LEFT`/`RIGHT`, `SPACE`, `F5`, or a hex VK), `--window_x=`/`--window_y=`,
 `--nickname=`, `--host=auto`, `--host_players=N`, `--host_hero=NAME|RANDOM`, `--dll_patch=false`
 (pristine engine DLL);
-`RT_NET_DEBUG=1` logs every 0x16 message in rghost (stderr).
+`RT_NET_DEBUG=1` logs every 0x16 message in rghost (stderr). `--perflog=N` prints ticks/s, the
+slowest tick, Java heap and thread count every N seconds (`HostServer.perf`).
+
+### Dropped connections and going back into a match
+
+A client whose game crashed or lost the network can go back into the match it was in: start the
+game again (or go Online -> Quick Match) with the **same nickname** within 3 minutes. Meanwhile
+the match goes on; that player's turns time out.
+
+What the engine does on its own is not enough. Its acceptor is polled all match long and the
+per-connection handshake (`0x1000d8c0`) takes a late joiner in, but always as a **new** player:
+next free key (`0x10023f40`) and seat (`0x10024c60`). A player who came back to a 3-player match
+became player 4, with no base and no hero, and crashed on their first move (`0x100b4a90` finds no
+hero entity). Giving them the old key and seat is not enough either: once the engine has seen the
+connection drop (leave command, `0x1005c530`) it sends that player nothing more. So rghost holds
+the seat instead:
+
+* Relay: `player_left` carries `lost: 1` when the connection dropped (not a normal leave or a
+  surrender). rghost then does **not** tell the engine: the session stays "connected" (sends to
+  it are dropped) for `HOLD_MS` = 180 s, then it is closed and the engine sees the leave. A
+  served room is kept while its host serves it, even with no members (in a 2-player match the
+  only client's drop emptied it: the player came back into a new room without the host); it
+  goes at `unserve`.
+* Casino (`Casino.java` / `casino.js`): a hosted room becomes `running` when its players are sent
+  into it; a player whose connection drops in it is remembered in `dropped` with the time. Their
+  next Quick Match request (case 9) within `REJOIN_MS` = 170 s is answered as usual and then
+  starts a one-player match into that room instead of queueing. `unserve` (the host's listener
+  closed: match over) forgets the room.
+* rghost, host side (`track_seats`): a new connection with the same name as a held session gets
+  its old seat (preset in the pending join, so state 3 skips the seat search) and key (hook on
+  the key allocator `0x10023f40`). The handshake sends the battle state on the new connection;
+  then the held session takes over the new relay player id (the engine keeps using its old
+  connection object for that key: `0x1005c340` does not register a key twice).
+* The handshake also dispatches a join command (type 0xc) for the player. Applied to a player
+  who is already in the game it replaces their player object (`0x10010010`, game+0x14 -> +0x2c
+  by seat) and record (`0x10027450`, game+0x1c -> +0x10 by key) with empty ones, on every
+  machine: the others crashed a minute later (`0x1004a0f4`). rghost hooks the server
+  controller's dispatch (vtable `0x101779a0` slot 9) and sends that one command only to the
+  player coming back; the host's game does not apply it.
+* The player coming back needs it (their screen stays black without it), but must keep the
+  objects from the battle state, or their game dies a few minutes later. rghost.dll is loaded
+  by every Windows game, so it also hooks the client's join handler (vtable `0x10188d18` slot
+  0x58, `0x100e16a0`): for a key and seat the game already has, the old objects are put back.
+  The Android build (recompiled engine, no rghost) does not have this: an Android player who
+  comes back is not safe.
+* Relay `hello`: names are unique per server, so a restarted client used to become `Player22`
+  while its old connection was still open (a crash or a frozen PC leaves a half-open TCP
+  connection that only the 60 s idle timer closes). A connection with the same name that has
+  sent nothing (not even a ping, every 15 s) for `STALE_MS` = 20 s is now closed first, so the
+  player keeps their name and the casino finds them.
+* rghost: the engine never destroys connection objects, so session slots are never reused
+  (`MAX_SESS` 4096; it was 64, which a long-running host could use up), and nothing is sent on a
+  closed session.
+
+Client login state (`SNAPMobileClient`, `native/rt/net.c`): the engine logs in with `login()`
+and never calls `startLoginScreen()`, which is what reset `loginErrorState`/`loginCancelled`. One
+failed attempt (no host found yet, a dropped broadcast) therefore made every later attempt report
+"cannot connect" (and a logout made them report "cancelled") until the game was restarted. A
+login request now clears both. A lost connection (`handleError`) also clears the queued actions
+except a logout, so a half-finished join cannot run on the dead socket.
 
 ## How online worked in 2008–2010
 
@@ -138,6 +214,11 @@ casino bot instead of other players. The bot behaves like an MT peer: it opens w
 transport hello (channel 2 `00`) and the keep-alive frame, accepts the client's hello (`20`),
 answers its pings and pings every 10 s. Without the hello the client never starts its own
 keep-alive and drops the connection ("Connection lost") 20 s after entering the casino.
+Because the greeting follows right behind `joined`, the clients enter a room on their WebSocket
+reader when `joined` arrives (`SNAPMobileClient.onRelayJoined`, the reader in `native/rt/net.c`),
+not on the action thread after the request returns: a greeting that won that race was dropped
+as "not in a room", and the client then lost the casino 20 s later now and then (typically
+when coming back to the casino after a match).
 
 **Room greeting.** The engine only starts talking in a room after the room's server has
 spoken. Plain rooms: the relay sends each joiner one frame (`05 00 01 20 4e 00 00`).
@@ -323,8 +404,9 @@ screen (two castles on the field). Transport findings:
   from that cap; the casino connection starts with cap 254 (shift 8), but only the game
   connection is fragmented by us.
 * **Relay protocol for the server role** (implemented, tested in `server/test`): the server says
-  `hello` then `{"t":"serve","room":"QM_1"}`; it gets `{"t":"player_joined","pid":N}` when the
-  player has taken its seat (its client session exists) and `player_left`; binary frames both
+  `hello` then `{"t":"serve","room":"QM_1"}`; it gets `{"t":"player_joined","pid":N,"name":…}`
+  when the player has taken its seat (its client session exists) and `player_left` (with
+  `"lost":1` if the connection dropped); binary frames both
   ways are `[u16 LE pid][zlib message]`. The server pings every 15 s (the relay reaps idle
   connections after 60 s). A `join` of a matchmade room that does not exist yet is treated as
   `create` (the client sends `join` for the `hosted=yes` player).
