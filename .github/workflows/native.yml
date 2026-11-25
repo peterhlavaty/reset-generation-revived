@@ -1,0 +1,51 @@
+# Native builds that cannot be made on a Windows PC: the desktop game for Linux and macOS (and
+# the Android APK, from the Linux job). Each job is one `cargo x` command; the Ghidra analysis
+# of the engine DLL (decompiled/native/pcode.txt, never committed) is cached between runs.
+name: native
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "native/**"
+      - "tools/rgtool/**"
+      - "tools/ghidra_scripts/**"
+      - "src/java/rg/**"
+      - ".github/workflows/native.yml"
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Toolchains cache (JDK 25, Ghidra)
+        uses: actions/cache@v4
+        with:
+          path: .toolchains
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-v1
+      - name: P-code cache (Ghidra analysis of the engine DLL)
+        uses: actions/cache@v4
+        with:
+          path: decompiled/native/pcode.txt
+          key: pcode-${{ hashFiles('game/ResetGeneration/ResetGeneration-Win32-Web.dll', 'tools/ghidra_scripts/*.java') }}
+      - name: Desktop game
+        run: cargo x build-desktop
+      - name: Android APK
+        if: runner.os == 'Linux'
+        run: cargo x build-android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ResetGeneration-${{ runner.os }}
+          path: |
+            dist/ResetGeneration-Native-*.zip
+            dist/*.apk
+          if-no-files-found: error

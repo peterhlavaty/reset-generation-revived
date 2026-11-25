@@ -16,6 +16,7 @@ typedef SOCKET sock_t;
 #define closesock closesocket
 #else
 #include <netdb.h>
+#include <signal.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -35,6 +36,10 @@ static uint8_t *netbuf;
 static int netbuf_size;
 
 void rg_net_configure(const char *url, const char *nick) {
+#ifndef _WIN32
+    /* a send() on a connection the relay dropped must fail with EPIPE, not kill the game */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     if (url) snprintf(server_url, sizeof server_url, "%s", url);
     if (nick) snprintf(nickname, sizeof nickname, "%s", nick);
 }

@@ -36,6 +36,7 @@ fn newer(a: &Path, b: &Path) -> bool {
 /// then exports decompiled/native/pcode.txt (for recomp) and rg_win32.c (for reading).
 pub fn ghidra_export(args: &[String]) -> R<()> {
     let ghidra = need("ghidra")?;
+    make_executable(&ghidra);
     let jdk = need("jdk25")?;
     let r = root();
     let dll = args.first().map(PathBuf::from).unwrap_or_else(dll);
@@ -71,7 +72,13 @@ pub fn generate(extra: &[String]) -> R<PathBuf> {
     let gen = gen_dir();
     let table = gen.join("rg_gen_table.c");
     if !pcode().exists() {
-        return Err("missing decompiled/native/pcode.txt: run `cargo x ghidra-export` (needs `cargo x setup jdk25 ghidra`)".into());
+        // one time: the engine's P-code comes from a Ghidra analysis of the original DLL
+        eprintln!("no decompiled/native/pcode.txt yet: running the Ghidra export (one time, several minutes)");
+        let missing: Vec<String> = ["jdk25", "ghidra"].iter().filter(|t| crate::setup::find(t).is_none()).map(|t| t.to_string()).collect();
+        if !missing.is_empty() {
+            crate::setup::setup(&missing)?;
+        }
+        ghidra_export(&[])?;
     }
     let me = std::env::current_exe()?;
     if !extra.is_empty() || !table.exists() || newer(&pcode(), &table) || newer(&me, &table) {
@@ -285,6 +292,9 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
         (env("CC", "cc"), env("AR", "ar"), None)
     };
     let mut flags: Vec<String> = vec!["-O2".into(), "-fno-strict-aliasing".into(), "-fwrapv".into()];
+    if !cfg!(windows) {
+        flags.push("-fPIC".into()); // linked into a position-independent executable
+    }
     flags.push(format!("-I{}", rt.display()));
     flags.push(format!("-I{}", gen.display()));
     let obj = r.join("build/native/obj-desktop");
@@ -324,4 +334,26 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
     crate::windows::zip_dir(&dist, &zip)?;
     println!("built {} (+ {})", dist.display(), zip.display());
     Ok(())
+}
+
+/// Ghidra's launch scripts and native helpers (support/, */os/*) must be executable on Unix; not
+/// every unzip keeps the permission bits.
+fn make_executable(ghidra: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut stack = vec![ghidra.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for p in std::fs::read_dir(&d).into_iter().flatten().flatten().map(|e| e.path()) {
+                let s = p.to_string_lossy().to_string();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if s.contains("/support/") || s.contains("/os/") || s.ends_with(".sh") {
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = ghidra;
 }

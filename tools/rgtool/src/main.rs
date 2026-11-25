@@ -114,6 +114,10 @@ fn main() {
     };
     if let Err(e) = r {
         eprintln!("error: {e}");
+        if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            // shown on the workflow run's page (and in the public API's check-run annotations)
+            println!("::error::{}", e.to_string().replace('\n', "%0A"));
+        }
         std::process::exit(1);
     }
 }
