@@ -171,15 +171,17 @@ void rt_trace(uint32_t func) {
     }
 }
 
-static struct { uint32_t func; rt_hook_fn fn; } hooks[16];
+static struct { uint32_t func; rt_hook_fn fn; } hooks[32];
 static int nhooks;
 void rt_hook_add(uint32_t func, rt_hook_fn fn) {
-    if (nhooks >= 16) rt_fatal("too many hooks");
+    if (nhooks >= 32) rt_fatal("too many hooks");
     hooks[nhooks].func = func;
     hooks[nhooks++].fn = fn;
 }
-void rt_hook(uint32_t func) {
-    for (int i = 0; i < nhooks; i++) if (hooks[i].func == func) hooks[i].fn();
+int rt_hook(uint32_t func) {
+    int done = 0;
+    for (int i = 0; i < nhooks && !done; i++) if (hooks[i].func == func) done = hooks[i].fn();
+    return done;
 }
 
 /* Calls guest function `addr` from the host with stdcall/cdecl arguments; returns EAX. */

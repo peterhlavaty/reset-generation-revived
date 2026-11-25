@@ -44,6 +44,11 @@ void rg_net_configure(const char *url, const char *nick) {
     if (nick) snprintf(nickname, sizeof nickname, "%s", nick);
 }
 void net_attach(uint8_t *buf, int size) { netbuf = buf; netbuf_size = size; }
+const char *net_server_url(void) { return server_url; }
+const char *net_nickname(void) {
+    if (!nickname[0]) snprintf(nickname, sizeof nickname, "Player%04d", rand() % 9000 + 1000);
+    return nickname;
+}
 
 /* ------------------------------------------------------------------ queues */
 enum { A_LOGIN, A_LOGOUT, A_CREATE, A_JOIN, A_MOVE, A_LEAVE, A_SEND, A_FRIENDS };

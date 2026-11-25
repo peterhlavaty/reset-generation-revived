@@ -116,8 +116,12 @@ void rt_call(uint32_t addr);                               /* indirect call/jump
 void rt_trace_ret(uint32_t func, uint32_t eax);          /* return value of a traced function */
 void rt_trace(uint32_t func);                              /* recomp.py --trace */
 extern int rt_xoff;
-void rt_hook(uint32_t func);                               /* recomp.py hooks (DEFAULT_HOOKS / --hook) */
-typedef void (*rt_hook_fn)(void);                          /* runs at function entry; ECX/ESP are the callee's */
+/* recomp.rs hooks (DEFAULT_HOOKS / --hook at a function entry, INSN_HOOKS before an instruction).
+ * Handlers see the registers in cpu.r. A nonzero return skips the rest: at an entry the handler
+ * has done the function's work (EAX set, ESP past the return address and arguments); at an
+ * instruction hook with a skip target the code jumps there. */
+int rt_hook(uint32_t func);
+typedef int (*rt_hook_fn)(void);
 void rt_hook_add(uint32_t func, rt_hook_fn fn);
 void rt_bad_branch(uint32_t func, uint32_t target) __attribute__((noreturn));
 void rt_unimpl(uint32_t addr, const char *what) __attribute__((noreturn));

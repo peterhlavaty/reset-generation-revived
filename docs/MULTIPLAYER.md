@@ -4,14 +4,14 @@ Status (2026-11-25):
 
 | Piece | State |
 |---|---|
-| **Hosted games (Windows build)** | **Works, 2–4 players** — F5 makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. See "Hosted games" |
+| **Hosted games (every build)** | **Works, 2–4 players** — F5 (Android: the HOST button) makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. Windows/Java: `rghost.dll`; native desktop and Android: `native/rt/server.c`. See "Hosted games" and "Native hosting" |
 | Server (`server/`, Rust: relay, casino, game rooms; binary `rg-relay`) | **Done**, tests in `server/tests` (`cargo test -p rg-server`); public instance at `ws://resetgeneration.rustyapps.com/ws` (`cargo x deploy`, see "Running a server") |
 | LAN without internet (Windows) | **Done** — the host's game starts the bundled `rg-relay.exe --lan`, clients find it by UDP broadcast (`server=auto`, the default); see "LAN relay" |
 | Client: Windows (Java replacement for `SNAPMobileClient`) | **Done** — logs in to the relay with a nickname, no Arena login screen |
 | Client: native desktop / Android (`native/rt/net.c`) | **Done** (plain `ws://`): joins hosted games; verified Android ↔ Windows and native Windows ↔ Windows matches through the public server |
 | Casino system (login, casino enter, Quick Match queue, lock, matched-up) | **Done** — both players listed in "Players in Match", "Game starting…" |
 | Game room bot (`server/src/gameroom.rs`: handshake, seating on 0x15, forwarding) | **Done** |
-| Game server (channel 0x16) | **Done** by the hosting player's engine (`rghost.dll`); the recompiled engine can serve too (`rgtest --server`, Phase 0) but no native host offers hosting yet |
+| Game server (channel 0x16) | **Done** by the hosting player's engine (`rghost.dll` in the Windows build, `native/rt/server.c` in the native builds; verified native host ↔ native client, including a client killed and coming back) |
 | Going back into a match after a crash / dropped connection | **Done**, no time limit: the seat is held as long as the match runs (see "Dropped connections") |
 | Friendly arenas, rankings, statistics, achievements, friends | Answered with empty/OK replies so the client does not stall; not implemented |
 
@@ -77,6 +77,33 @@ host then hosts again and "Play Again" starts the next match. The host's chosen 
 the select, Random, or `host_hero=`) is the one every screen shows, and the host's nickname
 appears in Battle Stats. Android and native desktop clients join the same way (verified through
 the public server). Known limit: if the host quits the match ends for everyone.
+
+### Native hosting (desktop, Android)
+
+`native/rt/server.c` is the same host in the recompiled engine; there it needs no patching, the
+recompiler emits the hooks:
+
+* entry hooks (`DEFAULT_HOOKS` in `recomp.rs`) may now do the function's work themselves: a
+  nonzero return from `rt_hook` leaves the function (the handler sets `EAX`/`ESP`). Used for the
+  key allocator `0x10023f40` (the old key of a player coming back);
+* instruction hooks (`INSN_HOOKS`): `rt_hook(addr)` before one instruction, registers spilled
+  to `cpu.r`, optionally skipping to a later address. They replace rghost's detours: the
+  `PlaceTileUIState::enter` fix (`0x100b2c66`), the host's hero (`0x100ca9d9`, `EDX`) and name
+  (`0x100caa30`, `EDI`), and the member-clear skip `0x10094eac`. A site that is not an
+  instruction of the export fails the build;
+* vtable slots (acceptor `setController`, server dispatch, client join) are replaced only when
+  they still hold the expected original, as in rghost.
+
+The relay link runs on its own thread (connect, `hello` as `RGHost`, `serve`, reader); the game
+thread takes its events in `rg_server_pump()` after every tick. F5 (keycode 116 to `rg_key`, or
+`rg_host_request()`) opens the player-count picker, drawn by `rg_server_compose()` over the
+engine's frame with a small built-in font (`native/rt/font.c`), then the engine's hero select.
+While hosting, a status strip at the top says how many players are in. The desktop game also
+shows the status in its title bar and saves `host_players`; `host=auto`, `host_players=`,
+`host_hero=` and `keys=` (timed keys, `T:KEY,…`) work as in the Windows build. Android has a HOST
+touch button in the main menu (hidden while hosting) and remembers `host_players` in
+`revived.ini`. Verified: native host ↔ native client over a local `rg-relay`, a 2-player match,
+the client killed mid-match and back in its seat on both screens.
 
 ### LAN relay (no setup)
 
@@ -160,8 +187,8 @@ the seat instead:
   objects from the battle state, or their game dies a few minutes later. rghost.dll is loaded
   by every Windows game, so it also hooks the client's join handler (vtable `0x10188d18` slot
   0x58, `0x100e16a0`): for a key and seat the game already has, the old objects are put back.
-  The native desktop and Android builds (recompiled engine, no rghost) do not have this: a native
-  player who comes back is not safe yet (the hook would have to go into `native/rt`).
+  The native desktop and Android builds do the same in `native/rt/server.c` (stub in the same
+  vtable slot), so a native player who comes back keeps their objects too.
 * Relay `hello`: names are unique per server, so a restarted client used to become `Player22`
   while its old connection was still open (a crash or a frozen PC leaves a half-open TCP
   connection that only the 60 s idle timer closes). A connection with the same name that has
@@ -417,10 +444,6 @@ menu flow, and the relay's idle timeout handling when the server drops.
 
 ### What is still open
 
-* Hosting from the native desktop and Android builds: `native/rt/server.c` has the server side for
-  the recompiled engine, but no native host offers F5/hosting yet, and the client-side join
-  handler hook that makes going back into a match safe (see "Dropped connections") exists only in
-  `rghost.dll`.
 * TLS (`wss://`) in `native/rt/net.c`; the public server accepts plain `ws://` on port 80.
 * The host-local player 0 in `rgtest --server`, a headless build without the menu flow.
 

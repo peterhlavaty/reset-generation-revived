@@ -168,9 +168,10 @@ typedef struct { int key; float cx, cy, r; const char *label; int down; } button
 static button buttons[] = {
     {K_UP, 0, 0, 0, "up", 0}, {K_DOWN, 0, 0, 0, "down", 0}, {K_LEFT, 0, 0, 0, "left", 0}, {K_RIGHT, 0, 0, 0, "right", 0},
     {K_CTRL, 0, 0, 0, "action", 0}, {K_ENTER, 0, 0, 0, "select", 0}, {K_ESC, 0, 0, 0, "back", 0},
-    {K_CTRL, 0, 0, 0, "drop", 0},
+    {K_CTRL, 0, 0, 0, "drop", 0}, {0, 0, 0, 0, "host", 0},
 };
 #define B_DROP 7
+#define B_HOST 8               /* host a game (main menu; hidden while hosting) */
 /* The game drops a piece when Action is held for 500 ms. The Drop button is a tap that holds
  * Ctrl for DROP_MS by itself, so no finger has to stay down. */
 #define DROP_MS 700
@@ -214,6 +215,7 @@ static void layout_controls(void) {
     buttons[5] = (button){K_ENTER, lx, 1.1f * u, 0.7f * u, "select", 0};
     buttons[6] = (button){K_ESC, rx, 1.1f * u, 0.7f * u, "back", 0};
     buttons[B_DROP] = (button){K_CTRL, rx, ly - 3.0f * u, 0.95f * u, "drop", 0};
+    buttons[B_HOST] = (button){0, lx, 3.0f * u, 0.55f * u, "host", 0};
 }
 
 static void drop_release(void) {
@@ -234,6 +236,10 @@ static void press(int b, int down) {
         dg.down_at[b] = 0;
     }
 #endif
+    if (b == B_HOST) {
+        if (down && rg_host_state() == 0) rg_host_request();
+        return;
+    }
     if (b == B_DROP) {                     /* released by the main loop after DROP_MS */
         if (down) {
             if (!drop_pending) rg_key(1, K_CTRL);
@@ -249,6 +255,7 @@ static int hit(float x, float y) {
     int best = -1;
     float bestd = 1e9f;
     for (int i = 0; i < NB; i++) {
+        if (i == B_HOST && rg_host_state() != 0) continue;
         float dx = x - buttons[i].cx, dy = y - buttons[i].cy, dd = dx * dx + dy * dy;
         float reach = buttons[i].r * 1.35f;
         if (dd < reach * reach && dd < bestd) { best = i; bestd = dd; }
@@ -304,39 +311,13 @@ static void mask_triangle(float cx, float cy, float s, int dir, int alpha) {
         }
 }
 
-/* 5x7 bitmap font (upper case, digits, a little punctuation) for button labels and diagnostics */
-static const char font_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:.-/=,";
-static const uint8_t font5x7[][7] = {
-    {0x0e,0x11,0x11,0x1f,0x11,0x11,0x11}, {0x1e,0x11,0x11,0x1e,0x11,0x11,0x1e}, {0x0e,0x11,0x10,0x10,0x10,0x11,0x0e},
-    {0x1e,0x11,0x11,0x11,0x11,0x11,0x1e}, {0x1f,0x10,0x10,0x1e,0x10,0x10,0x1f}, {0x1f,0x10,0x10,0x1e,0x10,0x10,0x10},
-    {0x0e,0x11,0x10,0x17,0x11,0x11,0x0f}, {0x11,0x11,0x11,0x1f,0x11,0x11,0x11}, {0x0e,0x04,0x04,0x04,0x04,0x04,0x0e},
-    {0x07,0x02,0x02,0x02,0x02,0x12,0x0c}, {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, {0x10,0x10,0x10,0x10,0x10,0x10,0x1f},
-    {0x11,0x1b,0x15,0x15,0x11,0x11,0x11}, {0x11,0x19,0x15,0x13,0x11,0x11,0x11}, {0x0e,0x11,0x11,0x11,0x11,0x11,0x0e},
-    {0x1e,0x11,0x11,0x1e,0x10,0x10,0x10}, {0x0e,0x11,0x11,0x11,0x15,0x12,0x0d}, {0x1e,0x11,0x11,0x1e,0x14,0x12,0x11},
-    {0x0f,0x10,0x10,0x0e,0x01,0x01,0x1e}, {0x1f,0x04,0x04,0x04,0x04,0x04,0x04}, {0x11,0x11,0x11,0x11,0x11,0x11,0x0e},
-    {0x11,0x11,0x11,0x11,0x11,0x0a,0x04}, {0x11,0x11,0x11,0x15,0x15,0x1b,0x11}, {0x11,0x11,0x0a,0x04,0x0a,0x11,0x11},
-    {0x11,0x11,0x0a,0x04,0x04,0x04,0x04}, {0x1f,0x01,0x02,0x04,0x08,0x10,0x1f},
-    {0x0e,0x11,0x13,0x15,0x19,0x11,0x0e}, {0x04,0x0c,0x04,0x04,0x04,0x04,0x0e}, {0x0e,0x11,0x01,0x02,0x04,0x08,0x1f},
-    {0x1e,0x01,0x01,0x0e,0x01,0x01,0x1e}, {0x02,0x06,0x0a,0x12,0x1f,0x02,0x02}, {0x1f,0x10,0x1e,0x01,0x01,0x11,0x0e},
-    {0x06,0x08,0x10,0x1e,0x11,0x11,0x0e}, {0x1f,0x01,0x02,0x04,0x08,0x08,0x08}, {0x0e,0x11,0x11,0x0e,0x11,0x11,0x0e},
-    {0x0e,0x11,0x11,0x0f,0x01,0x02,0x0c},
-    {0x00,0x0c,0x0c,0x00,0x0c,0x0c,0x00}, {0x00,0x00,0x00,0x00,0x00,0x0c,0x0c}, {0x00,0x00,0x00,0x1f,0x00,0x00,0x00},
-    {0x01,0x01,0x02,0x04,0x08,0x10,0x10}, {0x00,0x00,0x1f,0x00,0x1f,0x00,0x00}, {0x00,0x00,0x00,0x00,0x0c,0x04,0x08},
-};
-
-static const uint8_t *glyph(char c) {
-    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
-    const char *p = c ? strchr(font_chars, c) : NULL;
-    return p ? font5x7[p - font_chars] : NULL;
-}
-
 static int text_w(const char *s, int sc) { return (int)strlen(s) * 6 * sc - sc; }
 
 /* centred at cx, top at y */
 static void mask_text(float cx, int y, int sc, const char *s, int alpha) {
     int x = (int)cx - text_w(s, sc) / 2;
     for (; *s; s++, x += 6 * sc) {
-        const uint8_t *g = glyph(*s);
+        const uint8_t *g = rt_glyph(*s);
         if (!g) continue;
         for (int r = 0; r < 7; r++)
             for (int c = 0; c < 5; c++)
@@ -349,6 +330,7 @@ static void mask_text(float cx, int y, int sc, const char *s, int alpha) {
 static void build_mask(void) {
     unsigned key = (unsigned)controls_visible | (unsigned)bw << 1;
     for (int i = 0; i < NB; i++) key = key * 31 + (unsigned)buttons[i].down;
+    key = key * 31 + (unsigned)(rg_host_state() == 0);
     if (key == mask_key && mask) return;
     mask_key = key;
     dirty = 1;
@@ -357,6 +339,7 @@ static void build_mask(void) {
     for (int y = 0; y < BH; y++) { mask_y0[y] = bw; mask_y1[y] = -1; }
     if (!controls_visible) return;
     for (int i = 0; i < NB; i++) {
+        if (i == B_HOST && rg_host_state() != 0) continue;
         button *b = &buttons[i];
         mask_circle(b->cx, b->cy, b->r, b->down ? 150 : 70, 0);
         mask_circle(b->cx, b->cy, b->r, 140, 1);
@@ -364,6 +347,8 @@ static void build_mask(void) {
         else if (i == 4) {
             mask_circle(b->cx, b->cy, b->r * 0.35f, 170, 0);
             mask_text(b->cx, (int)(b->cy + b->r) + 14, 4, "ROTATE / OK", 230);
+        } else if (i == B_HOST) {
+            mask_text(b->cx, (int)b->cy - 10, 3, "HOST", 230);
         } else if (i == B_DROP) {
             mask_text(b->cx, (int)(b->cy + b->r) + 10, 4, "DROP", 230);
             /* a down arrow onto a bar: "place" */
@@ -409,7 +394,7 @@ static int dg_h(void) { return DG_LINES * 9 * DG_SC + 6; }
 
 static void dg_text(uint32_t *px, int stride, int x, int y, const char *s) {
     for (; *s; s++, x += 6 * DG_SC) {
-        const uint8_t *g = glyph(*s);
+        const uint8_t *g = rt_glyph(*s);
         if (!g) continue;
         for (int r = 0; r < 7; r++)
             for (int c = 0; c < 5; c++)
@@ -627,24 +612,35 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
     }
 }
 
+static char cfg_server[200] = RG_ONLINE_SERVER, cfg_nick[32];
+static int cfg_players = 2;
+
+static void save_config(void) {
+    char path[600];
+    snprintf(path, sizeof path, "%s/../revived.ini", data_dir);
+    FILE *f = fopen(path, "w");
+    if (f) { fprintf(f, "server=%s\nnickname=%s\nhost_players=%d\n", cfg_server, cfg_nick, cfg_players); fclose(f); }
+}
+
 static void read_config(void) {
-    /* optional files/revived.ini: server=ws://host:port/ws, nickname=Name */
-    char path[600], line[256], server[200] = RG_ONLINE_SERVER, nick[32] = "";
+    /* optional files/revived.ini: server=ws://host:port/ws, nickname=Name, host_players=2..4 */
+    char path[600], line[256], *server = cfg_server, *nick = cfg_nick;
     snprintf(path, sizeof path, "%s/../revived.ini", data_dir);
     FILE *f = fopen(path, "r");
     while (f && fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
-        if (!strncmp(line, "server=", 7)) snprintf(server, sizeof server, "%s", line + 7);
-        if (!strncmp(line, "nickname=", 9)) snprintf(nick, sizeof nick, "%s", line + 9);
+        if (!strncmp(line, "server=", 7)) snprintf(server, sizeof cfg_server, "%s", line + 7);
+        if (!strncmp(line, "nickname=", 9)) snprintf(nick, sizeof cfg_nick, "%s", line + 9);
+        if (!strncmp(line, "host_players=", 13)) cfg_players = atoi(line + 13);
     }
     if (f) fclose(f);
     if (!nick[0]) {
         srand((unsigned)mono_ms());
-        snprintf(nick, sizeof nick, "Droid%04d", rand() % 9000 + 1000);
-        f = fopen(path, "w");
-        if (f) { fprintf(f, "server=%s\nnickname=%s\n", server, nick); fclose(f); }
+        snprintf(nick, sizeof cfg_nick, "Droid%04d", rand() % 9000 + 1000);
+        save_config();
     }
     rg_net_configure(server, nick);
+    rg_host_configure(cfg_players, -2);
     host_log("online: %s as %s", server, nick);
 }
 
@@ -685,6 +681,7 @@ void android_main(struct android_app *app) {
             uint64_t t0 = mono_ms();
             if (drop_pending && t0 >= drop_release_at) drop_release();
             if (!rg_tick()) { ANativeActivity_finish(app->activity); }
+            if (rg_host_players() != cfg_players) { cfg_players = rg_host_players(); save_config(); }
             uint64_t t1 = mono_ms();
 #ifdef RG_DIAG
             dg.ticks++;

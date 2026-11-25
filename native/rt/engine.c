@@ -34,18 +34,19 @@ static int cmp_str(const void *a, const void *b) { return strcmp(*(const char *c
  * pointer position, where the piece's ghost sits over existing blocks and cannot be seen (the ghost
  * layer is drawn under the blocks). When a forced target is set, start the cursor a few cells to the
  * left of it, on free ground: visible, and the player still has to move and rotate it. */
-static void hook_tile_tool(void) {
+static int hook_tile_tool(void) {
     uint32_t tool = cpu.r[ECX], target = LD32(tool + 0x18), cursor = LD32(tool + 0x28);
-    if (!target || !cursor || !M[target + 0xad]) return;
+    if (!target || !cursor || !M[target + 0xad]) return 0;
     ST32(cursor + 0x24, LD32(target + 0x98) - 3);
     ST32(cursor + 0x28, LD32(target + 0x9c));
+    return 0;
 }
 
 /* Debug aid (RG_DEBUG_WINLOSE=<frame>): after that tick, open the engine's built-in WIN_LOSE_TEST screen
  * (the debug menu entry FUN_100c7c70 that previews the end-of-match win/lose scenes; the shipped main
  * menu does not link it) so those screens can be screenshotted without playing a match to the end. */
 static uint32_t dbg_menu;
-static void hook_dbg_menu_ctor(void) { dbg_menu = cpu.r[ECX]; }
+static int hook_dbg_menu_ctor(void) { dbg_menu = cpu.r[ECX]; return 0; }
 static void debug_winlose(void) {
     static int frames, done;
     const char *e = getenv("RG_DEBUG_WINLOSE");
@@ -155,11 +156,15 @@ int rg_tick(void) {
     return r;
 }
 
-const uint32_t *rg_pixels(void) { return (const uint32_t *)(M + fb); }
+const uint32_t *rg_pixels(void) { return rg_server_compose((const uint32_t *)(M + fb), W, H); }
 
 /* Same arguments the Java host passed (java.awt.event.KeyEvent): Ctrl is KEY_LOCATION_LEFT (2),
  * other keys STANDARD (1); the key char is the character for Enter/Esc, CHAR_UNDEFINED otherwise. */
 void rg_key(int down, int keycode) {
+    if (!rg_server_key(down, keycode)) rg_engine_key(down, keycode);
+}
+
+void rg_engine_key(int down, int keycode) {
     uint32_t chr = (keycode == 10 || keycode == 27 || keycode == 32) ? (uint32_t)keycode : 0xffffu;
     uint32_t loc = keycode == 17 ? 2 : 1;
     call(down ? x_key_down : x_key_up, 6, env, listener_obj, rt_now_ms(), (uint32_t)keycode, chr, loc);

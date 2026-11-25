@@ -21,6 +21,10 @@ extern "C" {
     fn rg_pixels() -> *const u32;
     fn rg_key(down: c_int, keycode: c_int);
     fn rg_audio(buf: *mut u8, len: c_int);
+    fn rg_host_configure(players: c_int, hero: c_int);
+    fn rg_host_start(players: c_int, hero: c_int) -> c_int;
+    fn rg_host_status() -> *const c_char;
+    fn rg_host_players() -> c_int;
 }
 
 fn cstr(s: &str) -> CString {
@@ -33,12 +37,26 @@ struct Config {
     server: String,
     nickname: String,
     scale: String,
+    /// hosting (F5): player count, hero (a name or id, RANDOM, or empty: choose in the game)
+    host_players: i32,
+    host_hero: String,
+    /// test aids: host=auto hosts by itself, keys=T:KEY,... presses keys T ms after the start
+    host: String,
+    keys: String,
 }
 
 impl Config {
     fn load(dir: &Path) -> Config {
         let path = dir.join("revived.ini");
-        let mut c = Config { server: "online".into(), nickname: String::new(), scale: "fit".into() };
+        let mut c = Config {
+            server: "online".into(),
+            nickname: String::new(),
+            scale: "fit".into(),
+            host_players: 2,
+            host_hero: String::new(),
+            host: String::new(),
+            keys: String::new(),
+        };
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         c.apply(text.lines());
         if c.nickname.is_empty() {
@@ -56,8 +74,12 @@ impl Config {
                      # your name in online games (letters, digits, _)\n\
                      nickname={}\n\
                      # window size: fit (largest that fits the screen), 1, 2 or 4\n\
-                     scale={}\n",
-                    c.server, c.nickname, c.scale
+                     scale={}\n\
+                     # hosting a game (F5 in the main menu): players 2-4 (remembered), hero (a name,\n\
+                     # RANDOM, or empty: choose in the game)\n\
+                     host_players={}\n\
+                     host_hero=\n",
+                    c.server, c.nickname, c.scale, c.host_players
                 ),
             );
         }
@@ -78,9 +100,44 @@ impl Config {
                     }
                 }
                 "scale" if !v.is_empty() => self.scale = v,
+                "host_players" => self.host_players = v.parse().unwrap_or(2),
+                "host_hero" => self.host_hero = v.to_ascii_uppercase(),
+                "host" => self.host = v,
+                "keys" => self.keys = v,
                 _ => {}
             }
         }
+    }
+
+    /// host_hero: a hero name or id -> 0..9, RANDOM -> -1, empty -> -2 (choose in the game).
+    fn hero(&self) -> c_int {
+        const HEROES: [&str; 10] = [
+            "HEDGEHOG", "PLUMBER", "CYBORG", "LEVEL_50_ELF", "BABE_GUNNER", "MONSTER_TRAINER", "SCIFI_KNIGHT", "NINJA", "DR_LOVEBOMBER",
+            "AGGRESSOR",
+        ];
+        let h = self.host_hero.as_str();
+        if h == "RANDOM" {
+            return -1;
+        }
+        HEROES.iter().position(|n| *n == h).or_else(|| h.parse().ok().filter(|i| *i < 10)).map_or(-2, |i| i as c_int)
+    }
+
+    /// Sets `key=value` in revived.ini (replacing the line, or appending it).
+    fn save(dir: &Path, key: &str, value: &str) {
+        let path = dir.join("revived.ini");
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let line = format!("{key}={value}");
+        let mut found = false;
+        let mut out: Vec<String> = text
+            .lines()
+            .map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { found = true; line.clone() } else { l.to_string() })
+            .collect();
+        if !found {
+            out.push(line);
+        }
+        let _ = std::fs::write(&path, out.join("
+") + "
+");
     }
 
     fn server_url(&self) -> &str {
@@ -111,10 +168,36 @@ fn awt(k: Key) -> Option<c_int> {
         Key::Escape | Key::Backspace => 27,
         Key::LeftCtrl | Key::RightCtrl => 17,
         Key::Space => 32,
+        Key::F5 => 116,
         k if (Key::A as u32..=Key::Z as u32).contains(&(k as u32)) => 65 + (k as u32 - Key::A as u32) as c_int,
         k if (Key::Key0 as u32..=Key::Key9 as u32).contains(&(k as u32)) => 48 + (k as u32 - Key::Key0 as u32) as c_int,
         _ => return None,
     })
+}
+
+/// keys=T:KEY,... (a test aid): AWT key codes and when to press them (ms after the start).
+fn parse_keys(spec: &str) -> Vec<(u128, c_int)> {
+    let mut out: Vec<(u128, c_int)> = spec
+        .split(',')
+        .filter_map(|p| {
+            let (t, k) = p.trim().split_once(':')?;
+            let code = match k.trim().to_ascii_uppercase().as_str() {
+                "ESC" => 27,
+                "RETURN" | "ENTER" => 10,
+                "SPACE" => 32,
+                "CTRL" => 17,
+                "LEFT" => 37,
+                "UP" => 38,
+                "RIGHT" => 39,
+                "DOWN" => 40,
+                "F5" => 116,
+                k => i32::from_str_radix(k, 16).ok()?,
+            };
+            Some((t.trim().parse().ok()?, code))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// The engine's sound (8 kHz mono) waits here for the audio thread, which resamples it.
@@ -178,7 +261,32 @@ fn main() {
     let _audio = start_audio(ring.clone());
     let mut frame = vec![0u32; W * H];
     let mut pcm = [0u8; 512];
+    unsafe { rg_host_configure(cfg.host_players, cfg.hero()) };
+    let mut keys = parse_keys(&cfg.keys);
+    let start = std::time::Instant::now();
+    let (mut title, mut players, mut next_auto) = (String::new(), cfg.host_players, 15000u128);
     while win.is_open() {
+        let t = start.elapsed().as_millis();
+        while keys.first().is_some_and(|k| k.0 <= t) {
+            let (_, code) = keys.remove(0);
+            unsafe {
+                rg_key(1, code);
+                rg_key(0, code);
+            }
+        }
+        if cfg.host == "auto" && t >= next_auto {
+            next_auto = if unsafe { rg_host_start(cfg.host_players, cfg.hero()) } != 0 { u128::MAX } else { t + 2000 };
+        }
+        let status = unsafe { std::ffi::CStr::from_ptr(rg_host_status()) }.to_string_lossy().into_owned();
+        if status != title {
+            win.set_title(&if status.is_empty() { "Reset Generation".to_string() } else { format!("Reset Generation - {status}") });
+            title = status;
+        }
+        let p = unsafe { rg_host_players() };
+        if p != players {
+            players = p;
+            Config::save(&exe_dir, "host_players", &p.to_string());
+        }
         for k in win.get_keys_pressed(KeyRepeat::No) {
             if let Some(c) = awt(k) {
                 unsafe { rg_key(1, c) };

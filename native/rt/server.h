@@ -1,13 +1,16 @@
-/* Game server mode: runs the engine's own server-mode controller (the LAN host screen's)
- * with network players that arrive through the relay instead of tcp:// sockets.
- * See docs/MULTIPLAYER.md, "Next step: game server on the host player's device". */
+/* Hosting a game on this player's engine (server.c): the engine's own LAN host mode with the
+ * remote players arriving through the relay. The public API is in engine.h (rg_host_*). */
 #pragma once
+#include <stdint.h>
 
-/* Call before rg_init. url = relay (ws://host:port/ws), room = the game room to serve
- * (e.g. "QM_1"). The host then drives the menus to the LAN host screen (see rgtest --server). */
+/* Test mode (rgtest --server URL ROOM), before rg_init: host ROOM on the relay at URL by itself
+ * once the main menu is up. */
 void rg_server_enable(const char *url, const char *room);
 int rg_server_enabled(void);
 
-/* engine glue (engine.c / rt) */
+/* engine glue (engine.c) */
 void rg_server_init(void);          /* after the engine image is loaded */
 void rg_server_pump(void);          /* game thread, before each tick */
+int rg_server_key(int down, int keycode);   /* 1 = the key is ours (F5, the picker) */
+const uint32_t *rg_server_compose(const uint32_t *fb, int w, int h);   /* the frame with the picker / status */
+void rg_engine_key(int down, int keycode);  /* a key straight to the engine */

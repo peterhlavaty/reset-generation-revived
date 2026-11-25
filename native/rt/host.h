@@ -36,6 +36,11 @@ const char *rt_stub_name(uint32_t addr);
 static inline uint32_t rt_arg(int i);
 void rt_ret(uint32_t eax, int pop_args);
 
+/* 5x7 bitmap font (font.c): glyph rows (5 bits each), NULL for characters it does not have */
+const uint8_t *rt_glyph(char c);
+int rt_text_width(const char *s, int scale);
+void rt_draw_text(uint32_t *px, int w, int h, int x, int y, int scale, const char *s, uint32_t color);
+
 /* guest heap (win32.c) */
 uint32_t rt_heap_alloc(uint32_t n);
 void rt_heap_free(uint32_t p);

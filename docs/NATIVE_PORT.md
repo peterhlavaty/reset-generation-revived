@@ -102,7 +102,8 @@ window and [tinyaudio](https://crates.io/crates/tinyaudio) sound:
   URL, `nickname=`, `scale=fit|1|2|4`; written on first start, `--key=value` arguments override
   it) and `ResetGeneration.log`. The game runs with `data/` as its current directory, so a
   folder name with non-ASCII characters works.
-* Online: joins games (Quick Match) like Android; hosting needs the Windows build for now.
+* Online: joins games (Quick Match) like Android and hosts them: F5 in the main menu (or `host=auto`,
+  `host_players=2..4`, `host_hero=NAME|RANDOM`); the title bar shows the hosting status.
 
 ## WebAssembly (not built yet)
 
@@ -203,7 +204,5 @@ functions; `RT_LIVE_TRIGGER=addr:N` logs the N function entries after `addr`;
 * On 20:9 phones the side bars are narrow, so the d-pad and Action button overlap the edges of
   the game image (translucent). A layout option (smaller game, wider bars) would help.
 * Debug-signed APK (`build/android/debug.keystore`); a release key is needed for Play.
-* Native builds join online games but cannot host them, and a native player who goes back into
-  a match after a crash is not safe yet (`MULTIPLAYER.md`, "What is still open").
 * C++ exceptions / SEH unwinding are not implemented (`RaiseException` aborts); none were seen.
 * The native net client speaks plain `ws://` only (no TLS yet).

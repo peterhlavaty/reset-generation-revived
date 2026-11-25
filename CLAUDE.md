@@ -35,7 +35,7 @@ into rgtool (`tools/rgtool`, run as `cargo x <command>`).
   address" fatal means a missed entry point. The guest address space is a 4 GB reservation.
 * Online: the engine waits for the room's server to speak first; Quick Match and hosted rooms
   are served by `server/` (rg-relay, Rust). Matches run on the hosting player's engine
-  (`rghost.dll`, Windows build only); native/Android clients join. The Windows build bundles
+  (`rghost.dll` in the Windows build, `native/rt/server.c` natively). The Windows build bundles
   `rg-relay.exe` for LAN games (clients find it by UDP broadcast on 8787, `server=auto`). A
   dropped player's seat is held for as long as the match runs (`rejoin_ms: None`).
 * Windows child processes inherit our std handles unless `util::no_inherit()` ran: piped rgtool

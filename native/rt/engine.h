@@ -33,6 +33,16 @@ void rg_advance_ms(uint32_t ms);
 #define RG_ONLINE_SERVER "ws://resetgeneration.rustyapps.com/ws"
 void rg_net_configure(const char *server_url, const char *nickname);
 
+/* Hosting a game: this player's engine runs the match (and plays in it); the others join with
+ * Online -> Quick Match. F5 (keycode 116 to rg_key) or rg_host_request() in the main menu opens a
+ * player-count picker drawn over the game (rg_pixels), then the engine's hero select. */
+void rg_host_configure(int players, int hero);  /* picker default 2..4; hero 0..9, -1 random, -2 choose (default) */
+void rg_host_request(void);
+int rg_host_state(void);            /* 0 idle, 1 picker, 2 hero select, 3 waiting for players, 4 match running */
+const char *rg_host_status(void);   /* one line for a title bar ("" before the first host) */
+int rg_host_players(void);          /* the player count last chosen (to remember it) */
+int rg_host_start(int players, int hero);   /* hosts at once (no picker); 0 if not possible now */
+
 #ifdef __cplusplus
 }
 #endif

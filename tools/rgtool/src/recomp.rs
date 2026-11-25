@@ -207,9 +207,23 @@ const XOFF_DRAW: u64 = 0x10052de0;
 
 /// Function entries that call rt_hook() (native/rt/rt.c): the host can intercept them (game
 /// server mode: native/rt/server.c). Inert unless a handler is registered.
+/// A handler that returns nonzero has done the function's work itself (set EAX, popped the return
+/// address and arguments): the function returns at once.
 const DEFAULT_HOOKS: &[u64] = &[
     0x1008fa80, 0x1008f500, // main menu flow: event handler, constructor
     0x100d5350,             // block placement tool activated (rt: hook_tile_tool)
+    0x10023f40,             // player key allocation (rt/server.c: a player back in a match keeps their key)
+];
+
+/// Instructions that call rt_hook(addr) before they run, with the registers in cpu.r (spilled
+/// before, reloaded after, so a handler can change them). With a skip target, a handler that
+/// returns nonzero jumps there instead (the instructions in between do not run). The engine
+/// fixes and host features in native/rt/server.c (the same as native/win32/rghost.c patches in).
+const INSN_HOOKS: &[(u64, Option<u64>)] = &[
+    (0x100b2c66, None),             // PlaceTileUIState::enter: early exits leave the tile layer unset
+    (0x100ca9d9, None),             // LAN host entry: mov ebp,edx (the host's random hero in EDX)
+    (0x100caa30, None),             // LAN host entry: host player setup in EDI (the host's name)
+    (0x10094eac, Some(0x10094eb2)), // casino member clear: mov edx,[ecx]; push 1; call [edx] (delete)
 ];
 
 fn apply_patches(instrs: &mut HashMap<u64, Instr>) -> R<()> {
@@ -798,6 +812,12 @@ impl<'a> FuncGen<'a> {
         let rc = self.rc;
         self.discover();
         self.body_set = self.body.iter().copied().collect();
+        for (h, skip) in INSN_HOOKS {
+            if let Some(s) = skip.filter(|_| self.body_set.contains(h)) {
+                assert!(self.body_set.contains(&s), "INSN_HOOKS: skip target {s:x} not in the function of {h:x}");
+                self.targets.insert(s);
+            }
+        }
         // Pre-pass: fallthroughs that are not to the next emitted instruction need labels.
         for k in 0..self.body.len() {
             if let Some(nxt) = Self::fallthrough(&rc.instrs[&self.body[k]]) {
@@ -822,6 +842,12 @@ impl<'a> FuncGen<'a> {
             }
             let text = ins.text.replace("*/", "* /");
             out.push(if self.targets.contains(&a) { format!("L_{a:x}: /* {text} */") } else { format!("    /* {a:x} {text} */") });
+            if let Some((_, skip)) = INSN_HOOKS.iter().find(|(h, _)| *h == a) {
+                out.push(match skip {
+                    Some(s) => format!("    {SPILL} if (rt_hook(0x{a:x}u)) {{ {RELOAD} goto L_{s:x}; }} {RELOAD}"),
+                    None => format!("    {SPILL} rt_hook(0x{a:x}u); {RELOAD}"),
+                });
+            }
             if let Some(sp) = self.special(ins) {
                 out.push(format!("    {sp}"));
             } else {
@@ -879,7 +905,7 @@ impl<'a> FuncGen<'a> {
             head.push(format!("    rt_trace(0x{e:x}u);"));
         }
         if rc.hooks.contains(&e) {
-            head.push(format!("    rt_hook(0x{e:x}u);"));
+            head.push(format!("    if (rt_hook(0x{e:x}u)) {{ return; }}"));
         }
         let xoff = XOFF_FUNCS.iter().find(|(a, _)| *a == e).map(|(_, dx)| *dx);
         if let Some(dx) = xoff {
@@ -1102,6 +1128,13 @@ pub fn recompile(pcode: &Path, outdir: &Path, opts: &Options) -> R<()> {
     let (funcs, instrs) = load(pcode)?;
     let ninstrs = instrs.len();
     let mut rc = Recompiler::new(&funcs, instrs);
+    for (h, skip) in INSN_HOOKS {
+        for a in std::iter::once(h).chain(skip) {
+            if !rc.instrs.contains_key(a) {
+                return Err(format!("instruction hook site {a:x} not found").into());
+            }
+        }
+    }
     let secs = opts.dll.as_deref().map(read_pe).transpose()?;
     if let Some(s) = &secs {
         rc.resolve_jump_tables(s);

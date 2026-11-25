@@ -7,12 +7,12 @@ own server.
 | | Status |
 |---|---|
 | Windows 10/11 (the original engine DLL in a 32-bit Java host), widescreen HD, fullscreen | **Playable**, hosts and joins online/LAN games — `cargo x build-windows` → `dist/ResetGeneration-Revived/` (+ .zip) |
-| Native desktop on the recompiled engine (Windows, Linux, macOS) | **Playable**, joins online games — `cargo x build-desktop` → `dist/ResetGeneration-Native-<os>/` (+ .zip). Tested on Windows; Linux/macOS are built by CI (`.github/workflows/native.yml`) |
-| Android (phones, tablets, Chromebooks; touch + gamepad) | **Playable test build**, joins online games — `cargo x build-android` → `dist/ResetGeneration-Revived-<version>.apk` (sideload) |
+| Native desktop on the recompiled engine (Windows, Linux, macOS) | **Playable**, hosts and joins online games — `cargo x build-desktop` → `dist/ResetGeneration-Native-<os>/` (+ .zip). Tested on Windows; Linux/macOS are built by CI (`.github/workflows/native.yml`) |
+| Android (phones, tablets, Chromebooks; touch + gamepad) | **Playable test build**, hosts and joins online games — `cargo x build-android` → `dist/ResetGeneration-Revived-<version>.apk` (sideload) |
 | Online server (relay + matchmaking, Rust) | **Running** at `resetgeneration.rustyapps.com` — `cargo x deploy` |
 | WebAssembly | Not yet: see `docs/NATIVE_PORT.md`, "WebAssembly" |
 
-Multiplayer in short: press **F5** in the main menu of the Windows build, choose the number of
+Multiplayer in short: press **F5** in the main menu (Android: the HOST button), choose the number of
 players and a hero; everyone else (Windows, native, Android) chooses **Online → Quick Match**. The
 games meet on the public server, or on the LAN without internet (the host's game runs the relay).
 A player whose game crashed goes back into the running match by starting again with the same name
