@@ -2,8 +2,7 @@
 //! repository (git-ignored; RG_TOOLCHAINS overrides the place). Each download is checked against
 //! the SHA-256 its publisher lists. Already installed ones are kept.
 //!
-//! * jdk17-x86: Temurin 17, 32-bit (the engine DLL is 32-bit, so is the JVM that loads it)
-//! * llvm-mingw: clang for Windows targets (rghost.dll is i686, needs thiscall + GNU asm)
+//! * llvm-mingw: clang for Windows targets (the recompiled engine C is built with it on Windows)
 //! * jdk25, ghidra: the headless Ghidra export the native builds start from (Ghidra 12.2+ needs
 //!   JDK 25); jdk25 also runs the build-time Java tools on other OSes
 //!
@@ -19,7 +18,7 @@ pub fn dir() -> PathBuf {
     std::env::var_os("RG_TOOLCHAINS").map(PathBuf::from).unwrap_or_else(|| root().join(".toolchains"))
 }
 
-pub const ALL: &[&str] = &["jdk17-x86", "llvm-mingw", "jdk25", "ghidra"];
+pub const ALL: &[&str] = &["llvm-mingw", "jdk25", "ghidra"];
 
 fn os() -> &'static str {
     match std::env::consts::OS {
@@ -163,7 +162,7 @@ fn github(name: &str, repo: &str, pick: impl Fn(&str) -> bool) -> R<()> {
 pub fn setup(what: &[String]) -> R<()> {
     let list: Vec<&str> = if what.is_empty() {
         // what the Windows game build needs; the rest on request
-        if cfg!(windows) { vec!["jdk17-x86", "llvm-mingw"] } else { vec![] }
+        if cfg!(windows) { vec!["llvm-mingw"] } else { vec![] }
     } else if what.iter().any(|w| w == "all") {
         ALL.to_vec()
     } else {
@@ -175,7 +174,6 @@ pub fn setup(what: &[String]) -> R<()> {
             continue;
         }
         match name {
-            "jdk17-x86" => temurin(name, 17, "x32")?,
             "jdk25" => temurin(name, 25, if cfg!(target_arch = "aarch64") { "aarch64" } else { "x64" })?,
             "llvm-mingw" => {
                 let host = if cfg!(windows) { "ucrt-x86_64.zip" } else if cfg!(target_os = "macos") { "macos-universal.tar.xz" } else { "ucrt-ubuntu-22.04-x86_64.tar.xz" };

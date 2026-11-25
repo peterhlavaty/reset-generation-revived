@@ -612,7 +612,7 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
     }
 }
 
-static char cfg_server[200] = RG_ONLINE_SERVER, cfg_nick[32];
+static char cfg_server[200] = "auto", cfg_nick[32];
 static int cfg_players = 2;
 
 static void save_config(void) {
@@ -623,7 +623,7 @@ static void save_config(void) {
 }
 
 static void read_config(void) {
-    /* optional files/revived.ini: server=ws://host:port/ws, nickname=Name, host_players=2..4 */
+    /* files/../revived.ini: server=auto|online|lan|ws://host:port/ws, nickname=Name, host_players=2..4 */
     char path[600], line[256], *server = cfg_server, *nick = cfg_nick;
     snprintf(path, sizeof path, "%s/../revived.ini", data_dir);
     FILE *f = fopen(path, "r");

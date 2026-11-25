@@ -1,6 +1,6 @@
 //! LAN-Setup.exe: lets this PC host LAN games (Windows Firewall).
 //!
-//! The PC that hosts a game without internet (or with server=lan) runs the relay, rg-relay.exe,
+//! The PC that hosts a game without internet (or with server=lan) runs the relay in the game
 //! on port 8787: TCP for the game, UDP for the other players' search. This lets both in from the
 //! local network only (LocalSubnet), in every network type, so it does not matter whether Windows
 //! calls the network public or private. It also removes the inbound Block rules Windows creates
@@ -52,7 +52,7 @@ mod win {
     const GROUP: &str = "Reset Generation Revived";
     const PORT: u16 = 8787;
     /// Programs whose Block rules (left by a cancelled firewall prompt) keep LAN players out.
-    const PROGRAMS: [&str; 2] = ["\\resetgeneration-revived.exe", "\\rg-relay.exe"];
+    const PROGRAMS: [&str; 3] = ["\\resetgeneration.exe", "\\resetgeneration-revived.exe", "\\rg-relay.exe"];
 
     pub fn is_admin() -> bool {
         unsafe { IsUserAnAdmin().as_bool() }
@@ -132,7 +132,7 @@ mod win {
             out.push("To host: start the game and press F5 in the main menu.".into());
             out.push(String::new());
             out.push("An antivirus with its own firewall (ESET, Norton, McAfee...) replaces Windows Firewall:".into());
-            out.push(format!("allow rg-relay.exe (or TCP and UDP port {PORT} from the local network) there too."));
+            out.push(format!("allow ResetGeneration.exe (or TCP and UDP port {PORT} from the local network) there too."));
         }
         Ok(out)
     }

@@ -4,60 +4,82 @@ Status (2026-11-25):
 
 | Piece | State |
 |---|---|
-| **Hosted games (every build)** | **Works, 2–4 players** — F5 (Android: the HOST button) makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. Windows/Java: `rghost.dll`; native desktop and Android: `native/rt/server.c`. See "Hosted games" and "Native hosting" |
+| **Hosted games (every build)** | **Works, 2–4 players** — F5 (Android: the HOST button) makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. `native/rt/server.c`; see "Hosted games" |
 | Server (`server/`, Rust: relay, casino, game rooms; binary `rg-relay`) | **Done**, tests in `server/tests` (`cargo test -p rg-server`); public instance at `ws://resetgeneration.rustyapps.com/ws` (`cargo x deploy`, see "Running a server") |
-| LAN without internet (Windows) | **Done** — the host's game starts the bundled `rg-relay.exe --lan`, clients find it by UDP broadcast (`server=auto`, the default); see "LAN relay" |
-| Client: Windows (Java replacement for `SNAPMobileClient`) | **Done** — logs in to the relay with a nickname, no Arena login screen |
-| Client: native desktop / Android (`native/rt/net.c`) | **Done** (plain `ws://`): joins hosted games; verified Android ↔ Windows and native Windows ↔ Windows matches through the public server |
+| LAN without internet (desktop) | **Done** — the hosting game runs the relay in-process, clients find it by UDP broadcast (`server=auto`, the default); see "LAN relay" |
+| Client (`native/rt/net.c` + `native/rt/link.c`, replacing `SNAPMobileClient`) | **Done** (plain `ws://`): logs in with a nickname (no Arena login screen) and joins hosted games; verified desktop ↔ desktop (LAN and public server) and Android ↔ desktop |
 | Casino system (login, casino enter, Quick Match queue, lock, matched-up) | **Done** — both players listed in "Players in Match", "Game starting…" |
 | Game room bot (`server/src/gameroom.rs`: handshake, seating on 0x15, forwarding) | **Done** |
-| Game server (channel 0x16) | **Done** by the hosting player's engine (`rghost.dll` in the Windows build, `native/rt/server.c` in the native builds; verified native host ↔ native client, including a client killed and coming back) |
+| Game server (channel 0x16) | **Done** by the hosting player's engine (`native/rt/server.c`; verified host ↔ client, including a client killed and coming back) |
 | Going back into a match after a crash / dropped connection | **Done**, no time limit: the seat is held as long as the match runs (see "Dropped connections") |
 | Friendly arenas, rankings, statistics, achievements, friends | Answered with empty/OK replies so the client does not stall; not implemented |
 
-## Hosted games (Windows build) — working multiplayer
+Until 2026-11-25 there was also a Windows build that ran the original engine DLL in a 32-bit Java
+host (the 2020 standalone's launcher) with `rghost.dll`, a JNI helper that patched the same hooks
+into the real DLL at run time, and a Java relay client. The native desktop game replaced it; the
+sources are in the git history (`src/java/`, `native/win32/rghost.c`).
 
-The shortest path to a real match: no second engine instance and no recompiler. The original
-game had a **LAN host mode**: the host screen `0x100caa80` runs the server-mode controller and the
-host plays as local player 0; clients joined over `tcp://`, which this build lacks. `rghost.dll`
-(`native/win32/rghost.c`, a 32-bit JNI helper that `rg.HostServer` loads into the game's JVM) does
-in the real engine DLL what `native/rt/server.c` does for the recompiled one:
+## Hosted games — working multiplayer
 
-* at start: hooks the menu flow constructor `0x1008f500` (inline `jmp` to a trampoline that
-  records `ECX`). The engine DLL is usually relocated, so every address is rebased;
-* on **F5** (or `host=auto`): patches the TCP acceptor's `setController` (vtable `0x10188b64`,
-  slot 1) to install a fake listener. F5 first shows the engine's own hero select
+The shortest path to a real match: no second engine instance. The original game had a **LAN host
+mode**: the host screen `0x100caa80` runs the server-mode controller and the host plays as local
+player 0; clients joined over `tcp://`, which the web build lacks. `native/rt/server.c` turns it
+into an online host; the recompiler emits the hooks it needs:
+
+* entry hooks (`DEFAULT_HOOKS` in `recomp.rs`) may do the function's work themselves: a nonzero
+  return from `rt_hook` leaves the function (the handler sets `EAX`/`ESP`). Used for the menu flow
+  (`0x1008fa80`, `0x1008f500`) and the key allocator `0x10023f40` (the old key of a player coming
+  back);
+* instruction hooks (`INSN_HOOKS`): `rt_hook(addr)` before one instruction, registers spilled to
+  `cpu.r`, optionally skipping to a later address: the `PlaceTileUIState::enter` fix
+  (`0x100b2c66`), the host's hero (`0x100ca9d9`, `EDX`) and name (`0x100caa30`, `EDI`), and the
+  member-clear skip `0x10094eac`. A site that is not an instruction of the export fails the build;
+* vtable slots (acceptor `setController`, server dispatch, client join) are replaced only when
+  they still hold the expected original.
+
+What happens:
+
+* **F5** (keycode 116 to `rg_key`, or `rg_host_request()`) opens the player-count picker (2–4,
+  Left/Right or 2–4, Enter, Esc), drawn by `rg_server_compose()` over the engine's frame with a
+  small built-in font (`native/rt/font.c`); its keys are kept from the engine. While it is shown
+  the host taps Right (a no-op in the main menu) when it opens and every 10 s: the main menu
+  otherwise replays the intro after ~35 s without input. Then the engine's own hero select
   (`HeroSelectionScreen`, ctor `0x100dcff0`, the ten heroes plus Random) with a private copy of
-  its vtable (`0x101888e0`) whose onSelect/onBack (slots 11/12) run in rghost: Select replaces it
-  with the LAN host screen, Back cancels. `host_hero=NAME|RANDOM` (and `host=auto`, default random)
-  skip the select. The LAN host screen gets a hero list of `host_players` entries;
-* connects to the relay as `RGHost` and sends `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1}`.
-  Each `player_joined` becomes a connection object (`accept`); channel 0x16 travels as
-  `[u16 pid][zlib message]` exactly as in the Phase 0 design. `HostServer.pump()` runs on the
-  engine thread after every tick.
+  its vtable (`0x101888e0`) whose onSelect/onBack (slots 11/12) are host stubs: Select replaces it
+  with the LAN host screen, Back cancels. `host_hero=NAME|RANDOM` (and `host=auto`) skip the
+  select. The LAN host screen gets a hero list of `host_players` entries.
+* The TCP acceptor's `setController` (vtable `0x10188b64`, slot 1) installs a fake listener.
+* The relay link (`native/rt/link.c`) runs on its own thread: it picks the relay
+  (`relay_for_hosting`, see "LAN relay"), connects as `RGHost` and sends
+  `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1}`. Each `player_joined` becomes a
+  connection object (`accept`); channel 0x16 travels as `[u16 pid][zlib message]` exactly as in
+  the Phase 0 design. The game thread takes the link's events in `rg_server_pump()` after every
+  tick.
+* While hosting, a status strip at the top says how many players are in; the desktop game also
+  shows it in its title bar and saves `host_players`. Android has a HOST touch button in the main
+  menu (hidden while hosting) and remembers `host_players` in `revived.ini`.
 
 Relay side: `serve` with `players` registers a hosted game with the casino; `matchmake()` fills
 hosted games first (once enough players are queued), and `rg-relay --match-size`
 defaults to 0, so Quick Match never forms `QM_n` rooms that have no game server. When the host's
-engine closes the listener (match over, or the host left the host screen) rghost sends
-`{"t":"unserve"}`, so no one is matched into a dead room, and the title says "F5 = host a new
+engine closes the listener (match over, or the host left the host screen) the host sends
+`{"t":"unserve"}`, so no one is matched into a dead room, and the status says "F5 = host a new
 game" (`host=auto` re-hosts by itself). Once a game server serves a room, the game room stops
 sending EVENT SEAT_LEAVE (the match reports leavers itself): a client still on its win screen that
-got it stayed on a black screen. The Java clients need no change.
+got it stayed on a black screen.
 
 The host's hero and name: the LAN host screen's entry (`0x100ca920`) rolls the host's hero
 (`rand() % 10` at `0x100ca9ce`) and hands the host's player setup, name left empty, to the
-controller (`0x100caa30`, vt+0x6c), which sends it to every client. rghost detours both (13-byte
-signature checks): the roll keeps its RNG call but takes the chosen hero, and the setup gets the
-host's nickname, so the end screens say "Host Wins" instead of a blank name.
+controller (`0x100caa30`, vt+0x6c), which sends it to every client. The hooks keep the roll's RNG
+call but take the chosen hero, and give the setup the host's nickname, so the end screens say
+"Host Wins" instead of a blank name.
 
-Engine bug fix (rghost.dll, applied in every instance, host or client): `PlaceTileUIState::enter`
-(`0x100b2c20`) sets the state's tile-layer grid (`this+0x84 = this->layer(2)`) only for players
-still in the game, but `update` (`0x100b5df0` -> `0x100b5290`) copies board snapshots into it for
-everyone. A player who had surrendered (player state 5) therefore wrote through an uninitialised
-pointer: a crash at `0x100b5311`/`0x100b5325` or a silently corrupted heap (black screen), seen
-for the last player to surrender in 3-4 player games. Both early exits of `enter` now set the grid
-first (a 26-byte signature check guards the patch).
+Engine bug fix (every game, host or client): `PlaceTileUIState::enter` (`0x100b2c20`) sets the
+state's tile-layer grid (`this+0x84 = this->layer(2)`) only for players still in the game, but
+`update` (`0x100b5df0` -> `0x100b5290`) copies board snapshots into it for everyone. A player who
+had surrendered (player state 5) therefore wrote through an uninitialised pointer: a crash at
+`0x100b5311`/`0x100b5325` or a silently corrupted heap (black screen), seen for the last player to
+surrender in 3-4 player games. Both early exits of `enter` now set the grid first.
 
 Second engine fix (same place): the online user object (context service 0x39, vtable
 `0x1017b020`) belongs to the app context, yet a casino room also puts it in its member map under
@@ -69,83 +91,48 @@ connection called through it (`0x100ecf90`) and the client crashed a few seconds
 relay. The member delete at `0x10094eac` now skips the context's own object, and the casino keeps
 a player's id per nickname (`player_id` in `server/src/casino.rs`), which alone also avoids it.
 
-Verified on one PC with the real Windows build (`cargo x lan-test 2|3|4`): 2-, 3- and 4-player
-matches start; boards, items, heroes and health stay identical on all screens over many rounds;
-a client quitting mid-match leaves the host running; when the players surrender one by one every
-client reaches the win screen, Battle Stats and the casino (2, 3 and 4 players, any order); the
-host then hosts again and "Play Again" starts the next match. The host's chosen hero (picked in
-the select, Random, or `host_hero=`) is the one every screen shows, and the host's nickname
-appears in Battle Stats. Android and native desktop clients join the same way (verified through
-the public server). Known limit: if the host quits the match ends for everyone.
-
-### Native hosting (desktop, Android)
-
-`native/rt/server.c` is the same host in the recompiled engine; there it needs no patching, the
-recompiler emits the hooks:
-
-* entry hooks (`DEFAULT_HOOKS` in `recomp.rs`) may now do the function's work themselves: a
-  nonzero return from `rt_hook` leaves the function (the handler sets `EAX`/`ESP`). Used for the
-  key allocator `0x10023f40` (the old key of a player coming back);
-* instruction hooks (`INSN_HOOKS`): `rt_hook(addr)` before one instruction, registers spilled
-  to `cpu.r`, optionally skipping to a later address. They replace rghost's detours: the
-  `PlaceTileUIState::enter` fix (`0x100b2c66`), the host's hero (`0x100ca9d9`, `EDX`) and name
-  (`0x100caa30`, `EDI`), and the member-clear skip `0x10094eac`. A site that is not an
-  instruction of the export fails the build;
-* vtable slots (acceptor `setController`, server dispatch, client join) are replaced only when
-  they still hold the expected original, as in rghost.
-
-The relay link runs on its own thread (connect, `hello` as `RGHost`, `serve`, reader); the game
-thread takes its events in `rg_server_pump()` after every tick. F5 (keycode 116 to `rg_key`, or
-`rg_host_request()`) opens the player-count picker, drawn by `rg_server_compose()` over the
-engine's frame with a small built-in font (`native/rt/font.c`), then the engine's hero select.
-While hosting, a status strip at the top says how many players are in. The desktop game also
-shows the status in its title bar and saves `host_players`; `host=auto`, `host_players=`,
-`host_hero=` and `keys=` (timed keys, `T:KEY,…`) work as in the Windows build. Android has a HOST
-touch button in the main menu (hidden while hosting) and remembers `host_players` in
-`revived.ini`. Verified: native host ↔ native client over a local `rg-relay` (a 2-player match,
-the client killed mid-match and back in its seat on both screens) and Android host ↔ native
-client over the public server.
+Verified on one PC (`cargo x lan-test 2|3|4`, first with the Java build, since then with the
+native one): 2-, 3- and 4-player matches start; boards, items, heroes and health stay identical on
+all screens over many rounds; a client quitting mid-match leaves the host running; when the
+players surrender one by one every client reaches the win screen, Battle Stats and the casino; the
+host then hosts again and "Play Again" starts the next match. The host's chosen hero is the one
+every screen shows, and the host's nickname appears in Battle Stats. Native host ↔ native client
+(the client killed mid-match and back in its seat on both screens), LAN discovery with the
+in-game relay, and Android host ↔ desktop client over the public server are verified too. Known
+limit: if the host quits the match ends for everyone.
 
 ### LAN relay (no setup)
 
-With `server=auto` (the default) nobody types an address (`rg.relay.ServerChoice`): a game
-hosted on this network if there is one, else the public server; without internet the host's
-game runs the relay itself.
+With `server=auto` (the default) nobody types an address (`native/rt/link.c`): a game hosted on
+this network if there is one, else the public server; without internet the host's game runs the
+relay itself.
 
-* **F5** first shows a Java2D overlay drawn into the engine's backbuffer
-  (`HostServer.drawPicker`, called from `ResetGeneration.drawBuffer`): number of players 2–4
-  (Left/Right or 2–4, Enter, Esc). Keys reach it through Revived's key dispatcher and are kept
-  from the engine; the choice is saved as `host_players`. Then the engine's hero select.
-* For LAN play the host's game starts the bundled **`rg-relay.exe --lan --host-name NICK
-  --exit-with-parent`** (`rg.relay.LocalRelay`, once per game session): the same Rust server as
-  the public one, on TCP 8787 (HTTP `GET /status`, WebSocket `/ws`) plus a UDP discovery
-  responder on 8787. It ends with the game (its stdin is a pipe from the JVM). `rghost` connects
-  to `ws://127.0.0.1:8787/ws`. If 8787 is taken by another relay (`/status` answers), that one is
-  used; by anything else, hosting fails with a message in the title bar.
-* Clients: `SNAPMobileClient` login calls `LanDiscovery.find` (up to 20 s): it broadcasts
-  `RGR-DISCOVER 1` to every interface's broadcast address, 255.255.255.255 and 127.0.0.1 each
-  second; hosts answer `RGR-HOST 1 <port> <waiting hosted games> <host nick>`. A host with a
-  waiting game wins; otherwise the first answer, 1.5 s later. Nothing found → the public server
-  (`auto`) or the engine's "cannot connect" error (`lan`).
-* While the overlay is shown the launcher taps Right (a no-op in the main menu; Shift is Back)
-  when it opens and every 10 s: the main menu otherwise replays the intro after ~35 s without
-  input. The key that closes the overlay is kept from the engine until released.
-* Windows Firewall asks once, on the host only (inbound TCP/UDP 8787 for `rg-relay.exe`). If that
-  prompt was cancelled (Windows then adds inbound Block rules for the exe, which win over any
-  Allow) or the rule only covers the other network type, clients time out. `LAN-Setup.exe` in the
-  release (`tools/lan-setup`, asks for elevation) removes those Block rules and allows TCP/UDP
-  8787 from `LocalSubnet` in every profile (rule group "Reset Generation Revived"; `--remove`
-  deletes it). A third-party firewall (ESET, Norton...) replaces Windows Firewall and drops the
-  connections silently; a VPN client can hide the PC too.
+* Hosting (`relay_for_hosting`): `online` → the public server; `auto` → the public server if it
+  answers `GET /status`, else this device's own relay; `lan` → the own relay. The desktop game
+  runs that relay **in-process** (`native/desktop/src/lan.rs`: the `rg-server` library, the same
+  Rust server as the public one, on TCP 8787 (HTTP `GET /status`, WebSocket `/ws`) plus a UDP
+  discovery responder on 8787), started on first use and ending with the game. If 8787 is taken
+  by another relay (`/status` answers), that one is used; by anything else, hosting fails with a
+  message in the status. Android has no relay of its own: it hosts on the public server.
+* Joining (`relay_for_joining`, at login): `auto` broadcasts `RGR-DISCOVER 1` (UDP 8787) to every
+  interface's broadcast address, 255.255.255.255 and 127.0.0.1 each second for 2.5 s; hosts answer
+  `RGR-HOST 1 <port> <waiting hosted games> <host nick>`. A host with a waiting game wins;
+  otherwise the first answer, 1.5 s later. Nothing found → the public server. `lan` searches up
+  to 20 s and fails with the engine's "cannot connect" error; `online` skips the search.
+* Windows Firewall asks once, on the host only (inbound TCP/UDP 8787 for `ResetGeneration.exe`).
+  If that prompt was cancelled (Windows then adds inbound Block rules for the exe, which win over
+  any Allow) or the rule only covers the other network type, clients time out. `LAN-Setup.exe` in
+  the Windows release (`tools/lan-setup`, asks for elevation) removes those Block rules and allows
+  TCP/UDP 8787 from `LocalSubnet` in every profile (rule group "Reset Generation Revived";
+  `--remove` deletes it). A third-party firewall (ESET, Norton...) replaces Windows Firewall and
+  drops the connections silently; a VPN client can hide the PC too.
 
 A manual `server=ws://…` works everywhere (a relay you run yourself, see "Running a server").
 
-Test aids (Windows build): `--keys=T:KEY,...` presses keys T ms after start (`ESC`, `RETURN`,
-`UP`/`DOWN`/`LEFT`/`RIGHT`, `SPACE`, `F5`, or a hex VK), `--window_x=`/`--window_y=`,
-`--nickname=`, `--host=auto`, `--host_players=N`, `--host_hero=NAME|RANDOM`, `--dll_patch=false`
-(pristine engine DLL);
-`RT_NET_DEBUG=1` logs every 0x16 message in rghost (stderr). `--perflog=N` prints ticks/s, the
-slowest tick, Java heap and thread count every N seconds (`HostServer.perf`).
+Test aids (desktop game): `--keys=T:KEY,...` presses keys T ms after start (`ESC`, `RETURN`,
+`UP`/`DOWN`/`LEFT`/`RIGHT`, `SPACE`, `CTRL`, `F5`, or a hex AWT code), `--window_x=`/`--window_y=`,
+`--scale=1`, `--log=PATH`, `--nickname=`, `--host=auto`, `--host_players=N`,
+`--host_hero=NAME|RANDOM`; `RT_NET_DEBUG=1` logs every packet and relay message.
 
 ### Dropped connections and going back into a match
 
@@ -158,11 +145,11 @@ per-connection handshake (`0x1000d8c0`) takes a late joiner in, but always as a 
 next free key (`0x10023f40`) and seat (`0x10024c60`). A player who came back to a 3-player match
 became player 4, with no base and no hero, and crashed on their first move (`0x100b4a90` finds no
 hero entity). Giving them the old key and seat is not enough either: once the engine has seen the
-connection drop (leave command, `0x1005c530`) it sends that player nothing more. So rghost holds
-the seat instead:
+connection drop (leave command, `0x1005c530`) it sends that player nothing more. So the host holds
+the seat instead (`native/rt/server.c`):
 
 * Relay: `player_left` carries `lost: 1` when the connection dropped (not a normal leave or a
-  surrender). rghost then does **not** tell the engine: the session stays "connected" (sends to
+  surrender). The host then does **not** tell the engine: the session stays "connected" (sends to
   it are dropped) for as long as the match runs (`HOLD_MS` = 0: no limit; a positive value would
   close it after that long, and the engine would see the leave). A
   served room is kept while its host serves it, even with no members (in a 2-player match the
@@ -173,7 +160,7 @@ the seat instead:
   next Quick Match request (case 9), at any time while the room is served (`rejoin_ms: None`;
   `rg-relay --rejoin-secs N` would set a limit), is answered as usual and then starts a one-player match into that room instead of queueing. `unserve` (the host's listener
   closed: match over) forgets the room.
-* rghost, host side (`track_seats`): a new connection with the same name as a held session gets
+* Host side (`track_seats`): a new connection with the same name as a held session gets
   its old seat (preset in the pending join, so state 3 skips the seat search) and key (hook on
   the key allocator `0x10023f40`). The handshake sends the battle state on the new connection;
   then the held session takes over the new relay player id (the engine keeps using its old
@@ -181,27 +168,25 @@ the seat instead:
 * The handshake also dispatches a join command (type 0xc) for the player. Applied to a player
   who is already in the game it replaces their player object (`0x10010010`, game+0x14 -> +0x2c
   by seat) and record (`0x10027450`, game+0x1c -> +0x10 by key) with empty ones, on every
-  machine: the others crashed a minute later (`0x1004a0f4`). rghost hooks the server
+  machine: the others crashed a minute later (`0x1004a0f4`). The host hooks the server
   controller's dispatch (vtable `0x101779a0` slot 9) and sends that one command only to the
   player coming back; the host's game does not apply it.
 * The player coming back needs it (their screen stays black without it), but must keep the
-  objects from the battle state, or their game dies a few minutes later. rghost.dll is loaded
-  by every Windows game, so it also hooks the client's join handler (vtable `0x10188d18` slot
-  0x58, `0x100e16a0`): for a key and seat the game already has, the old objects are put back.
-  The native desktop and Android builds do the same in `native/rt/server.c` (stub in the same
-  vtable slot), so a native player who comes back keeps their objects too.
+  objects from the battle state, or their game dies a few minutes later. So every game (not
+  only a host) replaces the client's join handler (vtable `0x10188d18` slot 0x58, `0x100e16a0`)
+  with a stub in `native/rt/server.c`: for a key and seat the game already has, the old objects
+  are put back.
 * Relay `hello`: names are unique per server, so a restarted client used to become `Player22`
   while its old connection was still open (a crash or a frozen PC leaves a half-open TCP
   connection that only the 60 s idle timer closes). A connection with the same name that has
   sent nothing (not even a ping, every 15 s) for `STALE_MS` = 20 s is now closed first, so the
   player keeps their name and the casino finds them.
-* rghost: the engine never destroys connection objects, so session slots are never reused
+* Host: the engine never destroys connection objects, so session slots are never reused
   (`MAX_SESS` 4096; it was 64, which a long-running host could use up), and nothing is sent on a
   closed session.
 
-Client login state (`SNAPMobileClient`, `native/rt/net.c`): the engine logs in with `login()`
-and never calls `startLoginScreen()`, which is what reset `loginErrorState`/`loginCancelled`. One
-failed attempt (no host found yet, a dropped broadcast) therefore made every later attempt report
+Client login state (`native/rt/net.c`): the engine logs in with `login()` and never calls
+`startLoginScreen()`, which is what reset `loginErrorState`/`loginCancelled`. One failed attempt (no host found yet, a dropped broadcast) therefore made every later attempt report
 "cannot connect" (and a logout made them report "cancelled") until the game was restarted. A
 login request now clears both. A lost connection (`handleError`) also clears the queued actions
 except a logout, so a half-finished join cannot run on the dead socket.
@@ -215,7 +200,7 @@ native engine; everything above that — the engine's **MT** networking layer, t
 
 ```
 engine MT layer ──JNI──► SNAPMobileClient (Java)  ──►  SNAP server: rooms, game servers
-                         replaced by: Java client / native net.c ──WebSocket──► our relay
+                         replaced by: native/rt/net.c ──WebSocket──► our relay
 ```
 
 ### Engine-facing contract (unchanged)
@@ -246,7 +231,7 @@ transport hello (channel 2 `00`) and the keep-alive frame, accepts the client's 
 answers its pings and pings every 10 s. Without the hello the client never starts its own
 keep-alive and drops the connection ("Connection lost") 20 s after entering the casino.
 Because the greeting follows right behind `joined`, the clients enter a room on their WebSocket
-reader when `joined` arrives (`SNAPMobileClient.onRelayJoined`, the reader in `native/rt/net.c`),
+reader when `joined` arrives (the reader in `native/rt/net.c`),
 not on the action thread after the request returns: a greeting that won that race was dropped
 as "not in a room", and the client then lost the casino 20 s later now and then (typically
 when coming back to the casino after a match).
@@ -320,10 +305,9 @@ cargo x deploy-ssh CMD   # one command there    cargo x undeploy           remov
 `deploy` reads `deploy.local.ini` (git-ignored; copy `deploy.example.ini`): host, user, SSH key
 (a passphrase can come from a file) and the domain. SSH is pure Rust (russh), no `ssh` needed.
 
-Clients: Windows `app\revived.ini` → `server=auto|online|lan|ws://<host>:8787/ws`,
-`nickname=…`. Native desktop: `revived.ini` next to the program (`server=online` or a
-`ws://` URL). Android: `files/revived.ini` in the app's storage (default: the public server, a
-`DroidNNNN` nickname). The native client speaks `ws://` only; the Java client also `wss://`.
+Clients: desktop `revived.ini` next to the program, Android `files/revived.ini` in the app's
+storage: `server=auto|online|lan|ws://<host>:8787/ws` (default `auto`), `nickname=…` (default
+`PlayerNNNN`, Android `DroidNNNN`). The client speaks plain `ws://` only.
 
 ## The game room (done)
 
@@ -375,9 +359,9 @@ Channel 0x16 is **client ↔ authoritative game server**, not peer-to-peer locks
 Before hosted games, the plan was a **headless second engine instance** in server mode (the
 recompiled engine, no rendering/input) joining the relay room as the game server. Phase 0 proved
 that the engine's own server-mode controller can serve real clients; the findings below are what
-`rghost.dll` and `native/rt/server.c` are built on. The later phases (launching that server on the
-host's device, a Cloudflare relay, TLS for Android) were overtaken: the Windows host's own engine
-serves the match (`rghost.dll`), the relay is the Rust server, and Android plays through it.
+the hosts (`rghost.dll` then, `native/rt/server.c` now) are built on. The later phases
+(launching that server on the host's device, a Cloudflare relay, TLS for Android) were overtaken: the hosting player's own
+engine serves the match, the relay is the Rust server, and every build plays through it.
 
 ### Phase 0 result (2026-10-17)
 

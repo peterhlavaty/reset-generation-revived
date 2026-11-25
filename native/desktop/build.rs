@@ -2,6 +2,10 @@
 //! host shim, which `cargo x build-desktop` compiles and names in RG_ENGINE_LIB.
 fn main() {
     println!("cargo:rerun-if-env-changed=RG_ENGINE_LIB");
+    println!("cargo:rerun-if-env-changed=RG_ICON_RES");
+    if let Ok(res) = std::env::var("RG_ICON_RES") {
+        println!("cargo:rustc-link-arg-bins={res}"); // the icon (Windows)
+    }
     let Ok(lib) = std::env::var("RG_ENGINE_LIB") else {
         panic!("the engine library is missing: build this crate with `cargo x build-desktop`");
     };

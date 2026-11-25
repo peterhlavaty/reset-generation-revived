@@ -65,21 +65,6 @@ pub fn files_with_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
     out
 }
 
-/// Copies a directory tree.
-pub fn copy_dir(from: &Path, to: &Path) -> R<()> {
-    std::fs::create_dir_all(to)?;
-    for e in std::fs::read_dir(from)? {
-        let e = e?;
-        let (src, dst) = (e.path(), to.join(e.file_name()));
-        if src.is_dir() {
-            copy_dir(&src, &dst)?;
-        } else {
-            std::fs::copy(&src, &dst)?;
-        }
-    }
-    Ok(())
-}
-
 /// Removes a directory tree if it exists.
 pub fn remove_dir(p: &Path) -> R<()> {
     if p.exists() {
@@ -101,16 +86,44 @@ pub fn read_ini(p: &Path) -> R<Vec<(String, String)>> {
 }
 
 /// Long-running programs we start (the game, the emulator) must not inherit our stdout / stderr:
-/// a caller reading them through a pipe would wait until those programs end.
+/// a caller reading them through a pipe would wait until those programs end. Windows passes every
+/// inheritable handle to a child, and under `cargo x` we hold more copies of the caller's pipe than
+/// our std handles (cargo's own, inherited from its parent), so all handles lose the flag.
 pub fn no_inherit() {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
-        for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+        // handle values are multiples of 4; a value that is no handle just fails
+        for h in (4..0x10000usize).step_by(4) {
             unsafe {
-                SetHandleInformation(GetStdHandle(h), HANDLE_FLAG_INHERIT, 0);
+                SetHandleInformation(h as HANDLE, HANDLE_FLAG_INHERIT, 0);
             }
         }
     }
+}
+
+/// Packs a folder into a zip (the folder itself at the top).
+pub fn zip_dir(dir: &Path, dest: &Path) -> R<()> {
+    let base = dir.parent().unwrap();
+    let mut out = zip::ZipWriter::new(std::fs::File::create(dest)?);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .large_file(false);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&d)?.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for p in entries {
+            let name = p.strip_prefix(base)?.to_string_lossy().replace('\\', "/");
+            if p.is_dir() {
+                out.add_directory(format!("{name}/"), opts)?;
+                stack.push(p);
+            } else {
+                out.start_file(name, opts)?;
+                std::io::copy(&mut std::fs::File::open(&p)?, &mut out)?;
+            }
+        }
+    }
+    out.finish()?;
+    Ok(())
 }

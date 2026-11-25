@@ -3,6 +3,8 @@
 //! `data/` (the game data, patched for the 640x360 engine size) and `revived.ini`.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod lan;
+
 use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, CString};
@@ -11,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 const W: usize = 640;
 const H: usize = 360;
-const ONLINE: &str = "ws://resetgeneration.rustyapps.com/ws";
 
 extern "C" {
     fn rg_desktop_init(log_path: *const c_char);
@@ -25,6 +26,7 @@ extern "C" {
     fn rg_host_start(players: c_int, hero: c_int) -> c_int;
     fn rg_host_status() -> *const c_char;
     fn rg_host_players() -> c_int;
+    fn rg_set_relay_starter(f: extern "C" fn(*const c_char) -> *const c_char);
 }
 
 fn cstr(s: &str) -> CString {
@@ -37,25 +39,32 @@ struct Config {
     server: String,
     nickname: String,
     scale: String,
+    fullscreen: bool,
     /// hosting (F5): player count, hero (a name or id, RANDOM, or empty: choose in the game)
     host_players: i32,
     host_hero: String,
-    /// test aids: host=auto hosts by itself, keys=T:KEY,... presses keys T ms after the start
+    /// test aids: host=auto hosts by itself, keys=T:KEY,... presses keys T ms after the start,
+    /// window_x/window_y place the window, log= writes the log there
     host: String,
     keys: String,
+    window_pos: (Option<isize>, Option<isize>),
+    log: String,
 }
 
 impl Config {
     fn load(dir: &Path) -> Config {
         let path = dir.join("revived.ini");
         let mut c = Config {
-            server: "online".into(),
+            server: "auto".into(),
             nickname: String::new(),
             scale: "fit".into(),
+            fullscreen: false,
             host_players: 2,
             host_hero: String::new(),
             host: String::new(),
             keys: String::new(),
+            window_pos: (None, None),
+            log: String::new(),
         };
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         c.apply(text.lines());
@@ -63,18 +72,20 @@ impl Config {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(7);
             c.nickname = format!("Player{}", 1000 + t % 9000);
         }
-        let args: Vec<String> = std::env::args().skip(1).filter_map(|a| a.strip_prefix("--").map(String::from)).collect();
         if text.is_empty() {
             let _ = std::fs::write(
                 &path,
                 format!(
-                    "# Reset Generation (native)\n\
-                     # server: online (the public server) or ws://HOST:PORT/ws\n\
+                    "# Reset Generation\n\
+                     # server: auto (a game hosted on this network, else the public server; hosting\n\
+                     # without internet runs a LAN server in this game), online, lan, or ws://HOST:PORT/ws\n\
                      server={}\n\
                      # your name in online games (letters, digits, _)\n\
                      nickname={}\n\
-                     # window size: fit (largest that fits the screen), 1, 2 or 4\n\
+                     # window size: fit (largest that fits the screen), 1, 2 or 4; F11 or Alt+Enter\n\
+                     # toggles fullscreen (Windows)\n\
                      scale={}\n\
+                     fullscreen=false\n\
                      # hosting a game (F5 in the main menu): players 2-4 (remembered), hero (a name,\n\
                      # RANDOM, or empty: choose in the game)\n\
                      host_players={}\n\
@@ -83,13 +94,18 @@ impl Config {
                 ),
             );
         }
+        let args: Vec<String> = std::env::args().skip(1).filter_map(|a| a.strip_prefix("--").map(String::from)).collect();
         c.apply(args.iter().map(String::as_str));
         c
     }
 
     fn apply<'a>(&mut self, lines: impl Iterator<Item = &'a str>) {
         for line in lines {
-            let Some((k, v)) = line.split_once('=') else { continue };
+            let (k, v) = match line.split_once('=') {
+                Some(kv) => kv,
+                None if line == "fullscreen" || line == "windowed" => ("fullscreen", if line == "fullscreen" { "true" } else { "false" }),
+                None => continue,
+            };
             let v = v.split('#').next().unwrap_or("").trim().to_string();
             match k.trim() {
                 "server" if !v.is_empty() => self.server = v,
@@ -99,11 +115,15 @@ impl Config {
                         self.nickname = n;
                     }
                 }
-                "scale" if !v.is_empty() => self.scale = v,
+                "scale" | "window_scale" if !v.is_empty() => self.scale = v,
+                "fullscreen" => self.fullscreen = v.eq_ignore_ascii_case("true"),
                 "host_players" => self.host_players = v.parse().unwrap_or(2),
                 "host_hero" => self.host_hero = v.to_ascii_uppercase(),
                 "host" => self.host = v,
                 "keys" => self.keys = v,
+                "window_x" => self.window_pos.0 = v.parse().ok(),
+                "window_y" => self.window_pos.1 = v.parse().ok(),
+                "log" => self.log = v,
                 _ => {}
             }
         }
@@ -135,16 +155,7 @@ impl Config {
         if !found {
             out.push(line);
         }
-        let _ = std::fs::write(&path, out.join("
-") + "
-");
-    }
-
-    fn server_url(&self) -> &str {
-        match self.server.as_str() {
-            "online" | "auto" => ONLINE,
-            s => s,
-        }
+        let _ = std::fs::write(&path, out.join("\n") + "\n");
     }
 
     fn scale(&self) -> Scale {
@@ -234,14 +245,76 @@ fn start_audio(ring: Ring) -> Option<tinyaudio::OutputDevice> {
     }
 }
 
+/// Window extras minifb lacks (Windows): borderless fullscreen on the window's monitor, the icon.
+#[cfg(windows)]
+mod platform {
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GetWindowRect, LoadIconW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, HWND_TOP, ICON_BIG,
+        ICON_SMALL, SWP_FRAMECHANGED, SWP_NOOWNERZORDER, WM_SETICON, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    };
+
+    pub struct Saved(isize, RECT);
+
+    /// The exe's icon (resource 1) on the window and its taskbar button.
+    pub fn icon(hwnd: *mut std::ffi::c_void) {
+        unsafe {
+            let icon = LoadIconW(GetModuleHandleW(std::ptr::null()), 1 as _);
+            if !icon.is_null() {
+                SendMessageW(hwnd as HWND, WM_SETICON, ICON_BIG as usize, icon as isize);
+                SendMessageW(hwnd as HWND, WM_SETICON, ICON_SMALL as usize, icon as isize);
+            }
+        }
+    }
+
+    pub fn fullscreen(hwnd: *mut std::ffi::c_void, saved: &mut Option<Saved>, on: bool) {
+        let hwnd = hwnd as HWND;
+        unsafe {
+            if on && saved.is_none() {
+                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                let mut r: RECT = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut r);
+                let mut mi: MONITORINFO = std::mem::zeroed();
+                mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+                *saved = Some(Saved(style, r));
+                SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !(WS_OVERLAPPEDWINDOW as isize)) | (WS_POPUP | WS_VISIBLE) as isize);
+                let m = mi.rcMonitor;
+                SetWindowPos(hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+            } else if !on {
+                if let Some(Saved(style, r)) = saved.take() {
+                    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                    SetWindowPos(hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod platform {
+    pub struct Saved;
+    pub fn icon(_: *mut std::ffi::c_void) {}
+    pub fn fullscreen(_: *mut std::ffi::c_void, _: &mut Option<Saved>, on: bool) {
+        if on {
+            eprintln!("fullscreen is only available on Windows; maximize the window instead");
+        }
+    }
+}
+
 fn main() {
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)).unwrap_or_else(|| ".".into());
     let data = exe_dir.join("data");
     let dll = data.join("ResetGeneration-Win32-Web.dll");
-    let log = exe_dir.join("ResetGeneration.log");
-    unsafe { rg_desktop_init(cstr(&log.to_string_lossy()).as_ptr()) };
     let cfg = Config::load(&exe_dir);
-    unsafe { rg_net_configure(cstr(cfg.server_url()).as_ptr(), cstr(&cfg.nickname).as_ptr()) };
+    let log = if cfg.log.is_empty() { exe_dir.join("ResetGeneration.log") } else { PathBuf::from(&cfg.log) };
+    unsafe {
+        rg_desktop_init(cstr(&log.to_string_lossy()).as_ptr());
+        rg_net_configure(cstr(&cfg.server).as_ptr(), cstr(&cfg.nickname).as_ptr());
+        rg_set_relay_starter(lan::start_relay);
+    }
 
     // The engine's file API is ANSI and gets its home directory as given: run from inside it with
     // a relative path, so a game folder with non-ASCII characters works too.
@@ -256,6 +329,15 @@ fn main() {
     let opts = WindowOptions { resize: true, scale: cfg.scale(), scale_mode: ScaleMode::AspectRatioStretch, ..WindowOptions::default() };
     let mut win = Window::new("Reset Generation", W, H, opts).unwrap_or_else(|e| fatal(&format!("cannot open a window: {e}")));
     win.set_target_fps(0); // the engine paces itself (32 fps)
+    if let (Some(x), Some(y)) = cfg.window_pos {
+        win.set_position(x, y);
+    }
+    platform::icon(win.get_window_handle());
+    let mut saved = None;
+    let mut full = cfg.fullscreen;
+    if full {
+        platform::fullscreen(win.get_window_handle(), &mut saved, true);
+    }
 
     let ring: Ring = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
     let _audio = start_audio(ring.clone());
@@ -287,8 +369,13 @@ fn main() {
             players = p;
             Config::save(&exe_dir, "host_players", &p.to_string());
         }
+        let alt = win.is_key_down(Key::LeftAlt) || win.is_key_down(Key::RightAlt);
         for k in win.get_keys_pressed(KeyRepeat::No) {
-            if let Some(c) = awt(k) {
+            if k == Key::F11 || (alt && matches!(k, Key::Enter | Key::NumPadEnter)) {
+                full = !full;
+                platform::fullscreen(win.get_window_handle(), &mut saved, full);
+                Config::save(&exe_dir, "fullscreen", if full { "true" } else { "false" });
+            } else if let Some(c) = awt(k) {
                 unsafe { rg_key(1, c) };
             }
         }

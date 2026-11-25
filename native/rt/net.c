@@ -1,7 +1,8 @@
-/* Relay client (WebSocket, ws:// only) and the SNAP Mobile login/room state machine. */
+/* Relay client (WebSocket links: link.c) and the SNAP Mobile login/room state machine. */
 #include "net.h"
 #include "engine.h"
 #include "host.h"
+#include "link.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,22 +10,10 @@
 #include <time.h>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-typedef SOCKET sock_t;
-#define BAD_SOCK INVALID_SOCKET
-#define closesock closesocket
+#include <windows.h>
 #else
-#include <netdb.h>
 #include <signal.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
-typedef int sock_t;
-#define BAD_SOCK (-1)
-#define closesock close
 #endif
 
 #define REQUEST_TIMEOUT_MS 10000
@@ -92,50 +81,20 @@ static void add_action(item *it, int allow_logged_out) {
 }
 
 /* ------------------------------------------------------------------ WebSocket */
-static sock_t ws = BAD_SOCK;
+static rt_link *ws;              /* the relay connection (guarded by send_lock) */
+static char ws_url[256];         /* the relay it goes to (server=auto: found on login) */
 static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
 static char reply[512];          /* last control reply (JSON) */
 static int reply_seq;
 static int ws_generation;
 
-static int send_all(sock_t s, const uint8_t *p, size_t n) {
-    while (n) {
-        int k = (int)send(s, (const char *)p, (int)n, 0);
-        if (k <= 0) return 0;
-        p += k;
-        n -= (size_t)k;
-    }
-    return 1;
-}
-
-static int recv_all(sock_t s, uint8_t *p, size_t n) {
-    while (n) {
-        int k = (int)recv(s, (char *)p, (int)n, 0);
-        if (k <= 0) return 0;
-        p += k;
-        n -= (size_t)k;
-    }
-    return 1;
-}
-
 static int ws_send(int opcode, const void *data, size_t len) {
-    uint8_t hdr[14];
-    size_t h = 0;
-    uint8_t mask[4];
-    uint32_t r = (uint32_t)rand() ^ (uint32_t)time(NULL) * 2654435761u;
-    memcpy(mask, &r, 4);
-    hdr[h++] = (uint8_t)(0x80 | opcode);
-    if (len < 126) hdr[h++] = (uint8_t)(0x80 | len);
-    else { hdr[h++] = 0x80 | 126; hdr[h++] = (uint8_t)(len >> 8); hdr[h++] = (uint8_t)len; }
-    memcpy(hdr + h, mask, 4);
-    h += 4;
-    uint8_t *buf = (uint8_t *)malloc(h + len);
-    memcpy(buf, hdr, h);
-    for (size_t i = 0; i < len; i++) buf[h + i] = ((const uint8_t *)data)[i] ^ mask[i & 3];
     pthread_mutex_lock(&send_lock);
-    int ok = ws != BAD_SOCK && send_all(ws, buf, h + len);
+    rt_link *l = ws;
+    if (l) link_ref(l);
     pthread_mutex_unlock(&send_lock);
-    free(buf);
+    int ok = l && link_send(l, opcode, data, len);
+    link_release(l);
     return ok;
 }
 
@@ -170,21 +129,16 @@ static void on_disconnect(int gen) {
     }
 }
 
+typedef struct { rt_link *l; int gen; } reader_arg;
+
 static void *reader(void *arg) {
-    int gen = (int)(intptr_t)arg;
-    sock_t s = ws;
+    reader_arg a = *(reader_arg *)arg;
+    free(arg);
     uint8_t *msg = (uint8_t *)malloc(65536);
-    for (;;) {
-        uint8_t h[2];
-        if (!recv_all(s, h, 2)) break;
-        int op = h[0] & 15;
-        uint64_t len = h[1] & 127;
-        if (len == 126) { uint8_t e[2]; if (!recv_all(s, e, 2)) break; len = (uint64_t)e[0] << 8 | e[1]; }
-        else if (len == 127) { uint8_t e[8]; if (!recv_all(s, e, 8)) break; len = 0; for (int i = 0; i < 8; i++) len = len << 8 | e[i]; }
-        if (len > 65535) break;
-        if (!recv_all(s, msg, (size_t)len)) break;
+    size_t len;
+    int op;
+    while ((op = link_read(a.l, msg, 65536, &len)) != 0) {
         if (op == 1) {                                   /* text: control reply / notice */
-            msg[len] = 0;
             char t[24];
             json_str((char *)msg, "t", t, sizeof t);
             if (!strcmp(t, "pong") || !strcmp(t, "peer_joined") || !strcmp(t, "peer_left")) continue;
@@ -199,19 +153,16 @@ static void *reader(void *arg) {
             reply_seq++;
             pthread_cond_broadcast(&reply_cv);
             pthread_mutex_unlock(&lock);
-        } else if (op == 2) {                            /* binary: game packet */
+        } else {                                         /* binary: game packet */
             pthread_mutex_lock(&lock);
             int ok = in_room && len <= MAX_PACKET;
             pthread_mutex_unlock(&lock);
             if (ok) add_event(mk(E_DATA, 0, room, msg, (int)len));
-        } else if (op == 9) {
-            ws_send(10, msg, (size_t)len);
-        } else if (op == 8) {
-            break;
         }
     }
     free(msg);
-    on_disconnect(gen);
+    link_release(a.l);
+    on_disconnect(a.gen);
     return NULL;
 }
 
@@ -244,70 +195,31 @@ static int request(const char *json, const char *type, char *out, size_t n) {
 
 static void ws_close(void) {
     pthread_mutex_lock(&send_lock);
-    if (ws != BAD_SOCK) {
-        uint8_t c[6] = {0x88, 0x80, 0, 0, 0, 0};
-        send_all(ws, c, 6);
-        shutdown(ws, 2);
-        closesock(ws);
-        ws = BAD_SOCK;
-    }
+    rt_link *l = ws;
+    ws = NULL;
     pthread_mutex_unlock(&send_lock);
+    if (l) { link_close(l); link_release(l); }
 }
 
 static int ws_connect(void) {
-    char host[200], path[200] = "/";
-    int port = 80;
-    if (strncmp(server_url, "ws://", 5) != 0) {
-        host_log("net: only ws:// servers are supported by the native client (got %s)", server_url);
-        return 0;
-    }
-    const char *p = server_url + 5, *slash = strchr(p, '/'), *colon = strchr(p, ':');
-    size_t hl = slash ? (size_t)(slash - p) : strlen(p);
-    if (colon && (!slash || colon < slash)) { hl = (size_t)(colon - p); port = atoi(colon + 1); }
-    snprintf(host, sizeof host, "%.*s", (int)hl, p);
-    if (slash) snprintf(path, sizeof path, "%s", slash);
-#ifdef _WIN32
-    static int wsa;
-    if (!wsa) { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); wsa = 1; }
-#endif
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_socktype = SOCK_STREAM;
-    char ports[8];
-    snprintf(ports, sizeof ports, "%d", port);
-    if (getaddrinfo(host, ports, &hints, &res) != 0 || !res) { host_log("net: cannot resolve %s", host); return 0; }
-    sock_t s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == BAD_SOCK || connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        host_log("net: cannot connect to %s:%d", host, port);
-        if (s != BAD_SOCK) closesock(s);
-        freeaddrinfo(res);
-        return 0;
-    }
-    freeaddrinfo(res);
-    int one = 1;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-    char req[600];
-    snprintf(req, sizeof req,
-             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-             "Sec-WebSocket-Key: UmVzZXRHZW5lcmF0aW9uIQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-             path, host, port);
-    char resp[1024];
-    size_t got = 0;
-    if (!send_all(s, (const uint8_t *)req, strlen(req))) { closesock(s); return 0; }
-    while (got < sizeof resp - 1) {
-        int k = (int)recv(s, resp + got, 1, 0);
-        if (k <= 0) break;
-        got += (size_t)k;
-        resp[got] = 0;
-        if (got >= 4 && !memcmp(resp + got - 4, "\r\n\r\n", 4)) break;
-    }
-    if (!strstr(resp, " 101 ")) { host_log("net: websocket upgrade refused"); closesock(s); return 0; }
-    ws = s;
+    char found[128];
+    const char *url = relay_for_joining(server_url, found, sizeof found);
+    if (!url) { host_log("net: no game found on the LAN (server=%s)", server_url); return 0; }
+    rt_link *l = link_open(url, "net");
+    if (!l) return 0;
+    snprintf(ws_url, sizeof ws_url, "%s", url);
+    pthread_mutex_lock(&send_lock);
+    ws = l;
+    pthread_mutex_unlock(&send_lock);
     pthread_mutex_lock(&lock);
     int gen = ++ws_generation;
     pthread_mutex_unlock(&lock);
+    reader_arg *a = (reader_arg *)malloc(sizeof *a);
+    a->l = l;
+    a->gen = gen;
+    link_ref(l);
     pthread_t t;
-    pthread_create(&t, NULL, reader, (void *)(intptr_t)gen);
+    pthread_create(&t, NULL, reader, a);
     pthread_detach(t);
     return 1;
 }
@@ -342,7 +254,7 @@ static int enter_room(const char *op, const char *name) {
 
 static void do_login(void) {
     login_in_progress = 1;
-    if (logged_in && ws != BAD_SOCK) { credentials_ok = 1; add_event(mk(E_LOGIN_DONE, 0, NULL, NULL, 0)); login_in_progress = 0; return; }
+    if (logged_in && ws) { credentials_ok = 1; add_event(mk(E_LOGIN_DONE, 0, NULL, NULL, 0)); login_in_progress = 0; return; }
     if (!nickname[0]) snprintf(nickname, sizeof nickname, "Player%04d", rand() % 9000 + 1000);
     if (!ws_connect()) { err_state = 3; login_in_progress = 0; return; }
     char json[120], out[512];
@@ -356,7 +268,7 @@ static void do_login(void) {
     }
     char name[32];
     json_str(out, "name", name, sizeof name);
-    host_log("net: logged in to %s as %s", server_url, name);
+    host_log("net: logged in to %s as %s", ws_url, name);
     pthread_mutex_lock(&lock);
     logged_in = 1;
     credentials_ok = 1;

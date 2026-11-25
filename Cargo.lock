@@ -2049,7 +2049,10 @@ name = "rg-native"
 version = "2.0.0"
 dependencies = [
  "minifb",
+ "rg-server",
  "tinyaudio",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

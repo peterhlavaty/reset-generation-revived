@@ -1,14 +1,18 @@
-//! Running and driving the built Windows game: `run`, `lan-test`, `keys`, `shot`, `killgame`.
-//! Logs go to build/logs, screenshots to build/shots.
+//! Running and driving the built desktop game (Windows): `run`, `lan-test`, `keys`, `shot`,
+//! `killgame`. Logs go to build/logs, screenshots to build/shots.
 
 use crate::util::{root, R};
-use crate::windows::exe;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The game's processes: the Windows build (Java host) and the native build.
-const GAME_EXES: [&str; 2] = ["ResetGeneration-Revived.exe", "ResetGeneration.exe"];
+/// The game's processes (also the retired Java build's).
+const GAME_EXES: [&str; 2] = ["ResetGeneration.exe", "ResetGeneration-Revived.exe"];
+
+fn exe() -> PathBuf {
+    let dist = format!("ResetGeneration-Revived-{}", std::env::consts::OS);
+    root().join("dist").join(dist).join(format!("ResetGeneration{}", std::env::consts::EXE_SUFFIX))
+}
 
 fn logs() -> PathBuf {
     let d = root().join("build/logs");
@@ -16,13 +20,21 @@ fn logs() -> PathBuf {
     d
 }
 
+/// Starts the game with its log in build/logs/<log>.
 fn spawn(args: &[String], log: &str) -> R<u32> {
     if !exe().exists() {
-        return Err("build first: cargo x build-windows".into());
+        return Err("build first: cargo x build-desktop".into());
     }
-    let f = std::fs::File::create(logs().join(log))?;
+    let path = logs().join(log);
+    let _ = std::fs::remove_file(&path);
     crate::util::no_inherit();
-    let child = Command::new(exe()).args(args).stdin(Stdio::null()).stdout(f.try_clone()?).stderr(f).spawn()?;
+    let child = Command::new(exe())
+        .args(args)
+        .arg(format!("--log={}", path.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     Ok(child.id())
 }
 
@@ -60,6 +72,7 @@ pub fn lan_test(args: &[String]) -> R<()> {
             "--nickname=Host".into(),
             s.clone(),
             "--host=auto".into(),
+            "--host_hero=RANDOM".into(),
             format!("--host_players={n}"),
             "--keys=6000:ESC".into(),
             "--window_scale=1".into(),
@@ -68,10 +81,9 @@ pub fn lan_test(args: &[String]) -> R<()> {
         ],
         "host.log",
     )?;
-    // The others start once the host is hosting: that also keeps them from patching the game data
-    // while the host does (first launch per resolution).
+    // the others start once the host is hosting
     let t = Instant::now();
-    while !std::fs::read_to_string(&host_log).unwrap_or_default().contains("HostServer: hosting") {
+    while !std::fs::read_to_string(&host_log).unwrap_or_default().contains("host: hosting") {
         if t.elapsed() > Duration::from_secs(90) {
             return Err(format!("the host did not start hosting, see {}", host_log.display()).into());
         }

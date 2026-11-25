@@ -1,6 +1,6 @@
 /* Hosting a game on this player's engine (every native build), and the engine fixes that go with
- * it. The native counterpart of native/win32/rghost.c (the Windows Java build's host DLL); see
- * there and docs/MULTIPLAYER.md for how and why each piece works. In short:
+ * it. See docs/MULTIPLAYER.md for how and why each piece works (it began as rghost.c, the retired
+ * Java build's host DLL; see the git history). In short:
  *   - the engine's LAN host screen (0x100caa80) is built and made the current screen; its entry
  *     creates the server-mode controller (0x1000ecd0) and a TCP acceptor;
  *   - the acceptor's setController (vtable 0x10188b64, slot 1) is replaced by a stub that installs
@@ -20,6 +20,7 @@
 #include "server.h"
 #include "engine.h"
 #include "host.h"
+#include "link.h"
 #include "net.h"
 #include "rt.h"
 #include <pthread.h>
@@ -29,22 +30,6 @@
 #include <strings.h>
 #include <time.h>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-typedef SOCKET sock_t;
-#define BAD_SOCK INVALID_SOCKET
-#define closesock closesocket
-#else
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-typedef int sock_t;
-#define BAD_SOCK (-1)
-#define closesock close
-#endif
 
 #define MAX_SESS 4096              /* slots are never reused: the engine never frees a connection */
 #define CH_GAME 0x16
@@ -80,8 +65,8 @@ enum { EV_JOIN, EV_LEAVE, EV_LOST, EV_DATA, EV_CLOSED };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER, send_lock = PTHREAD_MUTEX_INITIALIZER;
 static ev *ev_head, *ev_tail;
-static sock_t ws = BAD_SOCK;
-static volatile int ws_up, connecting;
+static rt_link *ws;                      /* the relay connection (guarded by send_lock) */
+static volatile int ws_up, connecting, no_relay;
 
 static void push_ev(int kind, int pid, const void *data, int len) {
     ev *e = (ev *)calloc(1, sizeof *e + (size_t)(len > 0 ? len : 0));
@@ -102,42 +87,13 @@ static ev *pop_ev(void) {
     return e;
 }
 
-static int send_all(sock_t s, const uint8_t *p, size_t n) {
-    while (n) {
-        int k = (int)send(s, (const char *)p, (int)n, 0);
-        if (k <= 0) return 0;
-        p += k;
-        n -= (size_t)k;
-    }
-    return 1;
-}
-static int recv_all(sock_t s, uint8_t *p, size_t n) {
-    while (n) {
-        int k = (int)recv(s, (char *)p, (int)n, 0);
-        if (k <= 0) return 0;
-        p += k;
-        n -= (size_t)k;
-    }
-    return 1;
-}
-
 static int ws_send(int opcode, const void *data, size_t len) {
-    uint8_t hdr[14], mask[4];
-    size_t h = 0;
-    uint32_t r = (uint32_t)rand() ^ (uint32_t)time(NULL) * 2654435761u;
-    memcpy(mask, &r, 4);
-    hdr[h++] = (uint8_t)(0x80 | opcode);
-    if (len < 126) hdr[h++] = (uint8_t)(0x80 | len);
-    else { hdr[h++] = 0x80 | 126; hdr[h++] = (uint8_t)(len >> 8); hdr[h++] = (uint8_t)len; }
-    memcpy(hdr + h, mask, 4);
-    h += 4;
-    uint8_t *buf = (uint8_t *)malloc(h + len);
-    memcpy(buf, hdr, h);
-    for (size_t i = 0; i < len; i++) buf[h + i] = ((const uint8_t *)data)[i] ^ mask[i & 3];
     pthread_mutex_lock(&send_lock);
-    int ok = ws_up && ws != BAD_SOCK && send_all(ws, buf, h + len);
+    rt_link *l = ws_up ? ws : NULL;
+    if (l) link_ref(l);
     pthread_mutex_unlock(&send_lock);
-    free(buf);
+    int ok = l && link_send(l, opcode, data, len);
+    link_release(l);
     return ok;
 }
 
@@ -166,79 +122,28 @@ static void send_serve(void) {
     host_log("host: offering room %s on %s for %d remote player(s)", room, url, remote_players);
 }
 
-static sock_t ws_open(void) {
-    char host[200], path[200] = "/";
-    int port = 80;
-    if (strncmp(url, "ws://", 5) != 0) { host_log("host: only ws:// relays are supported (got %s)", url); return BAD_SOCK; }
-    const char *p = url + 5, *slash = strchr(p, '/'), *colon = strchr(p, ':');
-    size_t hl = slash ? (size_t)(slash - p) : strlen(p);
-    if (colon && (!slash || colon < slash)) { hl = (size_t)(colon - p); port = atoi(colon + 1); }
-    snprintf(host, sizeof host, "%.*s", (int)hl, p);
-    if (slash) snprintf(path, sizeof path, "%s", slash);
-#ifdef _WIN32
-    static int wsa;
-    if (!wsa) { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); wsa = 1; }
-#endif
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_socktype = SOCK_STREAM;
-    char ports[8];
-    snprintf(ports, sizeof ports, "%d", port);
-    if (getaddrinfo(host, ports, &hints, &res) != 0 || !res) { host_log("host: cannot resolve %s", host); return BAD_SOCK; }
-    sock_t s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == BAD_SOCK || connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        host_log("host: cannot connect to %s:%d", host, port);
-        if (s != BAD_SOCK) closesock(s);
-        freeaddrinfo(res);
-        return BAD_SOCK;
-    }
-    freeaddrinfo(res);
-    int one = 1;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-    char req[600];
-    snprintf(req, sizeof req,
-             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-             "Sec-WebSocket-Key: UmVzZXRHZW5lcmF0aW9uIQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-             path, host, port);
-    char resp[1024];
-    size_t got = 0;
-    if (!send_all(s, (const uint8_t *)req, strlen(req))) { closesock(s); return BAD_SOCK; }
-    while (got < sizeof resp - 1) {
-        int k = (int)recv(s, resp + got, 1, 0);
-        if (k <= 0) break;
-        got += (size_t)k;
-        resp[got] = 0;
-        if (got >= 4 && !memcmp(resp + got - 4, "\r\n\r\n", 4)) break;
-    }
-    resp[got] = 0;
-    if (!strstr(resp, " 101 ")) { host_log("host: websocket upgrade refused"); closesock(s); return BAD_SOCK; }
-    return s;
-}
-
 /* connects (off the game thread: a dead server must not freeze the game), then reads */
 static void *link_thread(void *arg) {
     (void)arg;
-    sock_t s = ws_open();
-    if (s == BAD_SOCK) { connecting = 0; return NULL; }
+    char buf[128];
+    const char *u = relay_for_hosting(net_server_url(), net_nickname(), buf, sizeof buf);
+    no_relay = !u;
+    rt_link *l = u ? link_open(u, "host") : NULL;
+    if (!l) { connecting = 0; return NULL; }
+    snprintf(url, sizeof url, "%s", u);
+    link_ref(l);
     pthread_mutex_lock(&send_lock);
-    ws = s;
+    ws = l;
     ws_up = 1;
     pthread_mutex_unlock(&send_lock);
     connecting = 0;
     ws_send(1, "{\"t\":\"hello\",\"v\":1,\"name\":\"RGHost\"}", 35);
     if (serving) send_serve();
     uint8_t *msg = (uint8_t *)malloc(1 << 20);
-    for (;;) {
-        uint8_t h[2];
-        if (!recv_all(s, h, 2)) break;
-        int op = h[0] & 15;
-        uint64_t len = h[1] & 127;
-        if (len == 126) { uint8_t e[2]; if (!recv_all(s, e, 2)) break; len = (uint64_t)e[0] << 8 | e[1]; }
-        else if (len == 127) { uint8_t e[8]; if (!recv_all(s, e, 8)) break; len = 0; for (int i = 0; i < 8; i++) len = len << 8 | e[i]; }
-        if (len >= (1 << 20) - 1) break;
-        if (!recv_all(s, msg, (size_t)len)) break;
+    size_t len;
+    int op;
+    while ((op = link_read(l, msg, 1 << 20, &len)) != 0) {
         if (op == 1) {
-            msg[len] = 0;
             char t[24];
             json_str((char *)msg, "t", t, sizeof t);
             if (!strcmp(t, "player_joined")) {
@@ -249,15 +154,12 @@ static void *link_thread(void *arg) {
                 push_ev(json_int((char *)msg, "lost", 0) ? EV_LOST : EV_LEAVE, json_int((char *)msg, "pid", -1), NULL, 0);
             } else if (!strcmp(t, "error")) host_log("host: relay error %s", (char *)msg);
             else if (getenv("RT_NET_DEBUG")) host_log("host: relay %s", (char *)msg);
-        } else if (op == 2) {
-            if (len >= 2) push_ev(EV_DATA, msg[0] | msg[1] << 8, msg + 2, (int)len - 2);
-        } else if (op == 9) {
-            ws_send(10, msg, (size_t)len);
-        } else if (op == 8) {
-            break;
+        } else if (len >= 2) {
+            push_ev(EV_DATA, msg[0] | msg[1] << 8, msg + 2, (int)len - 2);
         }
     }
     free(msg);
+    link_release(l);
     pthread_mutex_lock(&send_lock);
     ws_up = 0;
     pthread_mutex_unlock(&send_lock);
@@ -495,7 +397,7 @@ static void c_recv(int arg) {
     rt_ret(msg, 2);
 }
 
-/* ------------------------------------------------------------------ rejoin (see rghost.c) */
+/* ------------------------------------------------------------------ rejoin */
 /* 0x10023f40 key allocation (entry hook): a player coming back gets their old key */
 static int hook_key_alloc(void) {
     if (force_key <= 0) return 0;
@@ -674,20 +576,13 @@ static int host_start(int players, int hero, const char *room_name) {
         host_log("host: cannot host now (not in the main menu yet, or already hosting)");
         return 0;
     }
-    const char *u = net_server_url();
-    if (strncmp(u, "ws://", 5) != 0) {
-        snprintf(status, sizeof status, "Cannot host: no relay server (%s)", u);
-        host_log("host: %s", status);
-        return 0;
-    }
-    if (!url[0] || strcmp(url, u) != 0) snprintf(url, sizeof url, "%s", u);
     const char *nick = net_nickname();
     if (room_name) snprintf(room, sizeof room, "%s", room_name);
     else snprintf(room, sizeof room, "HOST_%s_%d", nick, ++games);
     host_name = rt_strdup_guest(nick);
     players = players < 2 ? 2 : players > 4 ? 4 : players;
     remote_players = players - 1;
-    host_log("host: hosting %s for %d players (relay %s)", room, players, url);
+    host_log("host: hosting %s for %d players (server=%s)", room, players, net_server_url());
     if (hero == -2) { show_hero_select(players); return 1; }
     host_hero = (hero >= 0 && hero <= 9) ? (uint32_t)hero : 0xffffffffu;
     set_screen(build_host_screen(players));
@@ -743,7 +638,8 @@ const char *rg_host_status(void) {
     case 1: return "Host a game: number of players";
     case 2: return "Hosting: choose your hero (Back = cancel)";
     case 3:
-        if (!ws_up) snprintf(status, sizeof status, "Hosting: connecting to the server...");
+        if (!ws_up && no_relay) snprintf(status, sizeof status, "Cannot host: no server (no internet, and this device cannot run a LAN relay)");
+        else if (!ws_up) snprintf(status, sizeof status, "Hosting: connecting to the server...");
         else snprintf(status, sizeof status, "Hosting, waiting for players %d/%d (others: Online - Quick Match)", n, wanted);
         return status;
     case 4:
@@ -905,7 +801,7 @@ void rg_server_pump(void) {
     if (!picker) nudged_picker = 0;
     if (!hosting) return;
     static uint32_t retry, last_ping;
-    if (!ws_up && !connecting && ws == BAD_SOCK && (now - retry > 2000 || !retry)) {
+    if (!ws_up && !connecting && !ws && (now - retry > 2000 || !retry)) {
         retry = now ? now : 1;
         connecting = 1;
         pthread_t t;
@@ -950,8 +846,10 @@ void rg_server_pump(void) {
         } else if (e->kind == EV_CLOSED) {
             host_log("host: relay connection lost");
             pthread_mutex_lock(&send_lock);
-            if (ws != BAD_SOCK) { closesock(ws); ws = BAD_SOCK; }
+            rt_link *l = ws;
+            ws = NULL;
             pthread_mutex_unlock(&send_lock);
+            if (l) { link_close(l); link_release(l); }
             for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;
             free(e);
         } else free(e);

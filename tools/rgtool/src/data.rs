@@ -82,7 +82,7 @@ fn find(h: &[u8], n: &[u8]) -> Option<usize> {
 
 /// Inflates one complete zlib stream (trailing bytes ignored); a truncated or corrupt stream is an
 /// error, as with Python's `zlib.decompress`.
-fn inflate(src: &[u8]) -> R<Vec<u8>> {
+pub(crate) fn inflate(src: &[u8]) -> R<Vec<u8>> {
     let mut z = Decompress::new(true);
     let mut out = Vec::with_capacity(src.len().saturating_mul(2).max(256));
     loop {

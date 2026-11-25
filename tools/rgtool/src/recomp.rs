@@ -189,7 +189,7 @@ const PATCHES: &[(u64, Patch)] = &[
     (0x100b85fa, Patch::Const(0x78, 0x78 + DIALOG_DX)), // ADD EBP,0x78: speech box centre x
     (0x100b875e, Patch::Const(0x4b, 0x4b + DIALOG_DX)), // ADD EBP,0x4b: text x
     (0x100b8808, Patch::AddReg(8, DIALOG_DX)),          // MOV EDX,[ESP+0x10]: portrait x (EDX += dx)
-    // Fight cut-in popup (same sites as src/java/rg/DllPatcher.java): the 420x378 frame is drawn
+    // Fight cut-in popup (found by the retired Java build's DllPatcher): the 420x378 frame is drawn
     // at (0,0) and the 240x320 fight surface at (90,29) inside it. Centre both horizontally.
     (0x10028ac5, Patch::Const(0x5a, 0x5a + POPUP_DX)), // MOV [ESP+0x10],0x5a: fight surface x
     (0x10028af3, Patch::SrcReg(0xc, POPUP_DX)),        // MOV [ESP+8],EBX (=0): frame x
@@ -218,7 +218,7 @@ const DEFAULT_HOOKS: &[u64] = &[
 /// Instructions that call rt_hook(addr) before they run, with the registers in cpu.r (spilled
 /// before, reloaded after, so a handler can change them). With a skip target, a handler that
 /// returns nonzero jumps there instead (the instructions in between do not run). The engine
-/// fixes and host features in native/rt/server.c (the same as native/win32/rghost.c patches in).
+/// fixes and host features in native/rt/server.c.
 const INSN_HOOKS: &[(u64, Option<u64>)] = &[
     (0x100b2c66, None),             // PlaceTileUIState::enter: early exits leave the tile layer unset
     (0x100ca9d9, None),             // LAN host entry: mov ebp,edx (the host's random hero in EDX)

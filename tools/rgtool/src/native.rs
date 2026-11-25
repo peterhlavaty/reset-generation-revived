@@ -176,10 +176,10 @@ pub fn build_test(args: &[String]) -> R<()> {
     Ok(())
 }
 
-/// A JDK for the build-time Java tools (javac, keytool, apksigner, PatchTool); jdk25 is installed
-/// if there is none (with a cached P-code export the Ghidra step, which also installs it, is skipped).
+/// A JDK for the build-time Java tools (Ghidra, keytool, apksigner); jdk25 is installed if there
+/// is none (with a cached P-code export the Ghidra step, which also installs it, is skipped).
 pub fn tool_jdk() -> R<PathBuf> {
-    if let Some(j) = crate::setup::find("jdk17-x86").or_else(|| crate::setup::find("jdk25")) {
+    if let Some(j) = crate::setup::find("jdk25") {
         return Ok(j);
     }
     crate::setup::setup(&["jdk25".to_string()])?;
@@ -187,11 +187,10 @@ pub fn tool_jdk() -> R<PathBuf> {
 }
 
 /// The game data for the recompiled engine in `dest` (replaced): a copy of game/ResetGeneration
-/// patched by the game's own PatchTool (src/java/rg) for the 640x360 engine size, with the
-/// original DLL (the recompiled engine uses its data sections and imports at run time).
+/// with its paks patched for the 640x360 engine size (`pakpatch`), and the original DLL (the
+/// recompiled engine uses its data sections and imports at run time).
 pub fn patched_data(dest: &Path) -> R<()> {
     let r = root();
-    let jdk = tool_jdk()?;
     crate::util::remove_dir(dest)?;
     std::fs::create_dir_all(dest)?;
     for e in std::fs::read_dir(r.join("game/ResetGeneration"))?.flatten() {
@@ -200,32 +199,7 @@ pub fn patched_data(dest: &Path) -> R<()> {
             std::fs::copy(e.path(), dest.join(&name))?;
         }
     }
-    let cls = r.join("build/native/patchtool");
-    crate::util::remove_dir(&cls)?;
-    let jar = r.join("game/ResetGeneration.jar");
-    let src = r.join("src/java/rg");
-    run(Command::new(jdk.join("bin/javac"))
-        .args(["-nowarn", "--release", "17", "-cp"])
-        .arg(&jar)
-        .arg("-d")
-        .arg(&cls)
-        .args(["PatchTool.java", "PakPatcher.java", "DllPatcher.java"].map(|f| src.join(f))))?;
-    let sep = if cfg!(windows) { ";" } else { ":" };
-    run(Command::new(jdk.join("bin/java"))
-        .arg("-cp")
-        .arg(format!("{}{sep}{}", cls.display(), jar.display()))
-        .arg("rg.PatchTool")
-        .arg(dest)
-        .args(["640", "360"]))?;
-    let d = dest.join("ResetGeneration-Win32-Web.dll");
-    std::fs::rename(d.with_extension("dll.orig"), &d)?;
-    for e in std::fs::read_dir(dest)?.flatten() {
-        let n = e.file_name().to_string_lossy().to_string();
-        if n.ends_with(".orig") || n.ends_with(".revived") {
-            std::fs::remove_file(e.path())?;
-        }
-    }
-    Ok(())
+    crate::pakpatch::patch_dir(dest, 640, 360)
 }
 
 /// `cargo x native-test [FRAMES] [rgtest options…]`: runs build/native/rgtest headless on a
@@ -316,6 +290,16 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
 
     let mut cargo = Command::new("cargo");
     cargo.current_dir(&r).args(["build", "-q", "--release", "-p", "rg-native"]).env("RG_ENGINE_LIB", &lib);
+    if cfg!(windows) {
+        // the exe's icon (a resource object the linker adds: native/desktop/build.rs)
+        let rc = r.join("build/native/desktop/icon.rc");
+        let ico = r.join("native/desktop/icon.ico").to_string_lossy().replace('\\', "/");
+        std::fs::write(&rc, format!("1 ICON \"{ico}\"\n"))?;
+        let res = r.join("build/native/desktop/icon.o");
+        let windres = need("llvm-mingw")?.join("bin/x86_64-w64-mingw32-windres.exe");
+        run(Command::new(windres).arg(&rc).arg("-O").arg("coff").arg("-o").arg(&res))?;
+        cargo.env("RG_ICON_RES", &res);
+    }
     let mut out = r.join("target");
     if let Some(t) = target {
         run(Command::new("rustup").args(["target", "add", t]))?;
@@ -327,14 +311,20 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
     let exe_name = format!("ResetGeneration{}", std::env::consts::EXE_SUFFIX);
     let exe = out.join("release").join(&exe_name);
 
-    let name = format!("ResetGeneration-Native-{}", std::env::consts::OS);
+    let name = format!("ResetGeneration-Revived-{}", std::env::consts::OS);
     let dist = r.join("dist").join(&name);
     crate::util::remove_dir(&dist)?;
     std::fs::create_dir_all(&dist)?;
     std::fs::copy(&exe, dist.join(&exe_name))?;
+    if cfg!(windows) {
+        // opens the firewall for hosting LAN games (the hosting game's relay)
+        run(Command::new("cargo").current_dir(&r).args(["build", "-q", "--release", "-p", "lan-setup"]))?;
+        std::fs::copy(r.join("target/release/lan-setup.exe"), dist.join("LAN-Setup.exe"))?;
+    }
     patched_data(&dist.join("data"))?;
+    std::fs::copy(r.join("native/desktop/README.txt"), dist.join("README.txt"))?;
     let zip = r.join("dist").join(format!("{name}.zip"));
-    crate::windows::zip_dir(&dist, &zip)?;
+    crate::util::zip_dir(&dist, &zip)?;
     println!("built {} (+ {})", dist.display(), zip.display());
     Ok(())
 }

@@ -13,7 +13,8 @@ decompiled/native/pcode.txt        raw P-code of all 476k instructions (local, g
    │  cargo x recomp (tools/rgtool/src/recomp.rs; the build commands run it when needed)
    ▼
 build/native/gen/rg_gen_*.c        ~11,000 C functions + address→function table (generated)
-   │  + native/rt/      runtime: guest memory, dispatch, Win32 + JNI shims, engine glue, net client
+   │  + native/rt/      runtime: guest memory, dispatch, Win32 + JNI shims, engine glue, online
+   │                    client + game host + relay links
    │  + native/host/desktop/host.c + native/desktop (Rust: window, sound)  → desktop game
    │  + native/host/desktop/rgtest.c   headless test driver
    │  + native/android/main.c          NativeActivity host (NDK)
@@ -65,7 +66,7 @@ All through rgtool; toolchains are downloaded into `.toolchains/` on demand.
 ```bash
 cargo x ghidra-export      # once per DLL change (the builds below run it when pcode.txt is
                            #   missing): JDK 25 + Ghidra 12.2, several minutes
-cargo x build-desktop      # dist/ResetGeneration-Native-<os>/ (+ .zip): the desktop game
+cargo x build-desktop      # dist/ResetGeneration-Revived-<os>/ (+ .zip): the desktop game
 cargo x build-android      # dist/ResetGeneration-Revived-<version>.apk  [--abis=arm64-v8a,x86_64]
 cargo x build-native-test  # build/native/rgtest(.exe): headless test driver  [--calltrace]
 ```
@@ -97,13 +98,22 @@ window and [tinyaudio](https://crates.io/crates/tinyaudio) sound:
   (arrows, Enter, Esc/Backspace, Ctrl, Space, letters, digits).
 * Sound: the engine's 8 kHz mono mix goes into a queue (~100 ms) that the audio thread resamples
   to 44.1 kHz stereo.
-* Next to the program: `data/` (the game data, pre-patched for 640×360 by `rg.PatchTool`; saves
-  go there too, so the folder must be writable), `revived.ini` (`server=online` or a `ws://`
-  URL, `nickname=`, `scale=fit|1|2|4`; written on first start, `--key=value` arguments override
-  it) and `ResetGeneration.log`. The game runs with `data/` as its current directory, so a
-  folder name with non-ASCII characters works.
+* Next to the program: `data/` (the game data, pre-patched for 640×360 by
+  `tools/rgtool/src/pakpatch.rs`; saves go there too, so the folder must be writable),
+  `revived.ini` (`server=auto|online|lan|ws://…`, `nickname=`, `scale=fit|1|2|4`,
+  `fullscreen=`, `host_players=`, `host_hero=`; written on first start, `--key=value` arguments
+  override it), `ResetGeneration.log` (`--log=PATH` elsewhere), `README.txt` for players, and on
+  Windows `LAN-Setup.exe`. The game runs with `data/` as its current directory, so a folder name
+  with non-ASCII characters works.
+* Windows: borderless fullscreen on the window's monitor with F11 or Alt+Enter (remembered),
+  the icon as an exe resource (llvm-mingw `windres`); one self-contained `.exe` (static CRT).
 * Online: joins games (Quick Match) like Android and hosts them: F5 in the main menu (or `host=auto`,
-  `host_players=2..4`, `host_hero=NAME|RANDOM`); the title bar shows the hosting status.
+  `host_players=2..4`, `host_hero=NAME|RANDOM`); the title bar shows the hosting status. Hosting
+  without internet (or with `server=lan`) runs the relay in the game (`src/lan.rs`, the
+  `rg-server` library on port 8787 with LAN discovery; `docs/MULTIPLAYER.md`, "LAN relay").
+
+This is the Windows game since 2026-11-25; before, Windows had a build that ran the original
+engine DLL in a 32-bit Java host (`docs/WINDOWS_PORT.md`).
 
 ## WebAssembly (not built yet)
 
@@ -117,7 +127,7 @@ The same C would compile with Emscripten; what it needs:
 * **Main loop.** `rg_tick` sleeps to keep 32 fps; in a browser it has to be driven from
   `requestAnimationFrame` with the virtual clock (`rg_use_virtual_clock`), and `Sleep` must not
   block.
-* **Network.** `net.c` uses BSD sockets and a thread; in the browser that becomes a WebSocket
+* **Network.** `link.c` uses BSD sockets and threads; in the browser that becomes a WebSocket
   (`wss://resetgeneration.rustyapps.com/ws` is already served) with callbacks.
 * **Data.** The ~35 MB of paks are fetched into the virtual file system (IndexedDB for saves).
 * **Size/speed.** ~90 MB of generated C; the per-function dispatch table and the code size are
@@ -132,7 +142,7 @@ phone and open it (allow "install unknown apps" for the file manager), or
 * NativeActivity with no Java code; min SDK 26 (Android 8), target 36; arm64-v8a + x86_64,
   16 KB page-aligned native library.
 * Game data ships as assets and is copied to internal storage on first launch of each build
-  (saves are kept). The paks are pre-patched for the 640×360 engine size (`rg.PatchTool`).
+  (saves are kept). The paks are pre-patched for the 640×360 engine size (`pakpatch.rs`).
 * The window buffer is 720 px high at the screen's aspect ratio; the game is drawn 2× in the
   middle and the touch controls sit in the side bars: d-pad (left), Action (right, tap/hold
   like Ctrl), Select and Back (top corners). Tapping the engine's "Select"/"Back" soft-key
@@ -162,13 +172,13 @@ phone and open it (allow "install unknown apps" for the file manager), or
   highlight layers; `FUN_100867c0`) draw only the viewport columns `[start, grid+0x18+1)`; `grid+0x18`
   is 13 (sized for 240 px). On 640 the centred board starts at viewport column 4, so tile columns 10-11
   were never drawn. The recompiler patches the viewport load at `0x10086822` (`VIEW_COLS_EXTRA`); the
-  Windows build gets the same fix from `DllPatcher` (31 columns).
+  retired Java-hosted Windows build got the same fix from `DllPatcher` (31 columns).
 * **Tutorial piece ghost.** The ghost of the piece being placed lives in an overlay layer drawn
   under the blocks, and the tutorial starts the cursor on top of existing blocks, so it was
   invisible. `hook_tile_tool` (engine.c, hooked at `FUN_100d5350`, the placement tool's
   activation) moves the start of the cursor 3 cells left of the forced target when one is set.
   Full path: move Right x3, rotate once, hold (or tap Drop).
-* The native host clears the framebuffer before every tick (the Java host's `CLEAR_EACH_FRAME`);
+* The native host clears the framebuffer before every tick (as the old Java host did);
   a tick that draws nothing keeps the previous frame.
 * Audio: AAudio, the engine's 8 kHz mono mix resampled to the device rate.
 * Pause/resume freezes the engine clock so its 32 fps limiter does not race on resume.

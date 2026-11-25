@@ -10,8 +10,8 @@ on:
     paths:
       - "native/**"
       - "tools/rgtool/**"
+      - "server/**"
       - "tools/ghidra_scripts/**"
-      - "src/java/rg/**"
       - ".github/workflows/native.yml"
 
 jobs:
@@ -46,6 +46,6 @@ jobs:
         with:
           name: ResetGeneration-${{ runner.os }}
           path: |
-            dist/ResetGeneration-Native-*.zip
+            dist/ResetGeneration-Revived-*.zip
             dist/*.apk
           if-no-files-found: error

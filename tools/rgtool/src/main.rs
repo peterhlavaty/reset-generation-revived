@@ -6,11 +6,11 @@ mod android;
 mod data;
 mod deploy;
 mod native;
+mod pakpatch;
 mod play;
 mod recomp;
 mod setup;
 mod util;
-mod windows;
 
 use util::R;
 
@@ -18,13 +18,14 @@ const HELP: &str = "cargo x <command>
 
 Setup
   setup [what…|all]      download toolchains into .toolchains/ (default: what the Windows build
-                         needs; known: jdk17-x86, llvm-mingw, jdk25, ghidra)
+                         needs; known: llvm-mingw, jdk25, ghidra)
   doctor                 show the toolchains found
 
 Build
-  build-windows          dist/ResetGeneration-Revived (+ .zip): the Windows game
+  build-desktop          dist/ResetGeneration-Revived-<os> (+ .zip): the game for this OS
+                         (Windows, Linux, macOS; build-windows is the same)
 
-Play / test (Windows build)
+Play / test (the desktop build, Windows)
   run [game args…]       start the built game (e.g. --nickname=Bob --server=lan)
   lan-test [N] [--server=auto|online|lan|ws://…]
                          N games on this PC: one hosts, the others join with Quick Match
@@ -32,7 +33,7 @@ Play / test (Windows build)
                          key presses to the game window (RETURN ESC UP DOWN LEFT RIGHT CTRL F5
                          F11 …, hex codes), then optionally a screenshot to build/shots/<shot>.png
   shot [name] [--pid=N]  screenshot of the game window
-  killgame               end the game processes (only the game, not other Java programs)
+  killgame               end the game processes (and rg-relay.exe)
 
 Native (recompiled engine)
   ghidra-export [DLL]    headless Ghidra analysis -> decompiled/native/pcode.txt (needs
@@ -43,8 +44,6 @@ Native (recompiled engine)
                          build/native/rgtest: headless test driver for the recompiled engine
   native-test [FRAMES] [--size WxH] [--keys \"F:KEY,…\"] [--shots F,F] [--realtime]
                          run it (virtual clock; PPM screenshots in build/native/test)
-  build-desktop          dist/ResetGeneration-Native-<os> (+ .zip): the game on the recompiled
-                         engine as a native program for this OS (window, sound, online play)
 
 Android
   build-android [--abis=arm64-v8a,x86_64] [--diag]
@@ -80,7 +79,7 @@ fn main() {
     let r: R<()> = match cmd {
         "setup" => setup::setup(rest),
         "doctor" => setup::doctor(),
-        "build-windows" => windows::build(),
+        "build-windows" => native::build_desktop(rest), // the Windows game is the native desktop build
         "run" => play::run(rest),
         "lan-test" => play::lan_test(rest),
         "keys" => play::keys(rest),
@@ -93,6 +92,7 @@ fn main() {
         "build-desktop" => native::build_desktop(rest),
         "build-android" => android::build(rest),
         "pak" => data::pak(rest),
+        "pak-patch" => pakpatch::cmd(rest),
         "gfx" => data::gfx(rest),
         "spc" => data::spc(rest),
         "sisx" => data::sisx(rest),
