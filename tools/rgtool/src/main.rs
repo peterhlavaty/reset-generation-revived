@@ -6,6 +6,7 @@ mod android;
 mod data;
 mod deploy;
 mod native;
+mod oracle;
 mod pakpatch;
 mod play;
 mod recomp;
@@ -41,13 +42,16 @@ Play / test (the desktop build, Windows)
 Native (recompiled engine)
   ghidra-export [DLL]    headless Ghidra analysis -> decompiled/native/pcode.txt (needs
                          `cargo x setup jdk25 ghidra`; the first run takes several minutes)
-  recomp PCODE OUT [--files N] [--dll DLL] [--trace a,b] [--hook a,b]
+  recomp PCODE OUT [--files N] [--dll DLL] [--trace a,b] [--hook a,b] [--pure]
                          P-code -> C (the build commands run it themselves when needed)
   build-native-test [--calltrace] [--trace a,b]
                          build/native/rgtest: headless test driver for the recompiled engine
   native-test [FRAMES] [--size WxH] [--keys \"F:KEY,…\"] [--shots F,F] [--realtime]
                          run it (virtual clock; PPM screenshots in build/native/test)
   img-diff A.png B.png   count the pixels that differ (e.g. a web screenshot vs rgtest)
+  oracle [FRAMES] [rgtest options]
+                         the recompiled engine against the original DLL run natively (Windows):
+                         frame hashes and Win32/JNI call results compared (build/oracle)
 
 Android
   build-android [--abis=arm64-v8a,x86_64] [--diag]
@@ -97,6 +101,7 @@ fn main() {
         "build-android" => android::build(rest),
         "build-web" => web::build(rest),
         "img-diff" => native::img_diff(rest),
+        "oracle" => oracle::oracle(rest),
         "serve-web" => web::serve(rest),
         "pak" => data::pak(rest),
         "pak-patch" => pakpatch::cmd(rest),

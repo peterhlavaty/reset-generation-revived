@@ -57,8 +57,8 @@ ResetGeneration(.exe)  /  rgtest  /  libresetgen.so → dist/ResetGeneration-Rev
 | `net.c`, `net.h` | online play: the engine's SNAP Mobile interface on the relay (`MULTIPLAYER.md`) |
 | `link.c`, `link.h`, `tls_roots.h` | relay links: WebSocket over TCP, `wss://` by BearSSL (downloaded by rgtool); LAN discovery, the relay choice (`server=` auto, online, lan) |
 
-The Win32/JNI behaviour was checked call by call against the original DLL running under a CPU
-emulator (Unicorn; that Python oracle is no longer in the repository).
+The Win32/JNI behaviour is checked call by call against the original DLL with the oracle
+(`native/oracle`, `cargo x oracle`; see "Testing").
 
 ## Building
 
@@ -224,9 +224,21 @@ Verified (2026-11-25): the browser build in headless Chrome (intro, menus, setti
 tutorial; saves kept across page loads); every compared frame equals rgtest's bit for bit
 (`img-diff`, frames 450–2000 with the same keys).
 
-Differential testing against the original: `RT_API_TRACE=file rgtest …` logs every Win32/JNI
-call; compared with the same log from the emulated original DLL, the first divergence pointed at
-each bug (155,659 calls matched after the fixes).
+Differential testing against the original: `cargo x oracle [FRAMES] [rgtest options]` (Windows)
+builds two test drivers from rgtest.c and runs them on the same input. `build/oracle/rg-oracle.exe`
+is a 32-bit program that runs the **original DLL on the real CPU** (`native/oracle/oracle.c`):
+the runtime's PE loader maps it, and its imports and JNI calls go through trampolines at
+`RT_STUB_BASE` into the same `win32.c`/`jni.c`/`engine.c`; guest addresses are real addresses
+(the compact map of `host.h`) and the code runs on the guest stack at rgtest's addresses.
+`build/oracle/rgtest-pure.exe` is the recompiled engine without our widescreen patches and hooks
+(`recomp --pure`, `RT_PURE`) in the same map. Every frame's hash and every Win32/JNI call's result
+(`RT_API_TRACE=file`: "name result") must be equal; the first difference is reported with
+screenshots of the first different frame from both sides. (It replaced a Python/Unicorn emulator,
+against which 155,659 calls matched after the early fixes.)
+
+Verified (2026-11-25): `cargo x oracle 2001` with the intro skipped and the tutorial played
+(keys): all 2001 frames and 628,875 Win32/JNI calls identical. The patched build differs from
+frame 602 on (the widescreen speech boxes), as it should.
 
 Debug build (`cargo x build-native-test --calltrace`): crashes print the last 48 function
 entries and the guest call stack; `cargo x build-native-test --trace a,b` logs entries of chosen

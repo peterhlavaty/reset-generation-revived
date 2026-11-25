@@ -43,12 +43,17 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *e) {
             (unsigned long long)(a - (uintptr_t)M), cpu.r[ESP], rt_last_call);
     fprintf(stderr, "  last stub %s, host pc offset 0x%llx\n", rt_stub_name(rt_last_call), (unsigned long long)((uintptr_t)e->ExceptionRecord->ExceptionAddress - (uintptr_t)GetModuleHandleA(NULL)));
     rt_dump_calltrace();
+#ifdef __i386__   /* the oracle (native/oracle): the original code crashed */
+    fprintf(stderr, "  eip %08lx eax %08lx ecx %08lx edx %08lx esp %08lx\n", e->ContextRecord->Eip, e->ContextRecord->Eax,
+            e->ContextRecord->Ecx, e->ContextRecord->Edx, e->ContextRecord->Esp);
+#else
     if (getenv("RT_CRASH_STACK")) {   /* return addresses on the host stack (resolve with llvm-addr2line, image base 0x140000000) */
         uintptr_t base = (uintptr_t)GetModuleHandleA(NULL), *sp = (uintptr_t *)e->ContextRecord->Rsp;
         fprintf(stderr, "host stack:");
         for (int i = 0; i < 48; i++) if (sp[i] > base && sp[i] < base + 0x2000000) fprintf(stderr, " %llx", (unsigned long long)(sp[i] - base + 0x140000000ull));
         fputc(10, stderr);
     }
+#endif
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;
 }

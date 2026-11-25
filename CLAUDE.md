@@ -13,8 +13,9 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
 ## Facts that are easy to get wrong
 
 * The real game is the **native x86 DLL** `ResetGeneration-Win32-Web.dll` (the original Java
-  wrapper was only a host). Every build runs it **statically recompiled**; nothing loads the DLL
-  itself any more (the 32-bit Java host was retired 2026-11-25, see git history). JDK 25 is only a
+  wrapper was only a host). Every build runs it **statically recompiled**; only the test oracle
+  (`native/oracle`, `cargo x oracle`) runs the original, natively in a 32-bit process, to check
+  the recompiler (the 32-bit Java host was retired 2026-11-25, see git history). JDK 25 is only a
   build tool (Ghidra 12.2, keytool, apksigner).
 * The engine accepts **any screen size** at `init` and lays out its UI for it. Default is
   640×360 (≥320 rows so 240×320 cutscenes fit). The native builds are fixed at 640×360 (their
@@ -58,7 +59,9 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
   `.toolchains/` (`RG_TOOLCHAINS` overrides). The Android SDK is found via `ANDROID_HOME` or the
   Android Studio default location.
 * Builds: `build-desktop` (Windows, Linux, macOS; `build-windows` is an alias), `build-android`,
-  `build-web` (+ `serve-web`), `build-native-test` (+ `native-test`; `img-diff` compares shots).
+  `build-web` (+ `serve-web`), `build-native-test` (+ `native-test`; `img-diff` compares shots),
+  `oracle` (the recompiled engine against the original DLL, frame by frame and call by call;
+  Windows; run it after changing recomp.rs or native/rt).
 * Play/test: `run`, `lan-test N`, `keys "RETURN,DOWN,WAIT500" [shot] [--pid=N]`, `shot`,
   `killgame` (only game processes — never kill all `java.exe`), `android-run`, `android-keys`,
   `android-shot`, `android-log`. Screenshots go to `build/shots/`, logs to `build/logs/`.

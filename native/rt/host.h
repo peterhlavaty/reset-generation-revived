@@ -20,8 +20,13 @@ void host_sleep_ms(uint32_t ms);          /* Sleep() */
 /* Guest address map. Native builds reserve all 4 GB (M + guest address). The browser build has
  * one linear memory: guest addresses are memory addresses there (M = 0; a base below them would
  * break, the compiler folds constant addresses into wasm load offsets, which do not wrap), and the
- * guest gets the image (0x10000000) and one block after it, above the runtime's own memory. */
-#ifdef __wasm__
+ * guest gets the image (0x10000000) and one block after it, above the runtime's own memory. The
+ * oracle (native/oracle, a 32-bit process running the original DLL) uses the same compact map at
+ * real addresses, and so does the recompiled build it is compared with (RT_COMPACT_MAP). */
+#if defined(RT_ORACLE) && !defined(RT_COMPACT_MAP)
+#define RT_COMPACT_MAP
+#endif
+#if defined(__wasm__) || defined(RT_COMPACT_MAP)
 #define RT_GUEST_LOW 0x10000000u          /* the image's base */
 #define RT_HEAP_BASE 0x10800000u          /* the image ends below this (checked when loading) */
 #define RT_HEAP_SIZE 0x06000000u          /* 96 MB; a match uses about 20 */

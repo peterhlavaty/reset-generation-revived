@@ -1,5 +1,5 @@
 /* PE loader, guest heap and the Win32 functions the engine DLL imports (kernel32 + winmm).
- * Reference implementation: tools/emu/rgemu.py (the Unicorn oracle). */
+ * Checked against the original DLL with the oracle (native/oracle, `cargo x oracle`). */
 #include "host.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -574,8 +574,8 @@ int rt_load_image(rt_image *img, const char *dll_path, const char *dir) {
     uint32_t base = U32(opt + 28), size = U32(opt + 56), hdrsize = U32(opt + 60);
     img->base = base;
     img->entry = base + U32(opt + 16);
-#ifdef __wasm__
-    if (base != RT_GUEST_LOW || base + size > RT_HEAP_BASE) { host_log("the DLL does not fit the browser memory map"); free(d); return 0; }
+#if defined(__wasm__) || defined(RT_COMPACT_MAP)
+    if (base != RT_GUEST_LOW || base + size > RT_HEAP_BASE) { host_log("the DLL does not fit the compact memory map"); free(d); return 0; }
 #endif
     rt_mem_commit(STACK_BASE, STACK_SIZE);
     rt_mem_commit(HEAP_BASE, HEAP_SIZE);

@@ -34,10 +34,10 @@ cargo test                 # server and rgtool tests
 
 Running and testing: `cargo x run`, `cargo x lan-test 3` (a host and two clients on this PC),
 `cargo x keys "RETURN,DOWN" shot` (drive the game window and take a screenshot), `cargo x
-native-test`, `cargo x android-run` / `android-keys` / `android-shot` (emulator). Browser: `cargo x
-serve-web`, then http://localhost:8080/. Server:
-`cargo x deploy`, `deploy-status`, `deploy-logs`, `undeploy` (settings in `deploy.local.ini`,
-see `deploy.example.ini`).
+native-test`, `cargo x oracle` (the recompiled engine against the original DLL), `cargo x
+android-run` / `android-keys` / `android-shot` (emulator). Browser: `cargo x serve-web`, then
+http://localhost:8080/. Server: `cargo x deploy`, `deploy-status`, `deploy-logs`, `undeploy`
+(settings in `deploy.local.ini`, see `deploy.example.ini`).
 
 Linux builds need a C compiler, `pkg-config` and `libasound2-dev`; macOS needs the Xcode command
 line tools. Windows needs nothing besides Rust.

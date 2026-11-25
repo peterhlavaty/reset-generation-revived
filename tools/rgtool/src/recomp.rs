@@ -120,7 +120,7 @@ fn parse_vn(s: &str, names: &mut Interner) -> R<Option<Vn>> {
     Ok(Some(Vn { sp: names.get(sp), off: hex(off)?, size: size.parse()?, name: "" }))
 }
 
-fn load(path: &Path) -> R<(BTreeMap<u64, String>, HashMap<u64, Instr>)> {
+fn load(path: &Path, patches: bool) -> R<(BTreeMap<u64, String>, HashMap<u64, Instr>)> {
     let data = std::fs::read(path)?;
     let text = String::from_utf8_lossy(&data);
     let mut names = Interner::default();
@@ -164,7 +164,9 @@ fn load(path: &Path) -> R<(BTreeMap<u64, String>, HashMap<u64, Instr>)> {
             fix_bitscan(ins);
         }
     }
-    apply_patches(&mut instrs)?;
+    if patches {
+        apply_patches(&mut instrs)?;
+    }
     Ok((funcs, instrs))
 }
 
@@ -301,6 +303,7 @@ struct Recompiler {
     unsupported: BTreeMap<String, u64>,
     trace: HashSet<u64>,
     hooks: HashSet<u64>,
+    pure: bool, // the engine as it was: no layout patches or x offsets (`cargo x oracle`)
 }
 
 fn fname(a: u64) -> String {
@@ -907,11 +910,11 @@ impl<'a> FuncGen<'a> {
         if rc.hooks.contains(&e) {
             head.push(format!("    if (rt_hook(0x{e:x}u)) {{ return; }}"));
         }
-        let xoff = XOFF_FUNCS.iter().find(|(a, _)| *a == e).map(|(_, dx)| *dx);
+        let xoff = XOFF_FUNCS.iter().find(|(a, _)| *a == e && !rc.pure).map(|(_, dx)| *dx);
         if let Some(dx) = xoff {
             head.push(format!("    rt_xoff += {dx};"));
         }
-        if e == XOFF_DRAW {
+        if e == XOFF_DRAW && !rc.pure {
             // text-box widgets (return address in 0x100a2xxx) already centre themselves on the real screen width
             head.push("    uint32_t xo_p = LD32(cpu.r[ESP] + 8), xo = (LD32(cpu.r[ESP]) >> 12) == 0x100a2u ? 0 : (uint32_t)rt_xoff;".into());
             head.push("    if (xo) ST32(xo_p, LD32(xo_p) + xo);".into());
@@ -926,7 +929,7 @@ impl<'a> FuncGen<'a> {
         if let Some(dx) = xoff {
             text = text.replace(" RT_LEAVE(); return;", &format!(" RT_LEAVE(); rt_xoff -= {dx}; return;"));
         }
-        if e == XOFF_DRAW {
+        if e == XOFF_DRAW && !rc.pure {
             text = text.replace(" RT_LEAVE(); return;", " RT_LEAVE(); if (xo) ST32(xo_p, LD32(xo_p) - xo); return;");
         }
         text.replace(SPILL, &spill).replace(RELOAD, &reload)
@@ -1010,7 +1013,7 @@ impl Recompiler {
                 }
             }
         }
-        Recompiler { instrs, entries, jump_targets: HashSet::new(), unsupported: BTreeMap::new(), trace: HashSet::new(), hooks: HashSet::new() }
+        Recompiler { instrs, entries, jump_targets: HashSet::new(), unsupported: BTreeMap::new(), trace: HashSet::new(), hooks: HashSet::new(), pure: false }
     }
 
     /// Indirect jumps Ghidra left unresolved: read `JMP [reg*4 + table]` tables from the image.
@@ -1099,6 +1102,7 @@ pub struct Options {
     pub dll: Option<std::path::PathBuf>,
     pub trace: Vec<u64>,
     pub hooks: Vec<u64>,
+    pub pure: bool,
 }
 
 fn addr_list(s: &str) -> R<Vec<u64>> {
@@ -1106,9 +1110,9 @@ fn addr_list(s: &str) -> R<Vec<u64>> {
 }
 
 impl Options {
-    /// `--files N --dll PATH --trace a,b --hook a,b`
+    /// `--files N --dll PATH --trace a,b --hook a,b --pure`
     pub fn parse(args: &[String]) -> R<Options> {
-        let mut o = Options { files: 48, dll: None, trace: Vec::new(), hooks: Vec::new() };
+        let mut o = Options { files: 48, dll: None, trace: Vec::new(), hooks: Vec::new(), pure: false };
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
@@ -1117,6 +1121,7 @@ impl Options {
                 "--dll" => o.dll = Some(val()?.into()),
                 "--trace" => o.trace = addr_list(&val()?)?,
                 "--hook" => o.hooks = addr_list(&val()?)?,
+                "--pure" => o.pure = true,
                 _ => return Err(format!("unknown recomp option {a}").into()),
             }
         }
@@ -1125,7 +1130,7 @@ impl Options {
 }
 
 pub fn recompile(pcode: &Path, outdir: &Path, opts: &Options) -> R<()> {
-    let (funcs, instrs) = load(pcode)?;
+    let (funcs, instrs) = load(pcode, !opts.pure)?;
     let ninstrs = instrs.len();
     let mut rc = Recompiler::new(&funcs, instrs);
     for (h, skip) in INSN_HOOKS {
@@ -1142,6 +1147,7 @@ pub fn recompile(pcode: &Path, outdir: &Path, opts: &Options) -> R<()> {
     rc.jump_targets = rc.instrs.values().flat_map(|i| i.jumps.iter().copied()).collect();
     rc.trace = opts.trace.iter().copied().collect();
     rc.hooks = DEFAULT_HOOKS.iter().chain(&opts.hooks).copied().collect();
+    rc.pure = opts.pure;
     if let Some(s) = &secs {
         println!("data-pointer entries added: {}", rc.add_data_pointers(s));
     }

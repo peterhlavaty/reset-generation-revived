@@ -69,7 +69,12 @@ pub fn ghidra_export(args: &[String]) -> R<()> {
 
 /// Regenerates build/native/gen when the export or the recompiler is newer than it.
 pub fn generate(extra: &[String]) -> R<PathBuf> {
-    let gen = gen_dir();
+    generate_into(&gen_dir(), extra)
+}
+
+/// Like `generate`, into `gen`.
+pub fn generate_into(gen: &Path, extra: &[String]) -> R<PathBuf> {
+    let gen = gen.to_path_buf();
     let table = gen.join("rg_gen_table.c");
     if !pcode().exists() {
         // one time: the engine's P-code comes from a Ghidra analysis of the original DLL
@@ -163,32 +168,48 @@ pub fn build_test(args: &[String]) -> R<()> {
     let gen = generate(&recomp_args)?;
     let r = root();
     let (cc, libs): (PathBuf, &[&str]) = if cfg!(windows) {
-        (need("llvm-mingw")?.join("bin/x86_64-w64-mingw32-clang.exe"), &["-lws2_32", "-ladvapi32", "-lpthread", "-lm", "-static"])
+        (need("llvm-mingw")?.join("bin/x86_64-w64-mingw32-clang.exe"), WIN_LIBS)
     } else {
         (PathBuf::from(std::env::var("CC").unwrap_or("cc".into())), &["-lpthread", "-lm"])
     };
-    let rt = r.join("native/rt");
-    let mut flags: Vec<String> = ["-O2", "-fno-strict-aliasing", "-fwrapv"].iter().map(|s| s.to_string()).collect();
-    if calltrace {
-        flags.push("-DRT_CALLTRACE".into());
-    }
-    flags.push(format!("-I{}", rt.display()));
-    flags.push(format!("-I{}", gen.display()));
     let obj = r.join(if calltrace { "build/native/obj-test-trace" } else { "build/native/obj-test" });
-    let (tls_inc, tls_objs) = bearssl(&cc, &flags, &obj.join("bearssl"))?;
+    let exe = r.join("build/native").join(format!("rgtest{}", std::env::consts::EXE_SUFFIX));
+    let defs: &[&str] = if calltrace { &["RT_CALLTRACE"] } else { &[] };
+    link_driver(&cc, defs, Some(&gen), &[r.join("native/host/desktop/rgtest.c")], &obj, &exe, libs)
+}
+
+/// The libraries of a Windows test driver (llvm-mingw).
+pub const WIN_LIBS: &[&str] = &["-lws2_32", "-ladvapi32", "-lpthread", "-lm", "-static"];
+
+/// Compiles and links a test driver: native/rt and `sources` (and BearSSL), with the generated C
+/// in `gen` if given, by `cc` with the defines `defs`; objects go to `obj`.
+pub fn link_driver(cc: &Path, defs: &[&str], gen: Option<&Path>, sources: &[PathBuf], obj: &Path, exe: &Path, libs: &[&str]) -> R<()> {
+    let rt = root().join("native/rt");
+    let mut flags: Vec<String> = ["-O2", "-fno-strict-aliasing", "-fwrapv"].iter().map(|s| s.to_string()).collect();
+    flags.extend(defs.iter().map(|d| format!("-D{d}")));
+    flags.push(format!("-I{}", rt.display()));
+    if let Some(g) = gen {
+        flags.push(format!("-I{}", g.display()));
+    }
+    let (tls_inc, tls_objs) = bearssl(cc, &flags, &obj.join("bearssl"))?;
     flags.push(tls_inc);
     let headers = crate::util::files_with_ext(&rt, "h");
-    let mut gen_flags = flags.clone();
-    gen_flags.push("-w".into());
-    let mut objs = compile_all(&cc, &gen_flags, &c_files(&gen), &obj, &headers)?;
+    let mut objs = Vec::new();
+    if let Some(g) = gen {
+        let mut gen_flags = flags.clone();
+        gen_flags.push("-w".into());
+        objs.extend(compile_all(cc, &gen_flags, &c_files(g), obj, &headers)?);
+    }
     objs.extend(tls_objs);
     let mut own = c_files(&rt);
-    own.push(r.join("native/host/desktop/rgtest.c"));
+    own.extend(sources.iter().cloned());
     let mut own_flags = flags.clone();
     own_flags.extend(["-g", "-Wall", "-Wno-unused-function"].iter().map(|s| s.to_string()));
-    objs.extend(compile_all(&cc, &own_flags, &own, &obj, &headers)?);
-    let exe = r.join("build/native").join(format!("rgtest{}", std::env::consts::EXE_SUFFIX));
-    run(Command::new(&cc).arg("-o").arg(&exe).args(&objs).args(libs))?;
+    objs.extend(compile_all(cc, &own_flags, &own, obj, &headers)?);
+    if let Some(d) = exe.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    run(Command::new(cc).arg("-o").arg(exe).args(&objs).args(libs))?;
     println!("built {}", exe.display());
     Ok(())
 }
@@ -249,7 +270,7 @@ pub fn run_test(args: &[String]) -> R<()> {
 }
 
 /// A binary PPM (P6, maxval 255) as PNG next to it.
-fn ppm_to_png(p: &Path) -> R<()> {
+pub fn ppm_to_png(p: &Path) -> R<()> {
     let d = std::fs::read(p)?;
     let mut fields = Vec::new();
     let mut i = 0;

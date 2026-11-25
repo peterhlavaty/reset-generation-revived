@@ -40,6 +40,8 @@ void rt_mem_init(void) {
 void rt_mem_commit(uint32_t addr, uint32_t size) {
     if (addr < RT_GUEST_LOW || (uint64_t)addr + size > RT_GUEST_END) rt_fatal("guest memory %08x+%x is outside the browser map", addr, size);
 }
+#elif defined(RT_ORACLE)
+/* rt_mem_init, rt_mem_commit: native/oracle/oracle.c (guest addresses are real addresses) */
 #else
 #ifdef _WIN32
 #include <windows.h>
@@ -98,6 +100,7 @@ void rt_unimpl(uint32_t addr, const char *what) { rt_fatal("unsupported instruct
 
 /* ------------------------------------------------------------------ dispatch */
 uint32_t rt_last_call;
+#ifndef RT_ORACLE   /* the oracle runs the original code: native/oracle/oracle.c calls it */
 static uint32_t *hkeys;
 static void (**hfns)(void);
 static uint32_t hmask;
@@ -136,6 +139,7 @@ void rt_call(uint32_t addr) {
     }
     rt_fatal("indirect call to unknown address %08x", addr);
 }
+#endif
 
 void rt_trace_ret(uint32_t func, uint32_t eax) { host_log("   ret %08x -> %08x", func, eax); }
 
@@ -193,6 +197,10 @@ void rt_trace(uint32_t func) {
 static struct { uint32_t func; rt_hook_fn fn; } hooks[32];
 static int nhooks;
 void rt_hook_add(uint32_t func, rt_hook_fn fn) {
+#ifdef RT_PURE   /* the oracle comparison: the engine as it was, without our fixes */
+    (void)func, (void)fn;
+    return;
+#endif
     if (nhooks >= 32) rt_fatal("too many hooks");
     hooks[nhooks].func = func;
     hooks[nhooks++].fn = fn;
@@ -203,6 +211,7 @@ int rt_hook(uint32_t func) {
     return done;
 }
 
+#ifndef RT_ORACLE
 /* Calls guest function `addr` from the host with stdcall/cdecl arguments; returns EAX. */
 uint32_t rt_guest_call(uint32_t addr, int nargs, const uint32_t *args) {
     uint32_t saved_esp = cpu.r[ESP];
@@ -223,6 +232,7 @@ uint32_t rt_guest_thiscall(uint32_t addr, uint32_t ecx, int nargs, const uint32_
     cpu.r[ECX] = saved_ecx;
     return r;
 }
+#endif
 
 /* ------------------------------------------------------------------ helpers */
 void rt_movs(uint32_t dst, uint32_t src, uint32_t n, int w, int backward) {

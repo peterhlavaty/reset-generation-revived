@@ -3,7 +3,8 @@
 > **History.** This is the plan that led to the native port; it is done (option C, static
 > recompilation): see `NATIVE_PORT.md`. The Unicorn emulator it mentions (`tools/emu/rgemu.py`, the
 > oracle the recompiler was validated against) has since been removed from the repository with
-> the other Python tools.
+> the other Python tools; the oracle is now native (`native/oracle`, `cargo x oracle`: the original
+> DLL on the real CPU).
 
 Goal: Reset Generation as a real Android game (Play-distributable APK/AAB, landscape, touch
 controls, gamepad support), single-player first, multiplayer later.
