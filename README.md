@@ -87,13 +87,16 @@ players.
 
 1. One player hosts: in the main menu press **F5** (touch: **HOST**), choose the number of
    players (Left/Right, then Enter or OK) and a hero.
-2. Everyone else chooses **Quick Match** in the main menu and a hero. The match starts when all
-   seats are taken; the host plays too.
+2. Everyone else chooses **Quick Match** in the main menu and a hero. The *Players in Match*
+   screen shows whose game you are in: the host and the players already in it. The match starts
+   when all seats are taken; the host plays too.
 
 It works over the internet between all versions (Windows, Linux, macOS, Android and the
-browser). Quick Match fills the first game that is waiting for players, so join right after
-your host starts waiting (on the public server someone else may take a seat). After a match the
-host presses F5 (HOST) again and the others choose *Play Again*.
+browser). Quick Match picks a game hosted from your own home network first, otherwise the game
+hosted most recently, so join right after your friend starts hosting. Wrong host on the list?
+Press Back and choose Quick Match again: you get the next waiting game. (On the public server a
+stranger may take a free seat too.) After a match the host presses F5 (HOST) again and the
+others choose *Play Again*.
 
 * **Your name online** (letters, digits and _, up to 15): in the browser the *Online name* field
   at the top left. In the downloaded game start it once, close it, open `revived.ini` in the

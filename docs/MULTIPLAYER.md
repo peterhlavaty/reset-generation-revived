@@ -52,7 +52,8 @@ What happens:
 * The TCP acceptor's `setController` (vtable `0x10188b64`, slot 1) installs a fake listener.
 * The relay link (`native/rt/link.c`) runs on its own thread: it picks the relay
   (`relay_for_hosting`, see "LAN relay"), connects as `RGHost` and sends
-  `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1}`. Each `player_joined` becomes a
+  `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1,"name":"<nick>","hero":H}` (`hero`: the
+  engine's hero index 0-9, -1 random; `name` and `hero` since 2026-11-25, for the joiners' list). Each `player_joined` becomes a
   connection object (`accept`); channel 0x16 travels as `[u16 pid][zlib message]` exactly as in
   the Phase 0 design. The game thread takes the link's events in `rg_server_pump()` after every
   tick.
@@ -60,8 +61,22 @@ What happens:
   shows it in its title bar and saves `host_players`. Android has a HOST touch button in the main
   menu (hidden while hosting) and remembers `host_players` in `revived.ini`.
 
-Relay side: `serve` with `players` registers a hosted game with the casino; `matchmake()` fills
-hosted games first (once enough players are queued), and `rg-relay --match-size`
+Relay side: `serve` with `players` registers a hosted game with the casino (`casino.rs`). Every
+hosted game has its own seats and starts as soon as they are taken, whatever the other games do
+(until 2026-11-25 the queue only fed the oldest game, so a 3-4 player game nobody joined held up
+every other one). A player asking for Quick Match is seated at once if a game has a free seat:
+
+1. a game hosted from the player's own network first: the same public IPv4 address or IPv6 /64
+   (the relay takes the address from nginx's `X-Real-IP` when the connection comes from
+   loopback); a player seated elsewhere moves over when such a game appears;
+2. otherwise the newest waiting game (a game left waiting for hours does not catch everyone);
+3. not one the player left with Back (CASINO_CANCEL_MATCHMAKING) in the last 10 minutes, while
+   another is waiting: Back and Quick Match again goes through the games, then round again.
+
+The "Players in Match" list shows the host as an entry of its own (profile id 900000000 + n, the
+host's name and hero from `serve`; older hosts: the name from the room) and the players seated in
+that game; it is kept up to date with EVENT 9 (add) and 10 (remove). Players waiting while no game
+has a free seat see each other and are seated when a game is hosted. `rg-relay --match-size`
 defaults to 0, so Quick Match never forms `QM_n` rooms that have no game server. When the host's
 engine closes the listener (match over, or the host left the host screen) the host sends
 `{"t":"unserve"}`, so no one is matched into a dead room, and the status says "F5 = host a new
@@ -325,7 +340,8 @@ Quick Match end to end, as served by `casino.rs` and `gameroom.rs` (first verifi
 `rgtest` clients):
 
 1. `CASINO_MATCHMAKING` → the "Players in Match" screen opens while the player waits; it lists
-   the players from the RESPONSE and from later EVENTs 9 (not the seating events).
+   the players from the RESPONSE and from later EVENTs 9, minus EVENTs 10 (not the seating
+   events). The list may hold entries that are not casino players (the host of a hosted game).
 2. Group full → EVENT `CASINO_ENTER` per other member, REQUEST `LOCK_PLAYER_IN_GAME`
    ("Game starting…"), and after every RESPONSE 29 (or 3 s) EVENT `CASINO_MATCHED_UP`.
 3. Each player moves to the room (`naf://rg.com:80/QM_n?hosted=yes|no`), is greeted once all

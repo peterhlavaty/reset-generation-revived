@@ -20,6 +20,7 @@ use crate::wire::{frame, hex, CH_SYSTEM};
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_PACKET: usize = 2048; // the engine's shared net buffer
@@ -47,6 +48,8 @@ pub type Sink = Box<dyn Fn(Out)>;
 pub struct Client {
     pub id: ClientId,
     pub name: Option<String>,
+    /// Where it connects from (the player's public address behind the proxy), if known.
+    pub addr: Option<IpAddr>,
     room: Option<String>,
     serves: Option<String>,
     pub last_seen: u64,
@@ -79,6 +82,9 @@ impl Net {
         if let Some(c) = self.clients.get(&c) {
             (c.out)(Out::Text(msg.to_string()));
         }
+    }
+    pub fn addr(&self, c: ClientId) -> Option<IpAddr> {
+        self.clients.get(&c).and_then(|c| c.addr)
     }
     pub fn name(&self, c: ClientId) -> &str {
         self.clients.get(&c).and_then(|c| c.name.as_deref()).unwrap_or("?")
@@ -176,12 +182,18 @@ impl Relay {
 
     /// Registers a new connection.
     pub fn connect(&mut self, now: u64, out: Sink) -> ClientId {
+        self.connect_from(now, out, None)
+    }
+
+    /// Registers a new connection from this address (hosted games from a player's own network
+    /// come first in Quick Match).
+    pub fn connect_from(&mut self, now: u64, out: Sink, addr: Option<IpAddr>) -> ClientId {
         self.net.now = now;
         let id = self.next_id;
         self.next_id += 1;
         self.net.clients.insert(
             id,
-            Client { id, name: None, room: None, serves: None, last_seen: now, greeted: HashSet::new(), out },
+            Client { id, name: None, addr, room: None, serves: None, last_seen: now, greeted: HashSet::new(), out },
         );
         self.stats.connections += 1;
         id
@@ -211,7 +223,7 @@ impl Relay {
             "ping" => self.ctl(c, json!({"t": "pong", "ts": m.get("ts").cloned().unwrap_or(Value::Null)})),
             "create" | "join" | "move" => self.enter(c, room, t),
             "leave" => self.leave(c, false, true),
-            "serve" => self.serve(c, room, m.get("players")),
+            "serve" => self.serve(c, room, &m),
             "unserve" => {
                 if self.net.clients[&c].serves.is_some() {
                     self.unserve(c);
@@ -334,8 +346,9 @@ impl Relay {
     }
 
     /// A game server process (a host player's engine) offers to serve a matchmade room: it is not
-    /// a player and is not seated. With `players`, Quick Match fills the room with that many.
-    fn serve(&mut self, c: ClientId, room_name: Option<&str>, players: Option<&Value>) {
+    /// a player and is not seated. With `players`, Quick Match fills the room with that many;
+    /// `name` and `hero` (the host's, the engine's hero index) show on the joiners' waiting list.
+    fn serve(&mut self, c: ClientId, room_name: Option<&str>, m: &Value) {
         let Some(room_name) = room_name.filter(|r| valid_room(r)) else {
             return self.ctl(c, json!({"t": "error", "op": "serve", "code": "bad_room"}));
         };
@@ -362,16 +375,19 @@ impl Relay {
             false
         };
         // A host player's game (rg.HostServer): Quick Match fills its room with `players` players.
-        if let Some(n) = players.and_then(Value::as_f64) {
+        if let Some(n) = m.get("players").and_then(Value::as_f64) {
             if n.fract() == 0.0 && n > 0.0 && n < 100.0 && !exists {
-                self.casino.add_hosted(&mut self.net, room_name, n as usize);
+                let host = m.get("name").and_then(Value::as_str).filter(|n| valid_name(n));
+                let hero = m.get("hero").and_then(Value::as_i64);
+                let addr = self.net.addr(c);
+                self.casino.add_hosted(&mut self.net, room_name, n as usize, host, hero, addr);
             }
         }
     }
 
     fn unserve(&mut self, c: ClientId) {
         let Some(key) = self.net.clients.get_mut(&c).and_then(|cl| cl.serves.take()) else { return };
-        self.casino.game_over(&key);
+        self.casino.game_over(&mut self.net, &key);
         self.net.servers.remove(&key);
         if let Some(room) = self.rooms.get_mut(&key) {
             if let Bot::Game(g) = &mut room.bot {
@@ -411,7 +427,7 @@ impl Relay {
                     }
                 }
             }
-            Bot::Casino => self.casino.leave(&self.net, c),
+            Bot::Casino => self.casino.leave(&mut self.net, c),
             Bot::Plain => {}
         }
         let room_name = room.name.clone();

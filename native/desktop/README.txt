@@ -41,8 +41,13 @@ MULTIPLAYER (2-4 players over the internet, on a LAN or on one PC; nothing to se
   1. The host presses F5 in the main menu, chooses the number of players
      (Left/Right, Enter) and a hero (Esc cancels). The host's game is the
      match's server; the title bar shows "Hosting, waiting for players".
-  2. The others choose Quick Match (main menu) and pick a hero. When enough
-     players have joined, the match starts. The host plays too.
+  2. The others choose Quick Match (main menu) and pick a hero. The Players
+     in Match screen shows whose game they are in (the host and the players
+     already in it). When all seats are taken, the match starts. The host
+     plays too.
+  Quick Match picks a game hosted from the player's own home network first,
+  otherwise the game hosted most recently. Wrong host? Back, then Quick Match
+  again: the next waiting game.
   After a match the host presses F5 again (the title bar says so) and the
   others choose Play Again.
 

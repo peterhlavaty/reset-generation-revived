@@ -10,7 +10,7 @@
 use crate::relay::{Config, Out, Relay, MAX_PACKET};
 use futures_util::{SinkExt, StreamExt};
 use std::cell::{Cell, RefCell};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -100,7 +100,7 @@ pub async fn serve_on(listener: TcpListener, opts: Options, addr: SocketAddr) ->
         }
     });
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
             Err(_) => {
                 // out of file descriptors and the like: back off a little
@@ -111,7 +111,7 @@ pub async fn serve_on(listener: TcpListener, opts: Options, addr: SocketAddr) ->
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         tokio::task::spawn_local(async move {
-            let _ = connection(stream, shared).await;
+            let _ = connection(stream, peer.ip(), shared).await;
         });
     }
 }
@@ -192,7 +192,7 @@ impl Drop for OpenGuard {
     }
 }
 
-async fn connection(mut stream: TcpStream, shared: Rc<Shared>) -> Option<()> {
+async fn connection(mut stream: TcpStream, peer: IpAddr, shared: Rc<Shared>) -> Option<()> {
     if shared.open.get() >= shared.max {
         respond(&mut stream, "503 Service Unavailable", "text/plain", "relay full\n").await;
         return None;
@@ -233,11 +233,16 @@ async fn connection(mut stream: TcpStream, shared: Rc<Shared>) -> Option<()> {
         .max_message_size(Some(MAX_PACKET + 1024))
         .max_frame_size(Some(MAX_PACKET + 1024));
     let ws = WebSocketStream::from_partially_read(stream, rest, Role::Server, Some(cfg)).await;
-    client(ws, shared).await;
+    // behind the local reverse proxy (the public server's nginx) the player's address is its header
+    let addr = match head.header("x-real-ip").and_then(|a| a.parse().ok()) {
+        Some(real) if peer.is_loopback() => real,
+        _ => peer,
+    };
+    client(ws, addr, shared).await;
     Some(())
 }
 
-async fn client(mut ws: WebSocketStream<TcpStream>, shared: Rc<Shared>) {
+async fn client(mut ws: WebSocketStream<TcpStream>, addr: IpAddr, shared: Rc<Shared>) {
     let (tx, mut rx) = mpsc::channel::<Out>(QUEUE);
     let slow = Rc::new(Notify::new());
     let slow2 = slow.clone();
@@ -248,7 +253,7 @@ async fn client(mut ws: WebSocketStream<TcpStream>, shared: Rc<Shared>) {
     });
     let id = {
         let now = shared.now();
-        shared.relay.borrow_mut().connect(now, sink)
+        shared.relay.borrow_mut().connect_from(now, sink, Some(addr))
     };
     loop {
         tokio::select! {

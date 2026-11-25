@@ -46,7 +46,8 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
   (`?keys=…&shots=…` + `cargo x img-diff`). Public at https://resetgeneration.rustyapps.com/
   (`cargo x deploy-web`: static files in /var/www/resetgeneration, our nginx site).
 * Online: the engine waits for the room's server to speak first; Quick Match and hosted rooms
-  are served by `server/` (rg-relay, Rust). Matches run on the hosting player's engine
+  are served by `server/` (rg-relay, Rust); Quick Match seats each player in one hosted game (own
+  network first, else the newest; Back + Quick Match = the next one). Matches run on the hosting player's engine
   (`native/rt/server.c`). The desktop game runs the relay in-process for LAN games (the
   `rg-server` library; clients find it by UDP broadcast on 8787, `server=auto`). A dropped
   player's seat is held for as long as the match runs (`rejoin_ms: None`). Games reach the public

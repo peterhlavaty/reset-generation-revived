@@ -117,8 +117,10 @@ static int json_int(const char *j, const char *key, int dflt) {
 }
 
 static void send_serve(void) {
-    char json[200];
-    snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d}", room, remote_players);
+    /* name and hero: the joiners' "Players in Match" list shows whose game they are in */
+    char json[256];
+    snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d,\"name\":\"%s\",\"hero\":%d}",
+             room, remote_players, net_nickname(), host_hero <= 9 ? (int)host_hero : -1);
     ws_send(1, json, strlen(json));
     host_log("host: offering room %s on %s for %d remote player(s)", room, url, remote_players);
 }

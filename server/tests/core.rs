@@ -57,9 +57,13 @@ impl T {
         T { relay: Relay::new(cfg, Box::new(|_| {})), now: 1_000_000 }
     }
     fn conn(&mut self) -> C {
+        self.conn_from(None)
+    }
+    fn conn_from(&mut self, addr: Option<&str>) -> C {
         let inbox = Rc::new(RefCell::new(Vec::new()));
         let i2 = inbox.clone();
-        let id = self.relay.connect(self.now, Box::new(move |o| i2.borrow_mut().push(o)));
+        let addr = addr.map(|a| a.parse().unwrap());
+        let id = self.relay.connect_from(self.now, Box::new(move |o| i2.borrow_mut().push(o)), addr);
         C { id, inbox }
     }
     fn send(&mut self, c: &C, m: Value) {
@@ -80,6 +84,26 @@ impl T {
         self.send(&c, json!({"t": "join", "room": "CasinoSystem"}));
         c.take();
         c
+    }
+    /// In the casino lobby, connected from this address.
+    fn player_at(&mut self, name: &str, addr: &str) -> C {
+        let c = self.conn_from(Some(addr));
+        self.send(&c, json!({"t": "hello", "v": 1, "name": name}));
+        self.send(&c, json!({"t": "join", "room": "CasinoSystem"}));
+        c.take();
+        c
+    }
+    /// A host's game as the engine offers it since 2026-11-25 (its name and hero, an address).
+    fn host_at(&mut self, nick: &str, players: u32, hero: i32, addr: &str) -> C {
+        let h = self.conn_from(Some(addr));
+        self.send(&h, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+        let room = format!("HOST_{nick}_1");
+        self.send(&h, json!({"t": "serve", "room": room, "players": players, "name": nick, "hero": hero}));
+        h.take();
+        h
+    }
+    fn cancel(&mut self, c: &C) {
+        self.bin(c, &frame(CH_MATCHMAKER, &Writer::new().u8(REQUEST).u8(10).done()));
     }
     fn quick_match(&mut self, c: &C) {
         let req = frame(CH_MATCHMAKER, &Writer::new().u8(REQUEST).u8(9).str("PLUMBER").str("FALSE").done());
@@ -111,6 +135,41 @@ fn matched_room(msgs: &[(u8, u8, u8, Vec<u8>)]) -> Option<String> {
         r.str().unwrap();
         r.str().unwrap()
     })
+}
+
+/// The "Players in Match" list after these messages: the Quick Match answer, then events 9
+/// (add) and 10 (remove); (id, name, hero) in order.
+fn waiting_list(msgs: &[(u8, u8, u8, Vec<u8>)], list: &mut Vec<(String, String, String)>) {
+    let get = |p: &[(String, String)], k: &str| p.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone()).unwrap();
+    for (_, t, action, rest) in msgs {
+        let mut r = Reader::new(rest);
+        match (*t, *action) {
+            (RESPONSE, 9) => {
+                r.u8().unwrap();
+                r.u32().unwrap();
+                list.clear();
+                for _ in 0..r.u8().unwrap() {
+                    let p = r.kv().unwrap();
+                    list.push((get(&p, "id"), get(&p, "name"), get(&p, "heroType")));
+                }
+            }
+            (EVENT, 9) => {
+                let id = r.str().unwrap();
+                let p = r.kv().unwrap();
+                assert!(!list.iter().any(|e| e.0 == id), "{id} listed twice");
+                list.push((id, get(&p, "name"), get(&p, "heroType")));
+            }
+            (EVENT, 10) => {
+                let id = r.str().unwrap();
+                list.retain(|e| e.0 != id);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn names(list: &[(String, String, String)]) -> Vec<&str> {
+    list.iter().map(|e| e.1.as_str()).collect()
 }
 
 fn got_lock(msgs: &[(u8, u8, u8, Vec<u8>)]) -> bool {
@@ -434,4 +493,115 @@ fn game_room_greets_once_everyone_is_in_and_routes_the_match() {
     t.bin(&a, &frame(0x30, &[1, 2]));
     assert!(b.take().contains(&Out::Binary(frame(0x30, &[1, 2]))));
     assert!(a.take().is_empty(), "no echo");
+}
+
+/// A 3-4 player game still waiting for players no longer holds up the others: every hosted game
+/// has its own seats, and the newest takes a player first.
+#[test]
+fn hosted_games_fill_independently_newest_first() {
+    let mut t = T::new(Config::default());
+    let _old = t.host_at("Ann", 3, 1, "10.0.0.1"); // hosted long ago, waits for 3
+    t.tick(60_000);
+    let _new = t.host_at("Ben", 1, 7, "10.0.0.2"); // a friend just hosted a 2-player game
+    let p = t.player_at("Pia", "10.0.0.3");
+    t.quick_match(&p);
+    let m = p.msgs();
+    let mut list = Vec::new();
+    waiting_list(&m, &mut list);
+    assert_eq!(list, vec![("900000002".into(), "Ben".into(), "NINJA".into())], "the list names the host and hero");
+    assert!(got_lock(&m), "Ben's game is full: it starts");
+    t.lock_ok(&p);
+    assert_eq!(matched_room(&p.msgs()).as_deref(), Some("HOST_Ben_1"));
+    // the next player goes into Ann's game, the only one left
+    let q = t.player_at("Quinn", "10.0.0.4");
+    t.quick_match(&q);
+    let m = q.msgs();
+    assert!(!got_lock(&m));
+    waiting_list(&m, &mut list);
+    assert_eq!(names(&list), ["Ann"]);
+    assert_eq!(t.relay.status()["hosted"], 1);
+    assert_eq!(t.relay.status()["queued"], 1);
+}
+
+/// A game hosted from the player's own network (the same public address) comes first, even
+/// when another is newer; a player already seated elsewhere moves to it.
+#[test]
+fn a_game_from_the_same_home_comes_first() {
+    let mut t = T::new(Config::default());
+    let _ann = t.host_at("Ann", 3, 1, "81.0.0.1");
+    let p = t.player_at("Pia", "81.0.0.9");
+    t.quick_match(&p);
+    let mut list = Vec::new();
+    waiting_list(&p.msgs(), &mut list);
+    assert_eq!(names(&list), ["Ann"]);
+    // someone at Pia's home hosts: Pia moves over (and that game is full)
+    let _sis = t.host_at("Sis", 1, -1, "81.0.0.9");
+    let m = p.msgs();
+    waiting_list(&m, &mut list);
+    assert_eq!(names(&list), ["Sis"]);
+    assert!(got_lock(&m));
+    // the same with IPv6: one /64 is one home
+    let _hal = t.host_at("Hal", 1, 2, "2a02:1:2:3::10");
+    let _ida = t.host_at("Ida", 3, 2, "2a02:9:9:9::10");
+    let q = t.player_at("Quinn", "2a02:1:2:3:abcd::7");
+    t.quick_match(&q);
+    t.lock_ok(&q);
+    assert_eq!(matched_room(&q.msgs()).as_deref(), Some("HOST_Hal_1"));
+}
+
+/// Back on the waiting screen and Quick Match again: the next game; once all were seen, round
+/// again. The list follows (the host and the players seated with them).
+#[test]
+fn back_and_quick_match_again_goes_to_the_next_game() {
+    let mut t = T::new(Config::default());
+    t.host_at("Ann", 3, 1, "10.0.0.1");
+    t.tick(1_000);
+    t.host_at("Ben", 3, 1, "10.0.0.2");
+    let p = t.player_at("Pia", "10.0.0.3");
+    let mut list = Vec::new();
+    t.quick_match(&p);
+    waiting_list(&p.msgs(), &mut list);
+    assert_eq!(names(&list), ["Ben"]);
+    let q = t.player_at("Quinn", "10.0.0.4");
+    t.quick_match(&q);
+    let mut qlist = Vec::new();
+    waiting_list(&q.msgs(), &mut qlist);
+    assert_eq!(names(&qlist), ["Ben", "Pia"], "seated with Pia in Ben's game");
+    waiting_list(&p.msgs(), &mut list);
+    assert_eq!(names(&list), ["Ben", "Quinn"]);
+    // Pia wants another game
+    t.cancel(&p);
+    waiting_list(&q.msgs(), &mut qlist);
+    assert_eq!(names(&qlist), ["Ben"]);
+    t.quick_match(&p);
+    waiting_list(&p.msgs(), &mut list);
+    assert_eq!(names(&list), ["Ann"]);
+    t.cancel(&p);
+    t.quick_match(&p);
+    waiting_list(&p.msgs(), &mut list);
+    assert_eq!(names(&list), ["Ben", "Quinn"], "seen them all: round again");
+}
+
+/// A host who stops waiting: the players seated in that game get another (or wait).
+#[test]
+fn players_of_a_game_whose_host_stops_get_another() {
+    let mut t = T::new(Config::default());
+    let ann = t.host_at("Ann", 2, 1, "10.0.0.1");
+    t.tick(1_000);
+    let ben = t.host_at("Ben", 2, 1, "10.0.0.2");
+    let p = t.player_at("Pia", "10.0.0.3");
+    let mut list = Vec::new();
+    t.quick_match(&p);
+    t.send(&ben, json!({"t": "unserve"}));
+    waiting_list(&p.msgs(), &mut list);
+    assert_eq!(names(&list), ["Ann"]);
+    t.disconnect(&ann);
+    waiting_list(&p.msgs(), &mut list);
+    assert!(list.is_empty(), "no game left: Pia waits");
+    // a host's game from before 2026-11-25 (no name or hero): the room names the host
+    t.host("RGHost", "HOST_Old_Timer_3", 1);
+    let m = p.msgs();
+    waiting_list(&m, &mut list);
+    assert_eq!(list, vec![("900000003".into(), "Old_Timer".into(), "PLUMBER".into())]);
+    assert!(got_lock(&m));
 }
