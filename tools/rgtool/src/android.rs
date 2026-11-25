@@ -4,7 +4,7 @@
 //! NativeActivity, packaged with aapt2 / zipalign / apksigner from the SDK.
 //! `android-run`, `android-keys`, `android-shot`, `android-log` drive it in the emulator.
 
-use crate::native::{c_files, compile_all, generate, patched_data, tool_jdk};
+use crate::native::{bearssl, c_files, compile_all, generate, patched_data, tool_jdk};
 use crate::setup::{android_sdk, newest};
 use crate::util::{files_with_ext, remove_dir, root, run, R};
 use std::io::Write;
@@ -102,9 +102,12 @@ pub fn build(args: &[String]) -> R<()> {
             cf.push(format!("-I{}", i.display()));
         }
         let obj = out.join(format!("obj-{abi}"));
+        let (tls_inc, tls_objs) = bearssl(&clang, &cf, &obj.join("bearssl"))?;
+        cf.push(tls_inc);
         let mut gf = cf.clone();
         gf.push("-w".into());
         let mut objs = compile_all(&clang, &gf, &c_files(&gen), &obj, &headers)?;
+        objs.extend(tls_objs);
         let mut own = c_files(&rt);
         own.push(r.join("native/android/main.c"));
         own.push(glue.join("android_native_app_glue.c"));

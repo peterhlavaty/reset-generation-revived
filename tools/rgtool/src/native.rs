@@ -141,6 +141,20 @@ pub fn c_files(dir: &Path) -> Vec<PathBuf> {
     crate::util::files_with_ext(dir, "c").into_iter().filter(|p| p.parent() == Some(dir)).collect()
 }
 
+/// BearSSL, the TLS of wss:// links (native/rt/link.c), installed into .toolchains on first use:
+/// its objects (compiled with `cc` and `flags` into `obj`) and the include flag native/rt needs.
+pub fn bearssl(cc: &Path, flags: &[String], obj: &Path) -> R<(String, Vec<PathBuf>)> {
+    if crate::setup::find("bearssl").is_none() {
+        crate::setup::setup(&["bearssl".to_string()])?;
+    }
+    let home = crate::setup::need("bearssl")?;
+    let inc = format!("-I{}", home.join("inc").display());
+    let mut f = flags.to_vec();
+    f.extend([inc.clone(), format!("-I{}", home.join("src").display()), "-w".into()]);
+    let objs = compile_all(cc, &f, &crate::util::files_with_ext(&home.join("src"), "c"), obj, &[])?;
+    Ok((inc, objs))
+}
+
 /// `cargo x build-native-test [--trace a,b] [--calltrace]`: build/native/rgtest(.exe), the
 /// headless test driver (recompiled engine + native/host/desktop/rgtest.c) for this PC.
 pub fn build_test(args: &[String]) -> R<()> {
@@ -149,7 +163,7 @@ pub fn build_test(args: &[String]) -> R<()> {
     let gen = generate(&recomp_args)?;
     let r = root();
     let (cc, libs): (PathBuf, &[&str]) = if cfg!(windows) {
-        (need("llvm-mingw")?.join("bin/x86_64-w64-mingw32-clang.exe"), &["-lws2_32", "-lpthread", "-lm", "-static"])
+        (need("llvm-mingw")?.join("bin/x86_64-w64-mingw32-clang.exe"), &["-lws2_32", "-ladvapi32", "-lpthread", "-lm", "-static"])
     } else {
         (PathBuf::from(std::env::var("CC").unwrap_or("cc".into())), &["-lpthread", "-lm"])
     };
@@ -161,10 +175,13 @@ pub fn build_test(args: &[String]) -> R<()> {
     flags.push(format!("-I{}", rt.display()));
     flags.push(format!("-I{}", gen.display()));
     let obj = r.join(if calltrace { "build/native/obj-test-trace" } else { "build/native/obj-test" });
+    let (tls_inc, tls_objs) = bearssl(&cc, &flags, &obj.join("bearssl"))?;
+    flags.push(tls_inc);
     let headers = crate::util::files_with_ext(&rt, "h");
     let mut gen_flags = flags.clone();
     gen_flags.push("-w".into());
     let mut objs = compile_all(&cc, &gen_flags, &c_files(&gen), &obj, &headers)?;
+    objs.extend(tls_objs);
     let mut own = c_files(&rt);
     own.push(r.join("native/host/desktop/rgtest.c"));
     let mut own_flags = flags.clone();
@@ -275,10 +292,13 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
     flags.push(format!("-I{}", rt.display()));
     flags.push(format!("-I{}", gen.display()));
     let obj = r.join("build/native/obj-desktop");
+    let (tls_inc, tls_objs) = bearssl(&cc, &flags, &obj.join("bearssl"))?;
+    flags.push(tls_inc);
     let headers = crate::util::files_with_ext(&rt, "h");
     let mut gen_flags = flags.clone();
     gen_flags.push("-w".into());
     let mut objs = compile_all(&cc, &gen_flags, &c_files(&gen), &obj, &headers)?;
+    objs.extend(tls_objs);
     let mut own = c_files(&rt);
     own.push(r.join("native/host/desktop/host.c"));
     flags.extend(["-Wall", "-Wno-unused-function"].iter().map(|s| s.to_string()));

@@ -39,14 +39,16 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
   are served by `server/` (rg-relay, Rust). Matches run on the hosting player's engine
   (`native/rt/server.c`). The desktop game runs the relay in-process for LAN games (the
   `rg-server` library; clients find it by UDP broadcast on 8787, `server=auto`). A dropped
-  player's seat is held for as long as the match runs (`rejoin_ms: None`).
+  player's seat is held for as long as the match runs (`rejoin_ms: None`). Games reach the public
+  relay by `wss://` (BearSSL in `native/rt/link.c`, Let's Encrypt roots built in), falling back
+  to `ws://` on port 80; LAN relays are plain `ws://`.
 * Windows child processes inherit our std handles unless `util::no_inherit()` ran: piped rgtool
   commands then hang until the game exits.
 * aapt2 on Windows writes asset names with `\`; android.rs rewrites them (regression test).
 
 ## Tools
 
-* `cargo x setup [all|llvm-mingw|jdk25|ghidra]`, `cargo x doctor` — toolchains in
+* `cargo x setup [all|llvm-mingw|jdk25|ghidra|bearssl]`, `cargo x doctor` — toolchains in
   `.toolchains/` (`RG_TOOLCHAINS` overrides). The Android SDK is found via `ANDROID_HOME` or the
   Android Studio default location.
 * Builds: `build-desktop` (Windows, Linux, macOS; `build-windows` is an alias), `build-android`,

@@ -5,9 +5,9 @@ Status (2026-11-25):
 | Piece | State |
 |---|---|
 | **Hosted games (every build)** | **Works, 2–4 players** — F5 (Android: the HOST button) makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. `native/rt/server.c`; see "Hosted games" |
-| Server (`server/`, Rust: relay, casino, game rooms; binary `rg-relay`) | **Done**, tests in `server/tests` (`cargo test -p rg-server`); public instance at `ws://resetgeneration.rustyapps.com/ws` (`cargo x deploy`, see "Running a server") |
+| Server (`server/`, Rust: relay, casino, game rooms; binary `rg-relay`) | **Done**, tests in `server/tests` (`cargo test -p rg-server`); public instance at `wss://resetgeneration.rustyapps.com/ws` (`cargo x deploy`, see "Running a server") |
 | LAN without internet (desktop) | **Done** — the hosting game runs the relay in-process, clients find it by UDP broadcast (`server=auto`, the default); see "LAN relay" |
-| Client (`native/rt/net.c` + `native/rt/link.c`, replacing `SNAPMobileClient`) | **Done** (plain `ws://`): logs in with a nickname (no Arena login screen) and joins hosted games; verified desktop ↔ desktop (LAN and public server) and Android ↔ desktop |
+| Client (`native/rt/net.c` + `native/rt/link.c`, replacing `SNAPMobileClient`) | **Done** (`wss://` and `ws://`): logs in with a nickname (no Arena login screen) and joins hosted games; verified desktop ↔ desktop (LAN and public server) and Android ↔ desktop |
 | Casino system (login, casino enter, Quick Match queue, lock, matched-up) | **Done** — both players listed in "Players in Match", "Game starting…" |
 | Game room bot (`server/src/gameroom.rs`: handshake, seating on 0x15, forwarding) | **Done** |
 | Game server (channel 0x16) | **Done** by the hosting player's engine (`native/rt/server.c`; verified host ↔ client, including a client killed and coming back) |
@@ -287,8 +287,9 @@ currently answered with empty OK responses.
 ## Running a server
 
 The server is one small Rust program (`server/`, binary `rg-relay`: tokio on one thread, about
-1 MB of memory). The public instance runs behind nginx on `resetgeneration.rustyapps.com` (plain
-`ws://` on port 80 for the games, `wss://` on 443 for browsers; `GET /status` for counters).
+1 MB of memory). The public instance runs behind nginx on `resetgeneration.rustyapps.com` (`wss://` on
+port 443 for the games and browsers, plain `ws://` on port 80 for builds before 2026-11-25 and as
+the games' fallback; `GET /status` for counters).
 
 ```bash
 cargo run -p rg-server --release -- --listen 0.0.0.0:8787    # a server of your own
@@ -307,7 +308,10 @@ cargo x deploy-ssh CMD   # one command there    cargo x undeploy           remov
 
 Clients: desktop `revived.ini` next to the program, Android `files/revived.ini` in the app's
 storage: `server=auto|online|lan|ws://<host>:8787/ws` (default `auto`), `nickname=…` (default
-`PlayerNNNN`, Android `DroidNNNN`). The client speaks plain `ws://` only.
+`PlayerNNNN`, Android `DroidNNNN`). The client speaks `ws://` and `wss://` (`native/rt/link.c`:
+TLS 1.2 by BearSSL, which rgtool downloads like a toolchain, trusting the Let's Encrypt roots in
+`native/rt/tls_roots.h`). When TLS to the standard port fails it retries `ws://` on port 80, so a
+device whose clock is wrong (certificates cannot be checked) still plays; the log says so.
 
 ## The game room (done)
 
@@ -429,7 +433,6 @@ menu flow, and the relay's idle timeout handling when the server drops.
 
 ### What is still open
 
-* TLS (`wss://`) in `native/rt/net.c`; the public server accepts plain `ws://` on port 80.
 * The host-local player 0 in `rgtest --server`, a headless build without the menu flow.
 
 Debugging tools: `cargo x build-native-test --calltrace --trace <hex,…>` then `cargo x

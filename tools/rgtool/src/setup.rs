@@ -1,10 +1,11 @@
 //! `cargo x setup [what…]`: downloads the toolchains the builds need into `.toolchains/` in the
 //! repository (git-ignored; RG_TOOLCHAINS overrides the place). Each download is checked against
-//! the SHA-256 its publisher lists. Already installed ones are kept.
+//! a SHA-256 (the one its publisher lists, or pinned here). Already installed ones are kept.
 //!
 //! * llvm-mingw: clang for Windows targets (the recompiled engine C is built with it on Windows)
 //! * jdk25, ghidra: the headless Ghidra export the native builds start from (Ghidra 12.2+ needs
 //!   JDK 25); jdk25 also runs the build-time Java tools on other OSes
+//! * bearssl: the TLS library (C sources) of wss:// relay links; the builds install it themselves
 //!
 //! Android SDK / NDK: an existing installation (ANDROID_HOME, ANDROID_SDK_ROOT or the Android
 //! Studio default) is used; `cargo x doctor` shows what was found.
@@ -18,7 +19,7 @@ pub fn dir() -> PathBuf {
     std::env::var_os("RG_TOOLCHAINS").map(PathBuf::from).unwrap_or_else(|| root().join(".toolchains"))
 }
 
-pub const ALL: &[&str] = &["llvm-mingw", "jdk25", "ghidra"];
+pub const ALL: &[&str] = &["llvm-mingw", "jdk25", "ghidra", "bearssl"];
 
 fn os() -> &'static str {
     match std::env::consts::OS {
@@ -183,6 +184,12 @@ pub fn setup(what: &[String]) -> R<()> {
                 github(name, "mstorsjo/llvm-mingw", |n| n.starts_with("llvm-mingw-") && n.ends_with(host))?
             }
             "ghidra" => github(name, "NationalSecurityAgency/ghidra", |n| n.starts_with("ghidra_") && n.ends_with(".zip"))?,
+            "bearssl" => install(
+                name,
+                "https://bearssl.org/bearssl-0.6.tar.gz",
+                "6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14",
+                "bearssl-0.6.tar.gz",
+            )?,
             _ => return Err(format!("unknown toolchain {name} (known: {})", ALL.join(", ")).into()),
         }
     }

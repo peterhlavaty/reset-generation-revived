@@ -1,6 +1,7 @@
 //! `cargo x deploy`: puts the relay (server/) on the public server, next to whatever else runs
 //! there, without touching it: one static binary, one systemd unit and one nginx site for its own
-//! subdomain (plain ws on port 80 for the games, wss on 443 for browsers).
+//! subdomain (wss on 443 for the games and browsers, plain ws on port 80 for older builds and as
+//! the games' fallback).
 //!
 //! Settings: deploy.local.ini in the repository root (git-ignored, see deploy.example.ini).
 //! SSH is pure Rust (russh): the key, even a passphrase-protected one, is decoded in memory.
@@ -180,7 +181,7 @@ map $http_upgrade $rg_relay_connection {{
     ''      close;
 }}
 
-# Plain ws for the games (their WebSocket clients have no TLS), no redirect to https.
+# Plain ws for older game builds and the games' TLS fallback: no redirect to https.
 server {{
     listen 80;
     listen [::]:80;

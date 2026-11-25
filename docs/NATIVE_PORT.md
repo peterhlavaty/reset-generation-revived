@@ -54,7 +54,8 @@ ResetGeneration(.exe)  /  rgtest  /  libresetgen.so → dist/ResetGeneration-Rev
 | `win32.c` | PE loader (sections, exports, IAT → stubs), guest heap, the 86 kernel32/winmm imports |
 | `jni.c` | fake `JNIEnv` (240-entry table in guest memory): strings, direct buffers, `Call*Method` → host |
 | `engine.c`, `engine.h` | boot sequence and per-frame API (`rg_init`, `rg_tick`, `rg_key`, `rg_audio`, `rg_pixels`) |
-| `net.c`, `net.h` | online play: the engine's SNAP Mobile interface on the relay (`MULTIPLAYER.md`), ws:// |
+| `net.c`, `net.h` | online play: the engine's SNAP Mobile interface on the relay (`MULTIPLAYER.md`) |
+| `link.c`, `link.h`, `tls_roots.h` | relay links: WebSocket over TCP, `wss://` by BearSSL (downloaded by rgtool); LAN discovery, the relay choice (`server=` auto, online, lan) |
 
 The Win32/JNI behaviour was checked call by call against the original DLL running under a CPU
 emulator (Unicorn; that Python oracle is no longer in the repository).
@@ -215,4 +216,3 @@ functions; `RT_LIVE_TRIGGER=addr:N` logs the N function entries after `addr`;
   the game image (translucent). A layout option (smaller game, wider bars) would help.
 * Debug-signed APK (`build/android/debug.keystore`); a release key is needed for Play.
 * C++ exceptions / SEH unwinding are not implemented (`RaiseException` aborts); none were seen.
-* The native net client speaks plain `ws://` only (no TLS yet).

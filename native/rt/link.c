@@ -1,7 +1,10 @@
-/* Relay connections: WebSocket client links and the relay choice (link.h). */
+/* Relay connections: WebSocket client links (ws://, and wss:// through BearSSL) and the relay
+ * choice (link.h). */
 #include "link.h"
 #include "engine.h"
 #include "host.h"
+#include "bearssl.h"
+#include "tls_roots.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,7 +65,7 @@ static void set_timeout(sock_t s, int opt, int ms) {
 }
 
 /* ------------------------------------------------------------------ addresses */
-typedef struct { char host[200], path[200]; int port, tls; } url_parts;
+typedef struct { char host[200], path[200]; int port, tls, own_port; } url_parts;
 
 static int parse_url(const char *url, url_parts *u) {
     memset(u, 0, sizeof *u);
@@ -72,7 +75,7 @@ static int parse_url(const char *url, url_parts *u) {
     else return 0;
     const char *slash = strchr(p, '/'), *colon = strchr(p, ':');
     size_t hl = slash ? (size_t)(slash - p) : strlen(p);
-    if (colon && (!slash || colon < slash)) { hl = (size_t)(colon - p); u->port = atoi(colon + 1); }
+    if (colon && (!slash || colon < slash)) { hl = (size_t)(colon - p); u->port = atoi(colon + 1); u->own_port = 1; }
     snprintf(u->host, sizeof u->host, "%.*s", (int)hl, p);
     snprintf(u->path, sizeof u->path, "%s", slash ? slash : "/");
     return u->host[0] && u->port > 0;
@@ -128,18 +131,213 @@ static int send_all(sock_t s, const uint8_t *p, size_t n) {
     return 1;
 }
 
-/* ------------------------------------------------------------------ WebSocket links */
+/* 1 when s has data (or its end) within ms, 0 on timeout, -1 on error */
+static int wait_readable(sock_t s, int ms) {
+#ifdef _WIN32
+    fd_set r;
+    FD_ZERO(&r);
+    FD_SET(s, &r);
+    struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
+    return select(0, &r, NULL, NULL, &tv);
+#else
+    struct pollfd p = {s, POLLIN, 0};
+    int k = poll(&p, 1, ms);
+    return k < 0 ? (errno == EINTR ? 0 : -1) : k;
+#endif
+}
+
+static void nap(void) {
+#ifdef _WIN32
+    Sleep(1);
+#else
+    usleep(1000);
+#endif
+}
+
+/* ------------------------------------------------------------------ links */
+/* wss:// is TLS 1.2 by BearSSL (downloaded by rgtool), trusting Let's Encrypt's roots
+ * (tls_roots.h). A link's engine is shared by its reader thread and its senders under tls_lock;
+ * nobody holds the lock while waiting for the network. */
+typedef struct {
+    br_ssl_client_context cc;
+    br_x509_minimal_context xc;
+    unsigned char buf[BR_SSL_BUFSIZE_BIDI];
+} tls_conn;
+
 struct rt_link {
     sock_t s;
     int refs, closed;
-    pthread_mutex_t send_lock;
+    uint32_t deadline;          /* reads fail after this host_time_ms() (while connecting); 0: never */
+    pthread_mutex_t send_lock;  /* one WebSocket frame at a time */
+    pthread_mutex_t tls_lock;
+    tls_conn *tls;              /* NULL for ws:// */
 };
 
-static int raw_send(rt_link *l, const uint8_t *p, size_t n) { return send_all(l->s, p, n); }
+static br_x509_trust_anchor anchors[sizeof TLS_ROOTS / sizeof TLS_ROOTS[0]];
+static size_t n_anchors;
+static pthread_once_t anchors_once = PTHREAD_ONCE_INIT;
+
+typedef struct { unsigned char *p; size_t n; } bytes;
+
+static void dn_add(void *ctx, const void *buf, size_t len) {
+    bytes *b = (bytes *)ctx;
+    b->p = (unsigned char *)realloc(b->p, b->n + len);
+    memcpy(b->p + b->n, buf, len);
+    b->n += len;
+}
+
+static unsigned char *copy_of(const unsigned char *p, size_t n) {
+    unsigned char *q = (unsigned char *)malloc(n ? n : 1);
+    memcpy(q, p, n);
+    return q;
+}
+
+static void load_anchors(void) {
+    for (size_t i = 0; i < sizeof TLS_ROOTS / sizeof TLS_ROOTS[0]; i++) {
+        br_x509_decoder_context dc;
+        bytes dn = {NULL, 0};
+        br_x509_decoder_init(&dc, dn_add, &dn);
+        br_x509_decoder_push(&dc, TLS_ROOTS[i].der, TLS_ROOTS[i].len);
+        br_x509_pkey *pk = br_x509_decoder_get_pkey(&dc);
+        if (!pk || br_x509_decoder_last_error(&dc) || !br_x509_decoder_isCA(&dc)) { free(dn.p); continue; }
+        br_x509_trust_anchor *ta = &anchors[n_anchors++];
+        ta->dn.data = dn.p;
+        ta->dn.len = dn.n;
+        ta->flags = BR_X509_TA_CA;
+        ta->pkey = *pk;   /* the key bytes live in the decoder: copy them */
+        if (pk->key_type == BR_KEYTYPE_RSA) {
+            ta->pkey.key.rsa.n = copy_of(pk->key.rsa.n, pk->key.rsa.nlen);
+            ta->pkey.key.rsa.e = copy_of(pk->key.rsa.e, pk->key.rsa.elen);
+        } else {
+            ta->pkey.key.ec.q = copy_of(pk->key.ec.q, pk->key.ec.qlen);
+        }
+    }
+}
+
+static int expired(rt_link *l) { return l->deadline && (int32_t)(host_time_ms() - l->deadline) >= 0; }
+
+/* The TLS steps below run with tls_lock held. */
+static int tls_flush(rt_link *l) {
+    br_ssl_engine_context *e = &l->tls->cc.eng;
+    while (br_ssl_engine_current_state(e) & BR_SSL_SENDREC) {
+        size_t n;
+        unsigned char *b = br_ssl_engine_sendrec_buf(e, &n);
+        if (!send_all(l->s, b, n)) return 0;
+        br_ssl_engine_sendrec_ack(e, n);
+    }
+    return 1;
+}
+
+/* Feeds the engine from the socket, waiting up to 100 ms for data (without the lock: the reader
+ * thread also gets here, and another thread may have fed the engine meanwhile). */
+static int tls_fill(rt_link *l) {
+    br_ssl_engine_context *e = &l->tls->cc.eng;
+    pthread_mutex_unlock(&l->tls_lock);
+    int r = wait_readable(l->s, 100);
+    pthread_mutex_lock(&l->tls_lock);
+    if (r < 0 || (r == 0 && expired(l))) return 0;
+    if (!(br_ssl_engine_current_state(e) & BR_SSL_RECVREC) || wait_readable(l->s, 0) <= 0) return 1;
+    size_t n;
+    unsigned char *b = br_ssl_engine_recvrec_buf(e, &n);
+    int k = (int)recv(l->s, (char *)b, (int)n, 0);
+    if (k <= 0) return 0;
+    br_ssl_engine_recvrec_ack(e, (size_t)k);
+    return 1;
+}
+
+/* One step on: send what is pending, or read; 0 once the connection is over. */
+static int tls_step(rt_link *l) {
+    unsigned st = br_ssl_engine_current_state(&l->tls->cc.eng);
+    if (st & BR_SSL_CLOSED) return 0;
+    if (st & BR_SSL_SENDREC) return tls_flush(l);
+    if (st & BR_SSL_RECVREC) return tls_fill(l);
+    pthread_mutex_unlock(&l->tls_lock);   /* waiting for another thread to take received data */
+    nap();
+    pthread_mutex_lock(&l->tls_lock);
+    return 1;
+}
+
+/* The handshake: 0, or BearSSL's error (-1: the connection ended). */
+static int tls_start(rt_link *l, const char *host) {
+    pthread_once(&anchors_once, load_anchors);
+    tls_conn *t = (tls_conn *)calloc(1, sizeof *t);
+    l->tls = t;
+    br_ssl_engine_context *e = &t->cc.eng;
+    br_ssl_client_init_full(&t->cc, &t->xc, anchors, n_anchors);
+    br_ssl_engine_set_buffer(e, t->buf, sizeof t->buf, 1);
+    if (!br_ssl_client_reset(&t->cc, host, 0)) return br_ssl_engine_last_error(e);
+    pthread_mutex_lock(&l->tls_lock);
+    int ok = 1;
+    while (ok && !(br_ssl_engine_current_state(e) & (BR_SSL_SENDAPP | BR_SSL_RECVAPP))) ok = tls_step(l);
+    pthread_mutex_unlock(&l->tls_lock);
+    int err = br_ssl_engine_last_error(e);
+    return ok ? 0 : err ? err : -1;
+}
+
+static int tls_send(rt_link *l, const uint8_t *p, size_t n) {
+    br_ssl_engine_context *e = &l->tls->cc.eng;
+    int ok = 1;
+    pthread_mutex_lock(&l->tls_lock);
+    while (ok && n) {
+        if (br_ssl_engine_current_state(e) & BR_SSL_SENDAPP) {
+            size_t k;
+            unsigned char *b = br_ssl_engine_sendapp_buf(e, &k);
+            if (k > n) k = n;
+            memcpy(b, p, k);
+            br_ssl_engine_sendapp_ack(e, k);
+            p += k;
+            n -= k;
+        } else {
+            ok = tls_step(l);
+        }
+    }
+    if (ok) {
+        br_ssl_engine_flush(e, 0);
+        ok = tls_flush(l);
+    }
+    pthread_mutex_unlock(&l->tls_lock);
+    return ok;
+}
+
+static int tls_recv_some(rt_link *l, uint8_t *p, size_t n) {
+    br_ssl_engine_context *e = &l->tls->cc.eng;
+    int got = 0;
+    pthread_mutex_lock(&l->tls_lock);
+    for (;;) {
+        if (br_ssl_engine_current_state(e) & BR_SSL_RECVAPP) {
+            size_t k;
+            unsigned char *b = br_ssl_engine_recvapp_buf(e, &k);
+            if (k > n) k = n;
+            memcpy(p, b, k);
+            br_ssl_engine_recvapp_ack(e, k);
+            got = (int)k;
+            break;
+        }
+        if (!tls_step(l)) break;
+    }
+    pthread_mutex_unlock(&l->tls_lock);
+    return got;
+}
+
+static int raw_send(rt_link *l, const uint8_t *p, size_t n) {
+    return l->tls ? tls_send(l, p, n) : send_all(l->s, p, n);
+}
+
+/* Some bytes (> 0), or 0 once the connection is over. */
+static int raw_recv_some(rt_link *l, uint8_t *p, size_t n) {
+    if (l->tls) return tls_recv_some(l, p, n);
+    while (l->deadline) {
+        int r = wait_readable(l->s, 100);
+        if (r < 0 || (r == 0 && expired(l))) return 0;
+        if (r > 0) break;
+    }
+    int k = (int)recv(l->s, (char *)p, (int)n, 0);
+    return k > 0 ? k : 0;
+}
 
 static int raw_recv(rt_link *l, uint8_t *p, size_t n) {
     while (n) {
-        int k = (int)recv(l->s, (char *)p, (int)n, 0);
+        int k = raw_recv_some(l, p, n);
         if (k <= 0) return 0;
         p += k;
         n -= (size_t)k;
@@ -147,23 +345,53 @@ static int raw_recv(rt_link *l, uint8_t *p, size_t n) {
     return 1;
 }
 
-rt_link *link_open(const char *url, const char *who) {
-    url_parts u;
-    if (!parse_url(url, &u)) { host_log("%s: not a relay address: %s", who, url); return NULL; }
-    if (u.tls) { host_log("%s: wss:// is not supported yet (%s)", who, url); return NULL; }
-    sock_t s = tcp_connect(u.host, u.port, CONNECT_TIMEOUT_MS);
-    if (s == BAD_SOCK) { host_log("%s: cannot connect to %s:%d", who, u.host, u.port); return NULL; }
+/* TCP (and TLS for wss://) to u; reads time out after timeout_ms until the caller clears
+ * l->deadline. who: the log prefix, NULL for quiet. */
+static rt_link *conn_open(const url_parts *u, int timeout_ms, const char *who) {
+    sock_t s = tcp_connect(u->host, u->port, timeout_ms);
+    if (s == BAD_SOCK) {
+        if (who) host_log("%s: cannot connect to %s:%d", who, u->host, u->port);
+        return NULL;
+    }
     rt_link *l = (rt_link *)calloc(1, sizeof *l);
     l->s = s;
     l->refs = 1;
+    l->deadline = (host_time_ms() + (uint32_t)timeout_ms) | 1;
     pthread_mutex_init(&l->send_lock, NULL);
+    pthread_mutex_init(&l->tls_lock, NULL);
+    int err = u->tls ? tls_start(l, u->host) : 0;
+    if (err) {
+        if (who) host_log("%s: TLS with %s failed (BearSSL error %d)", who, u->host, err);
+        link_release(l);
+        return NULL;
+    }
+    return l;
+}
+
+/* conn_open; for wss:// on the standard port, ws:// on port 80 when TLS fails (a device whose
+ * clock is wrong cannot check certificates; the relay serves both). */
+static rt_link *conn_open_any(url_parts *u, int timeout_ms, const char *who) {
+    rt_link *l = conn_open(u, timeout_ms, who);
+    if (!l && u->tls && !u->own_port) {
+        u->tls = 0;
+        u->port = 80;
+        l = conn_open(u, timeout_ms, who);
+        if (l && who) host_log("%s: using ws://%s (no wss://)", who, u->host);
+    }
+    return l;
+}
+
+rt_link *link_open(const char *url, const char *who) {
+    url_parts u;
+    if (!parse_url(url, &u)) { host_log("%s: not a relay address: %s", who, url); return NULL; }
+    rt_link *l = conn_open_any(&u, CONNECT_TIMEOUT_MS, who);
+    if (!l) return NULL;
     char req[600], resp[1024];
     snprintf(req, sizeof req,
              "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
              "Sec-WebSocket-Key: UmVzZXRHZW5lcmF0aW9uIQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
              u.path, u.host, u.port);
     size_t got = 0;
-    set_timeout(s, SO_RCVTIMEO, CONNECT_TIMEOUT_MS);
     int ok = raw_send(l, (const uint8_t *)req, strlen(req));
     while (ok && got < sizeof resp - 1) {
         if (!raw_recv(l, (uint8_t *)resp + got, 1)) break;
@@ -171,7 +399,7 @@ rt_link *link_open(const char *url, const char *who) {
         if (got >= 4 && !memcmp(resp + got - 4, "\r\n\r\n", 4)) break;
     }
     resp[got] = 0;
-    set_timeout(s, SO_RCVTIMEO, 0);
+    l->deadline = 0;
     if (!ok || !strstr(resp, " 101 ")) {
         host_log("%s: %s refused the WebSocket upgrade", who, url);
         link_release(l);
@@ -186,6 +414,8 @@ void link_release(rt_link *l) {
     if (!l || __atomic_sub_fetch(&l->refs, 1, __ATOMIC_SEQ_CST) != 0) return;
     closesock(l->s);
     pthread_mutex_destroy(&l->send_lock);
+    pthread_mutex_destroy(&l->tls_lock);
+    free(l->tls);
     free(l);
 }
 
@@ -241,6 +471,12 @@ void link_close(rt_link *l) {
     if (!l->closed) {
         send_frame(l, 8, "", 0);
         l->closed = 1;
+        if (l->tls) {
+            pthread_mutex_lock(&l->tls_lock);
+            br_ssl_engine_close(&l->tls->cc.eng);
+            tls_flush(l);
+            pthread_mutex_unlock(&l->tls_lock);
+        }
         shutdown(l->s, SHUT_RDWR);
     }
     pthread_mutex_unlock(&l->send_lock);
@@ -253,19 +489,17 @@ void rg_set_relay_starter(relay_starter fn) { starter = fn; }
 int relay_reachable(const char *url) {
     url_parts u;
     if (!parse_url(url, &u)) return 0;
-    sock_t s = tcp_connect(u.host, u.port, 1000);
-    if (s == BAD_SOCK) return 0;
-    if (u.tls) { closesock(s); return 1; }   /* TLS: the port answers (enough to tell we are online) */
+    rt_link *l = conn_open_any(&u, 2000, NULL);
+    if (!l) return 0;
     char req[300], resp[2048];
     snprintf(req, sizeof req, "GET /status HTTP/1.0\r\nHost: %s\r\n\r\n", u.host);
-    set_timeout(s, SO_RCVTIMEO, 1000);
     size_t got = 0;
-    if (send_all(s, (const uint8_t *)req, strlen(req))) {
+    if (raw_send(l, (const uint8_t *)req, strlen(req))) {
         int k;
-        while (got < sizeof resp - 1 && (k = (int)recv(s, resp + got, (int)(sizeof resp - 1 - got), 0)) > 0) got += (size_t)k;
+        while (got < sizeof resp - 1 && (k = raw_recv_some(l, (uint8_t *)resp + got, sizeof resp - 1 - got)) > 0) got += (size_t)k;
     }
     resp[got] = 0;
-    closesock(s);
+    link_release(l);
     return !strncmp(resp, "HTTP/1.", 7) && strstr(resp, "\"players\"") != NULL;
 }
 

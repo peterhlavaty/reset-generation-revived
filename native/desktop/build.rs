@@ -16,7 +16,7 @@ fn main() {
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     match os.as_str() {
         "windows" => {
-            for l in ["ws2_32", "winmm"] {
+            for l in ["ws2_32", "winmm", "advapi32"] {
                 println!("cargo:rustc-link-lib={l}");
             }
             // one self-contained .exe (with crt-static, set by `cargo x build-desktop`): no
