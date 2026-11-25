@@ -184,7 +184,8 @@ pub fn build(args: &[String]) -> R<()> {
     let signer = bt.join(if cfg!(windows) { "apksigner.bat" } else { "apksigner" });
     run(Command::new(&signer)
         .env("JAVA_HOME", &jdk)
-        .args(["sign", "--ks"])
+        // no v4 signature: it only serves incremental adb installs and adds an .idsig file to dist/
+        .args(["sign", "--v4-signing-enabled", "false", "--ks"])
         .arg(&ks)
         .args(["--ks-pass", "pass:android", "--ks-key-alias", "rgdebug", "--out"])
         .arg(&apk)
