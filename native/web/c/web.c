@@ -1,10 +1,12 @@
-/* Platform services of the browser build (host.h) and its stand-in for the relay links: a page
- * cannot open TCP connections, so online play is off (net.c and server.c see that threads cannot
- * start and report "cannot connect" / "cannot host"). */
+/* Platform services of the browser build (host.h) and its choice of relay. The relay links are
+ * the page's WebSockets (native/web/src/link.rs); a page cannot listen or broadcast, so there are
+ * no LAN games: every setting but a relay's address means the public server. */
+#include "engine.h"
 #include "host.h"
 #include "link.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 /* from the Rust host (native/web/src/lib.rs) */
 void rg_web_log(const char *line, size_t len);
@@ -29,16 +31,12 @@ void host_sleep_ms(uint32_t ms) { (void)ms; }   /* the engine runs on the virtua
 /* the engine's clock, for the host's pacing */
 uint32_t rg_web_clock(void) { return rt_now_ms(); }
 
-rt_link *link_open(const char *url, const char *who) {
-    host_log("%s: cannot connect to %s from a web page", who, url);
-    return NULL;
+static const char *relay(const char *setting) {
+    if (setting && (!strncmp(setting, "ws://", 5) || !strncmp(setting, "wss://", 6))) return setting;
+    if (setting && !strcmp(setting, "lan")) host_log("net: there are no LAN games in a web browser: the public server");
+    return RG_ONLINE_SERVER;
 }
-void link_ref(rt_link *l) { (void)l; }
-void link_release(rt_link *l) { (void)l; }
-int link_send(rt_link *l, int opcode, const void *data, size_t len) { (void)l, (void)opcode, (void)data, (void)len; return 0; }
-int link_read(rt_link *l, uint8_t *buf, size_t cap, size_t *len) { (void)l, (void)buf, (void)cap, (void)len; return 0; }
-void link_close(rt_link *l) { (void)l; }
-const char *relay_for_joining(const char *setting, char *buf, size_t n) { (void)setting, (void)buf, (void)n; return NULL; }
-const char *relay_for_hosting(const char *setting, const char *nick, char *buf, size_t n) { (void)setting, (void)nick, (void)buf, (void)n; return NULL; }
-int relay_reachable(const char *url) { (void)url; return 0; }
+const char *relay_for_joining(const char *setting, char *buf, size_t n) { (void)buf, (void)n; return relay(setting); }
+const char *relay_for_hosting(const char *setting, const char *nick, char *buf, size_t n) { (void)nick, (void)buf, (void)n; return relay(setting); }
+int relay_reachable(const char *url) { (void)url; return 1; }
 void rg_set_relay_starter(relay_starter fn) { (void)fn; }

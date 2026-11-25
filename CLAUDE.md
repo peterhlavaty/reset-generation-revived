@@ -40,8 +40,11 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
 * Browser (`build-web`, `native/web`): the same C for wasm32 with our own small libc
   (`native/web/libc`), linked into a Rust crate. Guest addresses are linear-memory addresses
   (`M = 0`, fixed map above 0x10000000 in `native/rt/host.h`; an offset base breaks because clang
-  folds constant addresses into wasm load offsets). One thread: single-player only. Its frames
-  must equal rgtest's (`?keys=…&shots=…` + `cargo x img-diff`).
+  folds constant addresses into wasm load offsets). One thread (`RT_NO_THREADS`): its relay links
+  are the page's WebSockets (`native/web/src/link.rs`, polled), and net.c/server.c step their
+  network work on the game thread instead of blocking. Its frames must equal rgtest's
+  (`?keys=…&shots=…` + `cargo x img-diff`). Public at https://resetgeneration.rustyapps.com/
+  (`cargo x deploy-web`: static files in /var/www/resetgeneration, our nginx site).
 * Online: the engine waits for the room's server to speak first; Quick Match and hosted rooms
   are served by `server/` (rg-relay, Rust). Matches run on the hosting player's engine
   (`native/rt/server.c`). The desktop game runs the relay in-process for LAN games (the
@@ -67,6 +70,6 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
   `android-shot`, `android-log`. Screenshots go to `build/shots/`, logs to `build/logs/`.
 * Data: `pak list|extract`, `gfx`, `spc`, `sisx`, `split-ngage`.
 * Server: `server/` (`cargo test -p rg-server`, `cargo run -p rg-server -- --log-packets`);
-  `deploy`, `deploy-status`, `deploy-logs`, `deploy-ssh`, `undeploy` (settings in
+  `deploy`, `deploy-web`, `deploy-status`, `deploy-logs`, `deploy-ssh`, `undeploy` (settings in
   `deploy.local.ini`; the server also runs other sites — touch only our unit and nginx site).
 * CI: `.github/workflows/native.yml` builds the desktop game on Linux/macOS and the APK.

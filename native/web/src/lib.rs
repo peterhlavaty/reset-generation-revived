@@ -1,10 +1,11 @@
 //! Reset Generation in a web browser: the recompiled engine (C, built for wasm32 by
 //! `cargo x build-web`) with a canvas, the keyboard (and on-screen buttons on touch screens),
 //! Web Audio, the game data fetched into the engine's in-memory file system, and saves kept in
-//! localStorage. Single-player only: online play runs on the runtime's network threads
-//! (native/rt/net.c, link.c) and this build has one thread.
+//! localStorage. Online play (Quick Match, hosting with F5) goes through the page's WebSockets
+//! (link.rs) to the relay: `?server=ws://…/ws` picks another one than the public server.
 
 mod libc;
+mod link;
 mod saves;
 
 use js_sys::Uint8Array;
@@ -14,7 +15,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{AudioContext, AudioContextState, CanvasRenderingContext2d, HtmlCanvasElement, ImageData, KeyboardEvent, PointerEvent, Response};
+use web_sys::{AudioContext, AudioContextState, CanvasRenderingContext2d, HtmlCanvasElement, HtmlInputElement, ImageData, KeyboardEvent, PointerEvent, Response};
 
 const W: usize = 640;
 const H: usize = 360;
@@ -32,6 +33,7 @@ extern "C" {
     fn rg_fs_add(path: *const c_char, data: *const u8, len: usize) -> c_int;
     fn rg_web_clock() -> u32;
     fn rt_mem_init();
+    fn rg_net_configure(server: *const c_char, nick: *const c_char);
 }
 
 struct Game {
@@ -132,6 +134,7 @@ async fn run() -> Result<(), JsValue> {
     canvas.set_height(H as u32);
     let ctx: CanvasRenderingContext2d = canvas.get_context("2d")?.ok_or("no 2d canvas")?.dyn_into()?;
 
+    online(&doc)?;
     let c = |s: &str| CString::new(s).unwrap();
     unsafe {
         rg_use_virtual_clock(1); // see frame()
@@ -160,6 +163,67 @@ async fn run() -> Result<(), JsValue> {
     Ok(())
 }
 
+/// The relay and this player's name: `?server=` and `?nick=` from the address, else the name
+/// field's (kept in localStorage; made up at first, and then kept, so the relay knows this player
+/// when they come back to a match).
+fn online(doc: &web_sys::Document) -> Result<(), JsValue> {
+    let storage = window().local_storage().ok().flatten();
+    let mut nick = clean_nick(&param("nick"));
+    if nick.is_empty() {
+        nick = clean_nick(&storage.as_ref().and_then(|s| s.get_item(NICK).ok().flatten()).unwrap_or_default());
+    }
+    if nick.is_empty() {
+        nick = format!("Player{}", 1000 + (js_sys::Math::random() * 9000.0) as u32);
+    }
+    if let Some(s) = &storage {
+        let _ = s.set_item(NICK, &nick);
+    }
+    let server = param("server");
+    let c = |s: &str| CString::new(s).unwrap_or_default();
+    let server = c(if server.is_empty() { "online" } else { &server });
+    unsafe { rg_net_configure(server.as_ptr(), c(&nick).as_ptr()) };
+    let Some(field) = doc.get_element_by_id("nick").and_then(|e| e.dyn_into::<HtmlInputElement>().ok()) else { return Ok(()) };
+    field.set_value(&nick);
+    let f = field.clone();
+    let change = Closure::<dyn FnMut()>::new(move || {
+        let nick = clean_nick(&f.value());
+        if nick.is_empty() {
+            return;
+        }
+        f.set_value(&nick);
+        if let Some(s) = window().local_storage().ok().flatten() {
+            let _ = s.set_item(NICK, &nick);
+        }
+        let n = CString::new(nick).unwrap_or_default();
+        unsafe { rg_net_configure(std::ptr::null(), n.as_ptr()) }; // for the next login
+    });
+    field.add_event_listener_with_callback("change", change.as_ref().unchecked_ref())?;
+    change.forget();
+    let f = field.clone();
+    let done = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
+        if e.key() == "Enter" || e.key() == "Escape" {
+            let _ = f.blur(); // back to the game
+        }
+    });
+    field.add_event_listener_with_callback("keydown", done.as_ref().unchecked_ref())?;
+    done.forget();
+    Ok(())
+}
+
+const NICK: &str = "rg-nick";
+
+/// The relay's rule for names: 1 to 15 letters, digits or _.
+fn clean_nick(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(15).collect()
+}
+
+/// A parameter of the page address (`?name=value&…`), "" if it is not there.
+fn param(name: &str) -> String {
+    let search = window().location().search().unwrap_or_default();
+    let raw = search.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='));
+    raw.map(|s| js_sys::decode_uri_component(s).ok().and_then(|s| s.as_string()).unwrap_or_else(|| s.to_string())).unwrap_or_default()
+}
+
 /// Java AWT key codes (engine.h) for KeyboardEvent.code
 fn awt(code: &str) -> Option<c_int> {
     Some(match code {
@@ -171,6 +235,7 @@ fn awt(code: &str) -> Option<c_int> {
         "Escape" | "Backspace" => 27,
         "ControlLeft" | "ControlRight" => 17,
         "Space" => 32,
+        "F5" => 116, // host a game (native/rt/server.c), not "reload"
         _ => {
             let b = code.as_bytes();
             match (code.strip_prefix("Key"), code.strip_prefix("Digit")) {
@@ -211,8 +276,8 @@ fn input(doc: &web_sys::Document) -> Result<(), JsValue> {
     let w = window();
     for (ev, down) in [("keydown", true), ("keyup", false)] {
         let f = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
-            if e.alt_key() || e.meta_key() {
-                return; // browser shortcuts
+            if e.alt_key() || e.meta_key() || e.target().is_some_and(|t| t.is_instance_of::<HtmlInputElement>()) {
+                return; // browser shortcuts, typing a name
             }
             if let Some(code) = awt(&e.code()) {
                 e.prevent_default();
@@ -330,10 +395,6 @@ struct Test {
 }
 
 fn test_spec() -> Test {
-    let search = window().location().search().unwrap_or_default();
-    let param = |name: &str| {
-        search.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('=')).unwrap_or("").to_string()
-    };
     let key = |k: &str| match k.to_ascii_uppercase().as_str() {
         "ENTER" | "RETURN" => Some(10),
         "ESC" => Some(27),

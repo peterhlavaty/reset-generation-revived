@@ -8,6 +8,7 @@ Status (2026-11-25):
 | Server (`server/`, Rust: relay, casino, game rooms; binary `rg-relay`) | **Done**, tests in `server/tests` (`cargo test -p rg-server`); public instance at `wss://resetgeneration.rustyapps.com/ws` (`cargo x deploy`, see "Running a server") |
 | LAN without internet (desktop) | **Done** — the hosting game runs the relay in-process, clients find it by UDP broadcast (`server=auto`, the default); see "LAN relay" |
 | Client (`native/rt/net.c` + `native/rt/link.c`, replacing `SNAPMobileClient`) | **Done** (`wss://` and `ws://`): logs in with a nickname (no Arena login screen) and joins hosted games; verified desktop ↔ desktop (LAN and public server) and Android ↔ desktop |
+| Browser (https://resetgeneration.rustyapps.com/) | **Done**: joins and hosts like the other builds, through the page's WebSockets (`native/web/src/link.rs`; `net.c` and `server.c` stepped on the game thread, see `NATIVE_PORT.md`); verified browser ↔ desktop both ways. No LAN games |
 | Casino system (login, casino enter, Quick Match queue, lock, matched-up) | **Done** — both players listed in "Players in Match", "Game starting…" |
 | Game room bot (`server/src/gameroom.rs`: handshake, seating on 0x15, forwarding) | **Done** |
 | Game server (channel 0x16) | **Done** by the hosting player's engine (`native/rt/server.c`; verified host ↔ client, including a client killed and coming back) |
@@ -299,11 +300,16 @@ cargo test -p rg-server
 cargo x deploy           # build for Linux (static musl) and install it on the public server:
                          #   one binary, a systemd unit and an nginx site for the subdomain;
                          #   nothing else on that machine is touched
+cargo x deploy-web       # the browser version (dist/web) into /var/www/resetgeneration, served by
+                         #   the same nginx site at https://<domain>/ (static, precompressed .gz)
 cargo x deploy-status    # GET /status          cargo x deploy-logs [N]    journal lines
 cargo x deploy-ssh CMD   # one command there    cargo x undeploy           remove it again
 ```
 
-`deploy` reads `deploy.local.ini` (git-ignored; copy `deploy.example.ini`): host, user, SSH key
+The site sends `/ws` and `/status` to the relay and serves the browser version for everything else
+(on port 80 only `/ws` and `/status`; the rest redirects to https). `deploy` restarts the relay
+only when its binary or unit changed (a restart drops everyone connected). `deploy` reads
+`deploy.local.ini` (git-ignored; copy `deploy.example.ini`): host, user, SSH key
 (a passphrase can come from a file) and the domain. SSH is pure Rust (russh), no `ssh` needed.
 
 Clients: desktop `revived.ini` next to the program, Android `files/revived.ini` in the app's

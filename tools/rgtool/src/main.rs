@@ -74,7 +74,9 @@ Server
   deploy-status          GET /status of the public server
   deploy-logs [N]        the last N lines of the server's log (default 100)
   deploy-ssh CMD         run one command on the server
-  undeploy               remove the relay from the server again
+  deploy-web             build the browser version and put it on the public server (nginx
+                         serves it from the relay's site: https://<domain>/)
+  undeploy               remove the relay and the browser version from the server again
 ";
 
 fn main() {
@@ -114,6 +116,7 @@ fn main() {
         "android-shot" => android::shot(rest),
         "android-log" => android::log(rest),
         "deploy" => deploy::deploy(),
+        "deploy-web" => deploy::deploy_web(),
         "deploy-status" => deploy::status(),
         "deploy-logs" => deploy::logs(rest.first().and_then(|n| n.parse().ok()).unwrap_or(100)),
         "deploy-ssh" => deploy::remote(&rest.join(" ")),

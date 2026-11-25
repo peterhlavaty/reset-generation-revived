@@ -14,7 +14,8 @@
  * F5 (rg_key) or rg_host_request() opens a player-count picker drawn over the game
  * (rg_server_compose), then the engine's own hero select, then the LAN host screen. Everything
  * engine-facing runs on the game thread (rg_server_pump before each tick, and the stubs and hooks
- * the engine calls); the relay socket has a thread that only queues events.
+ * the engine calls); the relay socket has a thread that only queues events (in the browser build
+ * the same work is polled from rg_server_pump).
  *
  * Test mode (rgtest --server URL ROOM): hosts by itself once the menu is up. */
 #include "server.h"
@@ -122,15 +123,26 @@ static void send_serve(void) {
     host_log("host: offering room %s on %s for %d remote player(s)", room, url, remote_players);
 }
 
-/* connects (off the game thread: a dead server must not freeze the game), then reads */
-static void *link_thread(void *arg) {
-    (void)arg;
-    char buf[128];
-    const char *u = relay_for_hosting(net_server_url(), net_nickname(), buf, sizeof buf);
-    no_relay = !u;
-    rt_link *l = u ? link_open(u, "host") : NULL;
-    if (!l) { connecting = 0; return NULL; }
-    snprintf(url, sizeof url, "%s", u);
+/* a frame from the relay (op 1 text, 2 binary; msg NUL-terminated) */
+static void on_relay_frame(int op, const uint8_t *msg, size_t len) {
+    if (op == 1) {
+        char t[24];
+        json_str((const char *)msg, "t", t, sizeof t);
+        if (!strcmp(t, "player_joined")) {
+            char name[32];
+            json_str((const char *)msg, "name", name, sizeof name);
+            push_ev(EV_JOIN, json_int((const char *)msg, "pid", -1), name, (int)strlen(name) + 1);
+        } else if (!strcmp(t, "player_left")) {
+            push_ev(json_int((const char *)msg, "lost", 0) ? EV_LOST : EV_LEAVE, json_int((const char *)msg, "pid", -1), NULL, 0);
+        } else if (!strcmp(t, "error")) host_log("host: relay error %s", (const char *)msg);
+        else if (getenv("RT_NET_DEBUG")) host_log("host: relay %s", (const char *)msg);
+    } else if (len >= 2) {
+        push_ev(EV_DATA, msg[0] | msg[1] << 8, msg + 2, (int)len - 2);
+    }
+}
+
+/* the link is open: it becomes `ws` (with a reference of its own) and we introduce ourselves */
+static void link_up(rt_link *l) {
     link_ref(l);
     pthread_mutex_lock(&send_lock);
     ws = l;
@@ -139,33 +151,76 @@ static void *link_thread(void *arg) {
     connecting = 0;
     ws_send(1, "{\"t\":\"hello\",\"v\":1,\"name\":\"RGHost\"}", 35);
     if (serving) send_serve();
-    uint8_t *msg = (uint8_t *)malloc(1 << 20);
-    size_t len;
-    int op;
-    while ((op = link_read(l, msg, 1 << 20, &len)) != 0) {
-        if (op == 1) {
-            char t[24];
-            json_str((char *)msg, "t", t, sizeof t);
-            if (!strcmp(t, "player_joined")) {
-                char name[32];
-                json_str((char *)msg, "name", name, sizeof name);
-                push_ev(EV_JOIN, json_int((char *)msg, "pid", -1), name, (int)strlen(name) + 1);
-            } else if (!strcmp(t, "player_left")) {
-                push_ev(json_int((char *)msg, "lost", 0) ? EV_LOST : EV_LEAVE, json_int((char *)msg, "pid", -1), NULL, 0);
-            } else if (!strcmp(t, "error")) host_log("host: relay error %s", (char *)msg);
-            else if (getenv("RT_NET_DEBUG")) host_log("host: relay %s", (char *)msg);
-        } else if (len >= 2) {
-            push_ev(EV_DATA, msg[0] | msg[1] << 8, msg + 2, (int)len - 2);
-        }
-    }
-    free(msg);
+}
+
+/* the link ended: the reader's reference goes, and the game thread closes `ws` (EV_CLOSED) */
+static void link_down(rt_link *l) {
     link_release(l);
     pthread_mutex_lock(&send_lock);
     ws_up = 0;
     pthread_mutex_unlock(&send_lock);
     push_ev(EV_CLOSED, 0, NULL, 0);
+}
+
+static rt_link *open_relay(void) {
+    char buf[128];
+    const char *u = relay_for_hosting(net_server_url(), net_nickname(), buf, sizeof buf);
+    no_relay = !u;
+    rt_link *l = u ? link_open(u, "host") : NULL;
+    if (l) snprintf(url, sizeof url, "%s", u);
+    return l;
+}
+
+#ifndef RT_NO_THREADS
+/* connects (off the game thread: a dead server must not freeze the game), then reads */
+static void *link_thread(void *arg) {
+    (void)arg;
+    rt_link *l = open_relay();
+    if (!l) { connecting = 0; return NULL; }
+    link_up(l);
+    uint8_t *msg = (uint8_t *)malloc(1 << 20);
+    size_t len;
+    int op;
+    while ((op = link_read(l, msg, 1 << 20, &len)) != 0) on_relay_frame(op, msg, len);
+    free(msg);
+    link_down(l);
     return NULL;
 }
+#else
+/* Without threads (the browser build): the same, stepped from rg_server_pump. */
+static rt_link *pending;                 /* the link being opened or read (the reader's reference) */
+static uint32_t pending_since;
+
+static void link_start(void) {
+    pending = open_relay();
+    pending_since = host_time_ms();
+    if (!pending) connecting = 0;
+}
+
+static void link_step(void) {
+    if (!pending) return;
+    if (!ws_up) {                        /* still connecting */
+        int s = link_state(pending);
+        if (s == 1) link_up(pending);
+        else if (s < 0 || host_time_ms() - pending_since > 10000) {
+            link_close(pending);
+            link_release(pending);
+            pending = NULL;
+            connecting = 0;
+        }
+        return;
+    }
+    static uint8_t *msg;
+    if (!msg) msg = (uint8_t *)malloc(1 << 20);
+    for (;;) {
+        size_t len;
+        int op = link_poll(pending, msg, 1 << 20, &len);
+        if (op == 0) return;
+        if (op < 0) { link_down(pending); pending = NULL; return; }
+        on_relay_frame(op, msg, len);
+    }
+}
+#endif
 
 /* ------------------------------------------------------------------ sessions */
 typedef struct {
@@ -799,14 +854,21 @@ void rg_server_pump(void) {
         rg_engine_key(0, 39);
     }
     if (!picker) nudged_picker = 0;
+#ifdef RT_NO_THREADS
+    link_step();                         /* also after hosting ended: the closed link is let go */
+#endif
     if (!hosting) return;
     static uint32_t retry, last_ping;
     if (!ws_up && !connecting && !ws && (now - retry > 2000 || !retry)) {
         retry = now ? now : 1;
         connecting = 1;
+#ifdef RT_NO_THREADS
+        link_start();
+#else
         pthread_t t;
         if (pthread_create(&t, NULL, link_thread, NULL) == 0) pthread_detach(t);
-        else connecting = 0, no_relay = 1;   /* no threads (the browser build) */
+        else connecting = 0, no_relay = 1;   /* threads cannot be started */
+#endif
     }
     if (ws_up && now - last_ping > 15000) { last_ping = now; ws_send(1, "{\"t\":\"ping\"}", 12); }
     track_seats();

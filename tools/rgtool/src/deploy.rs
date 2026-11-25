@@ -1,7 +1,8 @@
 //! `cargo x deploy`: puts the relay (server/) on the public server, next to whatever else runs
 //! there, without touching it: one static binary, one systemd unit and one nginx site for its own
 //! subdomain (wss on 443 for the games and browsers, plain ws on port 80 for older builds and as
-//! the games' fallback).
+//! the games' fallback). `cargo x deploy-web`: the browser version (dist/web) into that site's
+//! folder, served by nginx as static files, like the other web apps on that server.
 //!
 //! Settings: deploy.local.ini in the repository root (git-ignored, see deploy.example.ini).
 //! SSH is pure Rust (russh): the key, even a passphrase-protected one, is decoded in memory.
@@ -24,6 +25,8 @@ const SITE: &str = "/etc/nginx/sites-available/rg-relay.conf";
 const ENABLED: &str = "/etc/nginx/sites-enabled/rg-relay.conf";
 const MARK: &str = "# Reset Generation Revived relay (written by rgtool deploy)";
 const PORT: u16 = 8787;
+/// The browser version: static files of our site (outside the folders other tools manage).
+const WEB: &str = "/var/www/resetgeneration";
 
 pub struct Settings {
     host: String,
@@ -121,6 +124,19 @@ impl Ssh {
         Ok(())
     }
 
+    /// Several files under `dir` in one SFTP session (their folders must exist).
+    pub async fn upload_all(&self, dir: &str, files: &[(String, Vec<u8>)]) -> R<()> {
+        let ch = self.handle.channel_open_session().await?;
+        ch.request_subsystem(true, "sftp").await?;
+        let sftp = SftpSession::new(ch.into_stream()).await?;
+        for (name, data) in files {
+            let mut f = sftp.open_with_flags(format!("{dir}/{name}"), OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE).await?;
+            f.write_all(data).await?;
+            f.shutdown().await?;
+        }
+        Ok(())
+    }
+
     pub async fn close(&self) {
         let _ = self.handle.disconnect(Disconnect::ByApplication, "", "en").await;
     }
@@ -160,9 +176,8 @@ WantedBy=multi-user.target
 }
 
 fn site(domain: &str, cert: Option<(&str, &str)>) -> String {
-    let loc = format!(
-        "    location / {{
-        proxy_pass http://127.0.0.1:{PORT};
+    let proxy = format!(
+        "        proxy_pass http://127.0.0.1:{PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $rg_relay_connection;
@@ -170,9 +185,27 @@ fn site(domain: &str, cert: Option<(&str, &str)>) -> String {
         proxy_buffering off;
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
+"
+    );
+    let relay = format!("    location = /ws {{\n{proxy}    }}\n    location = /status {{\n{proxy}    }}\n");
+    // the browser version: precompressed (deploy-web writes a .gz next to what compresses well),
+    // and "no-cache": its file names do not change between builds, so a browser asks every time
+    // (the ETag makes that a 304)
+    let web = format!(
+        "    root {WEB};
+    index index.html;
+    types {{ application/wasm wasm; }}
+    include /etc/nginx/mime.types;
+    gzip_static on;
+    gzip_vary on;
+    location / {{
+        add_header Cache-Control \"no-cache\";
+        try_files $uri $uri/ =404;
     }}
 "
     );
+    // port 80: the relay for plain ws; the page itself only over https when there is a certificate
+    let plain = if cert.is_some() { "    location / {\n        return 301 https://$host$request_uri;\n    }\n".to_string() } else { web.clone() };
     let mut s = format!(
         "{MARK}
 # Only this subdomain: everything else on this server keeps its own configuration.
@@ -181,12 +214,12 @@ map $http_upgrade $rg_relay_connection {{
     ''      close;
 }}
 
-# Plain ws for older game builds and the games' TLS fallback: no redirect to https.
+# Plain ws for older game builds and the games' TLS fallback: no redirect to https for /ws.
 server {{
     listen 80;
     listen [::]:80;
     server_name {domain};
-{loc}}}
+{relay}{plain}}}
 "
     );
     if let Some((crt, key)) = cert {
@@ -198,7 +231,7 @@ server {{
     server_name {domain};
     ssl_certificate     {crt};
     ssl_certificate_key {key};
-{loc}}}
+{relay}{web}}}
 "
         );
     }
@@ -259,13 +292,23 @@ pub fn deploy() -> R<()> {
         if cert.is_none() {
             println!("no TLS certificate found: serving plain ws only");
         }
-        // 2. The binary, swapped in atomically.
+        // 2. The binary and the service, swapped in atomically; the relay is restarted (which
+        //    drops everyone connected) only when one of them changed.
         ssh.run(&format!("mkdir -p {DIR}")).await?;
         ssh.upload(&format!("{DIR}/rg-relay.new"), &bin).await?;
-        ssh.run(&format!("chmod 755 {DIR}/rg-relay.new && mv -f {DIR}/rg-relay.new {DIR}/rg-relay")).await?;
-        // 3. The service.
-        ssh.upload(UNIT, unit().as_bytes()).await?;
-        ssh.run("systemctl daemon-reload && systemctl enable -q rg-relay && systemctl restart rg-relay").await?;
+        ssh.upload(&format!("{DIR}/rg-relay.service.new"), unit().as_bytes()).await?;
+        let (_, changed) = ssh
+            .exec(&format!(
+                "cd {DIR} && n=0; cmp -s rg-relay.new rg-relay || n=1; cmp -s rg-relay.service.new {UNIT} || n=1; \
+                 chmod 755 rg-relay.new && mv -f rg-relay.new rg-relay && mv -f rg-relay.service.new {UNIT} && echo $n"
+            ))
+            .await?;
+        let (_, active) = ssh.exec("systemctl is-active rg-relay").await?;
+        if changed.trim() == "0" && active.trim() == "active" {
+            println!("rg-relay unchanged and running: not restarted");
+        } else {
+            ssh.run("systemctl daemon-reload && systemctl enable -q rg-relay && systemctl restart rg-relay").await?;
+        }
         // 4. The nginx site; on a config error it is removed again and nginx is left as it was.
         ssh.upload(SITE, site(&s.domain, cert).as_bytes()).await?;
         ssh.run(&format!("ln -sf {SITE} {ENABLED}")).await?;
@@ -330,16 +373,92 @@ pub fn remote(cmd: &str) -> R<()> {
     })
 }
 
-/// Removes everything deploy added (binary, unit, site).
+/// `deploy-web`: builds the browser version and puts it on the server (into WEB, swapped in at
+/// once), with a gzip copy of each file that compresses by a tenth or more (gzip_static).
+pub fn deploy_web() -> R<()> {
+    use flate2::{write::GzEncoder, Compression};
+    let s = settings()?;
+    crate::web::build(&[])?;
+    let dist = root().join("dist/web");
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut dirs = vec![String::new()];
+    let mut todo = vec![dist.clone()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d)?.flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(&dist)?.to_string_lossy().replace('\\', "/");
+            if p.is_dir() {
+                dirs.push(rel);
+                todo.push(p);
+                continue;
+            }
+            let data = std::fs::read(&p)?;
+            let mut gz = GzEncoder::new(Vec::new(), Compression::best());
+            gz.write_all(&data)?;
+            let gz = gz.finish()?;
+            if gz.len() < data.len() / 10 * 9 {
+                files.push((format!("{rel}.gz"), gz));
+            }
+            files.push((rel, data));
+        }
+    }
+    let total: usize = files.iter().map(|f| f.1.len()).sum();
+    println!("uploading {} files, {} MB", files.len(), total >> 20);
+    block_on(async {
+        let ssh = Ssh::connect(&s).await?;
+        let stage = format!("{WEB}.new");
+        let mk: Vec<String> = dirs.iter().map(|d| format!("'{stage}/{d}'")).collect();
+        ssh.run(&format!("rm -rf {stage} && mkdir -p {}", mk.join(" "))).await?;
+        ssh.upload_all(&stage, &files).await?;
+        ssh.run(&format!(
+            "chmod -R a+rX {stage} && rm -rf {WEB}.old && {{ test ! -e {WEB} || mv {WEB} {WEB}.old; }} && mv {stage} {WEB} && rm -rf {WEB}.old"
+        ))
+        .await?;
+        // through nginx, as a browser would get it
+        let d = &s.domain;
+        let (_, code) = ssh
+            .exec(&format!("curl -s -o /dev/null -w '%{{http_code}} %{{size_download}}' -H 'Accept-Encoding: gzip' --resolve {d}:443:127.0.0.1 https://{d}/rg_web_bg.wasm"))
+            .await?;
+        println!("https://{d}/rg_web_bg.wasm: HTTP {code} bytes (gzip)");
+        ssh.close().await;
+        if !code.starts_with("200") {
+            return Err("nginx does not serve the browser version (run `cargo x deploy` for the site)".into());
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    println!("the browser version is at https://{}/", s.domain);
+    Ok(())
+}
+
+/// Removes everything deploy and deploy-web added (binary, unit, site, the browser version).
 pub fn undeploy() -> R<()> {
     let s = settings()?;
     block_on(async {
         let ssh = Ssh::connect(&s).await?;
         ssh.run(&format!(
-            "systemctl disable --now rg-relay 2>/dev/null; rm -f {ENABLED} {SITE} {UNIT}; rm -rf {DIR}; systemctl daemon-reload; nginx -t && systemctl reload nginx"
+            "systemctl disable --now rg-relay 2>/dev/null; rm -f {ENABLED} {SITE} {UNIT}; rm -rf {DIR} {WEB}; systemctl daemon-reload; nginx -t && systemctl reload nginx"
         ))
         .await?;
         ssh.close().await;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn site_routes() {
+        let tls = site("rg.example.com", Some(("/c.pem", "/k.pem")));
+        // the relay on both ports, the page over https only
+        assert_eq!(tls.matches("location = /ws {").count(), 2);
+        assert_eq!(tls.matches("location = /status {").count(), 2);
+        assert_eq!(tls.matches(&format!("root {WEB};")).count(), 1);
+        assert!(tls.contains("return 301 https://$host$request_uri;"));
+        assert_eq!(tls.matches('{').count(), tls.matches('}').count());
+        let plain = site("rg.example.com", None);
+        assert!(plain.contains(&format!("root {WEB};")) && !plain.contains("return 301"));
+        println!("{tls}");
+    }
 }

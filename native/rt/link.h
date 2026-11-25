@@ -22,6 +22,18 @@ int link_read(rt_link *l, uint8_t *buf, size_t cap, size_t *len);
 /* Sends a close frame and shuts the connection down: a blocked link_read returns 0. */
 void link_close(rt_link *l);
 
+/* The browser build has one thread (RT_NO_THREADS): its links (the page's WebSocket,
+ * native/web/src/link.rs) never block. link_open returns at once and connects in the background;
+ * net.c and server.c step their work on the game thread and poll. */
+#if defined(__wasm__) && !defined(RT_NO_THREADS)
+#define RT_NO_THREADS
+#endif
+#ifdef RT_NO_THREADS
+int link_state(rt_link *l);   /* 0 connecting, 1 open, -1 closed or failed */
+/* link_read that does not wait: 1 or 2 a frame, 0 nothing yet, -1 the connection ended */
+int link_poll(rt_link *l, uint8_t *buf, size_t cap, size_t *len);
+#endif
+
 /* The relay to join through for a server setting: "online" (or empty) the public server, "auto" a
  * game hosted on the LAN if one answers within 2.5 s else the public server, "lan" only the LAN
  * (20 s), anything else is the address itself. Blocks; NULL if nothing was found. */

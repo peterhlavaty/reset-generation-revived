@@ -1,4 +1,6 @@
-/* Relay client (WebSocket links: link.c) and the SNAP Mobile login/room state machine. */
+/* Relay client (WebSocket links: link.c, in the browser native/web/src/link.rs) and the SNAP
+ * Mobile login/room state machine: on a worker thread, or without threads (the browser build,
+ * RT_NO_THREADS) stepped on the game thread. */
 #include "net.h"
 #include "engine.h"
 #include "host.h"
@@ -129,6 +131,45 @@ static void on_disconnect(int gen) {
     }
 }
 
+#ifdef RT_NO_THREADS
+static char want[24];            /* the reply type the request in progress waits for (req_start) */
+static char want_reply[512];     /* and the reply */
+static int want_got;             /* 1 that reply came, -1 an error did */
+#endif
+
+/* a frame from the relay (op 1 text, 2 binary; msg NUL-terminated) */
+static void on_frame(int op, const uint8_t *msg, size_t len) {
+    if (op == 1) {                                   /* text: control reply / notice */
+        char t[24];
+        json_str((const char *)msg, "t", t, sizeof t);
+        if (!strcmp(t, "pong") || !strcmp(t, "peer_joined") || !strcmp(t, "peer_left")) return;
+        pthread_mutex_lock(&lock);
+        if (!strcmp(t, "joined") && entering[0]) {   /* before the packets behind it */
+            snprintf(room, sizeof room, "%s", entering);
+            in_room = 1;
+            entering[0] = 0;
+            push(&events, mk(E_CONNECTED, 0, NULL, NULL, 0));
+        }
+        snprintf(reply, sizeof reply, "%s", (const char *)msg);
+        reply_seq++;
+#ifdef RT_NO_THREADS
+        if (want[0] && (!strcmp(t, want) || !strcmp(t, "error"))) {
+            want_got = !strcmp(t, want) ? 1 : -1;
+            snprintf(want_reply, sizeof want_reply, "%s", (const char *)msg);
+            want[0] = 0;
+        }
+#endif
+        pthread_cond_broadcast(&reply_cv);
+        pthread_mutex_unlock(&lock);
+    } else {                                         /* binary: game packet */
+        pthread_mutex_lock(&lock);
+        int ok = in_room && len <= MAX_PACKET;
+        pthread_mutex_unlock(&lock);
+        if (ok) add_event(mk(E_DATA, 0, room, msg, (int)len));
+    }
+}
+
+#ifndef RT_NO_THREADS
 typedef struct { rt_link *l; int gen; } reader_arg;
 
 static void *reader(void *arg) {
@@ -137,29 +178,7 @@ static void *reader(void *arg) {
     uint8_t *msg = (uint8_t *)malloc(65536);
     size_t len;
     int op;
-    while ((op = link_read(a.l, msg, 65536, &len)) != 0) {
-        if (op == 1) {                                   /* text: control reply / notice */
-            char t[24];
-            json_str((char *)msg, "t", t, sizeof t);
-            if (!strcmp(t, "pong") || !strcmp(t, "peer_joined") || !strcmp(t, "peer_left")) continue;
-            pthread_mutex_lock(&lock);
-            if (!strcmp(t, "joined") && entering[0]) {   /* before the packets behind it */
-                snprintf(room, sizeof room, "%s", entering);
-                in_room = 1;
-                entering[0] = 0;
-                push(&events, mk(E_CONNECTED, 0, NULL, NULL, 0));
-            }
-            snprintf(reply, sizeof reply, "%s", (char *)msg);
-            reply_seq++;
-            pthread_cond_broadcast(&reply_cv);
-            pthread_mutex_unlock(&lock);
-        } else {                                         /* binary: game packet */
-            pthread_mutex_lock(&lock);
-            int ok = in_room && len <= MAX_PACKET;
-            pthread_mutex_unlock(&lock);
-            if (ok) add_event(mk(E_DATA, 0, room, msg, (int)len));
-        }
-    }
+    while ((op = link_read(a.l, msg, 65536, &len)) != 0) on_frame(op, msg, len);
     free(msg);
     link_release(a.l);
     on_disconnect(a.gen);
@@ -192,6 +211,7 @@ static int request(const char *json, const char *type, char *out, size_t n) {
     pthread_mutex_unlock(&lock);
     return got == 1;
 }
+#endif
 
 static void ws_close(void) {
     pthread_mutex_lock(&send_lock);
@@ -200,6 +220,10 @@ static void ws_close(void) {
     pthread_mutex_unlock(&send_lock);
     if (l) { link_close(l); link_release(l); }
 }
+
+#ifdef RT_NO_THREADS
+static int link_dead;             /* the link ended (link_poll said so) */
+#endif
 
 static int ws_connect(void) {
     char found[128];
@@ -214,6 +238,10 @@ static int ws_connect(void) {
     pthread_mutex_lock(&lock);
     int gen = ++ws_generation;
     pthread_mutex_unlock(&lock);
+#ifdef RT_NO_THREADS
+    (void)gen;
+    link_dead = 0;
+#else
     reader_arg *a = (reader_arg *)malloc(sizeof *a);
     a->l = l;
     a->gen = gen;
@@ -221,10 +249,12 @@ static int ws_connect(void) {
     pthread_t t;
     pthread_create(&t, NULL, reader, a);
     pthread_detach(t);
+#endif
     return 1;
 }
 
 /* ------------------------------------------------------------------ worker */
+#ifndef RT_NO_THREADS
 static int enter_room(const char *op, const char *name) {
     char json[160], out[512];
     if (in_room && strcmp(room, name) != 0) {
@@ -276,6 +306,7 @@ static void do_login(void) {
     add_event(mk(E_LOGIN_DONE, 0, NULL, NULL, 0));
     login_in_progress = 0;
 }
+#endif
 
 static void do_logout(void) {
     pthread_mutex_lock(&lock);
@@ -290,6 +321,7 @@ static void do_logout(void) {
     pthread_mutex_unlock(&lock);
 }
 
+#ifndef RT_NO_THREADS
 static void *worker(void *arg) {
     (void)arg;
     for (;;) {
@@ -346,12 +378,180 @@ static void *pinger(void *arg) {
     return NULL;
 }
 
+#else
+/* ------------------------------------------------------------------ worker without threads
+ * The browser build: the same actions, one at a time, stepped on the game thread (net_step,
+ * before every tick) instead of blocking: a request is sent (req_start) and its reply looked for
+ * in the frames on_frame saw (req_poll). */
+static item *cur;                /* the action in progress */
+static int stage;
+static uint32_t wait_until;
+
+static int due(uint32_t t) { return (int32_t)(host_time_ms() - t) >= 0; }
+
+static void req_start(const char *json, const char *type) {
+    snprintf(want, sizeof want, "%s", type);
+    want_got = 0;
+    want_reply[0] = 0;
+    wait_until = host_time_ms() + REQUEST_TIMEOUT_MS;
+    if (!ws_send(1, json, strlen(json))) want_got = -1;
+}
+/* 0 still waiting, 1 the reply came (want_reply), -1 an error, a timeout or a lost link */
+static int req_poll(void) {
+    if (!want_got && (link_dead || !ws || due(wait_until))) want_got = -1;
+    if (want_got) want[0] = 0;
+    return want_got;
+}
+
+/* the frames that came in */
+static void pump_link(void) {
+    static uint8_t *msg;
+    if (!msg) msg = (uint8_t *)malloc(65536);
+    while (ws && !link_dead) {
+        size_t len;
+        int op = link_poll(ws, msg, 65536, &len);
+        if (op == 0) return;
+        if (op < 0) { link_dead = 1; on_disconnect(ws_generation); return; }
+        on_frame(op, msg, len);
+    }
+}
+
+static int step_login(void) {   /* 1 when done */
+    char json[120];
+    switch (stage) {
+    case 0:
+        login_in_progress = 1;
+        if (logged_in && ws) { credentials_ok = 1; add_event(mk(E_LOGIN_DONE, 0, NULL, NULL, 0)); login_in_progress = 0; return 1; }
+        net_nickname();
+        if (!ws_connect()) { err_state = 3; login_in_progress = 0; return 1; }
+        wait_until = host_time_ms() + REQUEST_TIMEOUT_MS;
+        stage = 1;
+        return 0;
+    case 1: {
+        int s = link_state(ws);
+        if (s == 0 && !due(wait_until)) return 0;
+        if (s != 1) { host_log("net: cannot connect to %s", ws_url); ws_close(); err_state = 3; login_in_progress = 0; return 1; }
+        snprintf(json, sizeof json, "{\"t\":\"hello\",\"v\":1,\"name\":\"%s\"}", nickname);
+        req_start(json, "welcome");
+        stage = 2;
+        return 0;
+    }
+    default: {
+        int r = req_poll();
+        if (!r) return 0;
+        if (r < 0) {
+            host_log("net: login rejected: %s", want_reply);
+            ws_close();
+            err_state = 2;
+            login_in_progress = 0;
+            return 1;
+        }
+        char name[32];
+        json_str(want_reply, "name", name, sizeof name);
+        host_log("net: logged in to %s as %s", ws_url, name);
+        logged_in = 1;
+        credentials_ok = 1;
+        add_event(mk(E_LOGIN_DONE, 0, NULL, NULL, 0));
+        login_in_progress = 0;
+        return 1;
+    }
+    }
+}
+
+/* enter_room in steps: 0 not yet, 1 in the room, -1 failed */
+static int step_room(const char *op, const char *name) {
+    char json[160];
+    if (stage == 0) {
+        if (in_room && strcmp(room, name) != 0) { req_start("{\"t\":\"leave\"}", "left"); stage = 1; return 0; }
+        stage = 2;
+    }
+    if (stage == 1) {
+        if (!req_poll()) return 0;
+        add_event(mk(E_LEFT_ROOM, 0, room, NULL, 0));
+        in_room = 0;
+        stage = 2;
+    }
+    if (stage == 2) {
+        snprintf(json, sizeof json, "{\"t\":\"%s\",\"room\":\"%s\"}", op, name);
+        snprintf(entering, sizeof entering, "%s", name);   /* see enter_room */
+        req_start(json, "joined");
+        stage = 3;
+        return 0;
+    }
+    int r = req_poll();
+    if (!r) return 0;
+    entering[0] = 0;
+    if (r > 0) return 1;
+    char code[32];
+    json_str(want_reply, "code", code, sizeof code);
+    host_log("net: %s(%s) failed: %s", op, name, code[0] ? code : "timeout");
+    in_room = 0;
+    return -1;
+}
+
+static int step(item *it) {     /* 1 when the action is done */
+    switch (it->kind) {
+    case A_LOGIN: return step_login();
+    case A_LOGOUT: do_logout(); return 1;
+    case A_CREATE: return step_room("create", it->name) != 0;
+    case A_MOVE: return step_room("move", it->name) != 0;
+    case A_JOIN:
+        if (stage == 10) {                            /* waiting before the retry */
+            if (!due(wait_until)) return 0;
+            join_retries++;
+            add_event(mk(E_JOIN_RETRY, 0, it->name, NULL, 0));
+            return 1;
+        }
+        switch (step_room("join", it->name)) {
+        case 0: return 0;
+        case 1: return 1;
+        }
+        if (join_retries < 4) { stage = 10; wait_until = host_time_ms() + 3000; return 0; }
+        err_state = 3;
+        add_event(mk(E_NAF, 2, NULL, NULL, 0));
+        add_action(mk(A_LOGOUT, 0, NULL, NULL, 0), 1);
+        return 1;
+    case A_LEAVE:
+        if (stage == 0 && in_room && !strcmp(room, it->name)) { req_start("{\"t\":\"leave\"}", "left"); stage = 1; }
+        if (stage == 1) {
+            if (!req_poll()) return 0;
+            in_room = 0;
+        }
+        add_event(mk(E_LEFT_ROOM, 0, it->name, NULL, 0));
+        return 1;
+    case A_SEND:
+        if (!ws_send(2, it->data, (size_t)it->len)) on_disconnect(ws_generation);
+        return 1;
+    case A_FRIENDS: add_event(mk(E_FRIENDS, 0, NULL, NULL, 0)); return 1;
+    }
+    return 1;
+}
+
+static void net_step(void) {
+    if (!running) return;
+    pump_link();
+    static uint32_t last_ping;
+    if (logged_in && host_time_ms() - last_ping > 15000) { last_ping = host_time_ms(); ws_send(1, "{\"t\":\"ping\"}", 12); }
+    for (int n = 0; n < 64; n++) {               /* the sends of a tick go out in that tick */
+        if (!cur) {
+            cur = pop(&actions);
+            stage = 0;
+            if (!cur) return;
+        }
+        if (!step(cur)) return;
+        free(cur);
+        cur = NULL;
+    }
+}
+#endif
+
 /* ------------------------------------------------------------------ engine-facing */
-static int no_threads;   /* threads cannot be started (the browser build): logins fail at once */
+static int no_threads;   /* threads cannot be started: logins fail at once */
 
 int net_init(void) {
     if (!running) {
         running = 1;
+#ifndef RT_NO_THREADS
         pthread_t t;
         if (pthread_create(&t, NULL, worker, NULL) != 0) {
             no_threads = 1;
@@ -361,6 +561,7 @@ int net_init(void) {
         pthread_detach(t);
         pthread_create(&t, NULL, pinger, NULL);
         pthread_detach(t);
+#endif
     }
     return 1;
 }
@@ -402,6 +603,9 @@ int net_send(int len) {
 void net_friend_list(void) { add_action(mk(A_FRIENDS, 0, NULL, NULL, 0), 0); }
 
 void net_dispatch_events(void) {
+#ifdef RT_NO_THREADS
+    net_step();
+#endif
     for (;;) {
         pthread_mutex_lock(&lock);
         item *it = pop(&events);

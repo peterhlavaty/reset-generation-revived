@@ -77,7 +77,8 @@ pub fn build(_args: &[String]) -> R<()> {
     gen_flags.push("-w".into());
     let mut objs = compile_all(&cc, &gen_flags, &c_files(&gen), &obj.join("gen"), &headers)?;
     flags.extend(["-Wall", "-Wno-unused-function"].iter().map(|s| s.to_string()));
-    // no sockets in a page: link.c is replaced by native/web/c/web.c
+    // no sockets in a page: link.c is replaced by its WebSockets (native/web/src/link.rs; the relay
+    // choice in native/web/c/web.c)
     let mut own: Vec<PathBuf> = c_files(&rt).into_iter().filter(|p| !p.ends_with("link.c")).collect();
     own.extend(c_files(&web.join("c")));
     objs.extend(compile_all(&cc, &flags, &own, &obj.join("rt"), &headers)?);
@@ -128,12 +129,17 @@ const PAGE: &str = r#"<!doctype html>
   #pad { display: none; position: fixed; inset: 0; pointer-events: none; }
   #pad button { pointer-events: auto; position: absolute; width: 64px; height: 64px; border-radius: 32px; border: 2px solid #fff6;
                 background: #fff2; color: #fffa; font: bold 20px sans-serif; touch-action: none; user-select: none; -webkit-user-select: none; }
-  @media (pointer: coarse) { #pad { display: block; } }
+  @media (pointer: coarse) { #pad { display: block; } #bar .hint { display: none; } }
+  #bar { position: fixed; top: 6px; left: 8px; font-size: 13px; opacity: .45; transition: opacity .2s; }
+  #bar:hover, #bar:focus-within { opacity: 1; }
+  #bar input { width: 9em; background: #111; color: #eee; border: 1px solid #555; border-radius: 3px; font: inherit; padding: 1px 4px; }
 </style>
 </head>
 <body>
 <canvas id="screen" width="640" height="360"></canvas>
 <div id="status">Loading...</div>
+<div id="bar"><label>Online name <input id="nick" maxlength="15" spellcheck="false" autocomplete="off"></label>
+  <span class="hint">&middot; F5 hosts a game, others join it with Quick Match</span></div>
 <div id="pad">
   <button data-key="38" style="left:80px; bottom:144px">&#9650;</button>
   <button data-key="37" style="left:12px; bottom:76px">&#9664;</button>
@@ -141,6 +147,7 @@ const PAGE: &str = r#"<!doctype html>
   <button data-key="40" style="left:80px; bottom:8px">&#9660;</button>
   <button data-key="10" style="right:12px; bottom:60px; width:80px; height:80px; border-radius:40px">OK</button>
   <button data-key="27" style="right:12px; top:12px">X</button>
+  <button data-key="116" style="right:12px; top:84px; font-size:13px">HOST</button>
 </div>
 <script type="module">import init from "./rg_web.js"; init();</script>
 </body>

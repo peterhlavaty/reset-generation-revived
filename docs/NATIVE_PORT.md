@@ -120,11 +120,11 @@ engine DLL in a 32-bit Java host (`docs/WINDOWS_PORT.md`).
 
 `cargo x build-web` → `dist/web/` (a static site: `index.html`, `rg_web.js`, `rg_web_bg.wasm`
 ~12 MB / ~3 MB compressed, `data/` ~32 MB); `cargo x serve-web [PORT]` serves it on
-`http://localhost:8080/`. Single-player (and the tutorial); online play needs the runtime's
-network threads (`net.c`, `link.c`), which this one-threaded build does not have — a browser
-WebSocket version of `link.c` would bring it back.
+`http://localhost:8080/`. Public copy: **https://resetgeneration.rustyapps.com/** (`cargo x
+deploy-web`: static files, served by nginx from the relay's site). Everything the other builds do,
+online play included (Quick Match, hosting with F5 or the HOST touch button), except LAN games.
 
-* **Build.** The generated C, `native/rt` (without `link.c`) and `native/web/c/web.c` are compiled
+* **Build.** The generated C, `native/rt` (without `link.c`) and `native/web/c` are compiled
   for `wasm32-unknown-unknown` with clang (the Android NDK's, or `RG_WASM_CC`/`RG_WASM_AR`) against
   a small C library of our own (`native/web/libc`: strings, printf family, a case-insensitive
   in-memory file system, pthread stubs that refuse threads), archived as
@@ -148,6 +148,16 @@ WebSocket version of `link.c` would bring it back.
 * **Input and sound.** Keyboard (arrows, Enter, Esc/Backspace, Ctrl, Space, letters); on touch
   screens on-screen buttons (`data-key` elements). Web Audio plays the 8 kHz mix in short
   buffers ~0.1 s ahead, once the player has pressed something (browsers block sound before).
+* **Online.** One thread, so nothing may block (`RT_NO_THREADS`, set for wasm in `link.h`): the
+  relay links are the page's WebSockets (`native/web/src/link.rs`: `link_open` returns at once,
+  frames queue up between animation frames, `link_poll` hands them out), and the work that runs
+  on threads elsewhere is stepped on the game thread before every tick — `net.c`'s worker as a
+  state machine (one action at a time; a request is sent and its reply looked for in the frames
+  that came in), `server.c`'s relay link from `rg_server_pump`. The relay is the public server
+  (`?server=ws://…/ws` picks another; a page cannot find LAN games). The name comes from the
+  field at the top left (`?nick=`), kept in `localStorage` (`rg-nick`; made up at first). F5 is
+  the host key there, not "reload". Verified 2026-11-25: browser ↔ desktop both ways (each one
+  hosting) on a local relay, and the deployed page joining a desktop host on the public server.
 * **Testing.** `?keys=F:KEY,…&shots=F,…` in the page address presses keys and takes screenshots
   at engine frames like rgtest's `--keys`/`--shots` (the page then pulls sound like rgtest, so
   the frames match); `serve-web` saves the shots as `build/shots/web-FFFFF.png`, and

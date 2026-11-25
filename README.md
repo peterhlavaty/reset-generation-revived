@@ -9,7 +9,7 @@ recompiled), in widescreen, and back online with our own server.
 | Desktop: Windows, Linux, macOS (one executable + data; fullscreen on Windows) | **Playable**, hosts and joins online and LAN games — `cargo x build-desktop` → `dist/ResetGeneration-Revived-<os>/` (+ .zip). Tested on Windows; Linux/macOS are built by CI (`.github/workflows/native.yml`) |
 | Android (phones, tablets, Chromebooks; touch + gamepad) | **Playable test build**, hosts and joins online games — `cargo x build-android` → `dist/ResetGeneration-Revived-<version>.apk` (sideload) |
 | Online server (relay + matchmaking, Rust) | **Running** at `resetgeneration.rustyapps.com` — `cargo x deploy` |
-| Web browser (WebAssembly) | **Playable, single-player** (keyboard, touch buttons; saves in the browser) — `cargo x build-web` → `dist/web/` (static files), `cargo x serve-web` to try it |
+| Web browser (WebAssembly) | **Playable at https://resetgeneration.rustyapps.com/**, online play included (keyboard, touch buttons; saves in the browser) — `cargo x build-web` → `dist/web/` (static files), `cargo x serve-web` to try it, `cargo x deploy-web` to publish it |
 
 Multiplayer in short: press **F5** in the main menu (Android: the HOST button), choose the number of
 players and a hero; everyone else (desktop or Android) chooses **Online → Quick Match**. The games
@@ -36,7 +36,7 @@ Running and testing: `cargo x run`, `cargo x lan-test 3` (a host and two clients
 `cargo x keys "RETURN,DOWN" shot` (drive the game window and take a screenshot), `cargo x
 native-test`, `cargo x oracle` (the recompiled engine against the original DLL), `cargo x
 android-run` / `android-keys` / `android-shot` (emulator). Browser: `cargo x serve-web`, then
-http://localhost:8080/. Server: `cargo x deploy`, `deploy-status`, `deploy-logs`, `undeploy`
+http://localhost:8080/. Server: `cargo x deploy`, `deploy-web`, `deploy-status`, `deploy-logs`, `undeploy`
 (settings in `deploy.local.ini`, see `deploy.example.ini`).
 
 Linux builds need a C compiler, `pkg-config` and `libasound2-dev`; macOS needs the Xcode command
