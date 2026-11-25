@@ -88,7 +88,7 @@ pub fn build(_args: &[String]) -> R<()> {
     objs.extend(compile_all(&cc, &libc_flags, &c_files(&web.join("libc/src")), &obj.join("libc"), &headers)?);
     let lib = r.join("build/web/librgengine.a");
     let _ = std::fs::remove_file(&lib);
-    run(Command::new(&ar).arg("rcs").arg(&lib).args(&objs))?;
+    crate::native::archive(&ar, &lib, &objs)?;
 
     run(Command::new("rustup").args(["target", "add", TARGET]))?;
     // not stripped: wasm-bindgen reads the target_features section (it strips the rest itself)

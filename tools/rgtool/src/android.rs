@@ -124,12 +124,10 @@ pub fn build(args: &[String]) -> R<()> {
         objs.extend(compile_all(&clang, &of, &own, &obj, &headers)?);
         let so = libs.join("lib").join(abi).join("libresetgen.so");
         std::fs::create_dir_all(so.parent().unwrap())?;
-        run(Command::new(&clang)
-            .arg(format!("--target={triple}"))
-            .arg("-shared")
-            .arg("-o")
-            .arg(&so)
-            .args(&objs)
+        let mut link = Command::new(&clang);
+        link.arg(format!("--target={triple}")).arg("-shared").arg("-o").arg(&so);
+        crate::native::obj_args(&mut link, &objs, &obj.join("link.rsp"))?;
+        run(link
             .args(["-u", "ANativeActivity_onCreate", "-Wl,--gc-sections", "-Wl,-z,max-page-size=16384", "-Wl,--build-id=sha1", "-s"])
             .args(["-landroid", "-llog", "-laaudio", "-lm"]))?;
         eprintln!("{} ({} KB)", so.display(), std::fs::metadata(&so)?.len() >> 10);

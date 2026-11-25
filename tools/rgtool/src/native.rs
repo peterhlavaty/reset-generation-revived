@@ -209,7 +209,10 @@ pub fn link_driver(cc: &Path, defs: &[&str], gen: Option<&Path>, sources: &[Path
     if let Some(d) = exe.parent() {
         std::fs::create_dir_all(d)?;
     }
-    run(Command::new(cc).arg("-o").arg(exe).args(&objs).args(libs))?;
+    let mut link = Command::new(cc);
+    link.arg("-o").arg(exe);
+    obj_args(&mut link, &objs, &exe.with_extension("rsp"))?;
+    run(link.args(libs))?;
     println!("built {}", exe.display());
     Ok(())
 }
@@ -327,7 +330,7 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
     let lib = r.join("build/native/desktop/librgengine.a");
     std::fs::create_dir_all(lib.parent().unwrap())?;
     let _ = std::fs::remove_file(&lib);
-    run(Command::new(&ar).arg("rcs").arg(&lib).args(&objs))?;
+    archive(&ar, &lib, &objs)?;
 
     let mut cargo = Command::new("cargo");
     cargo.current_dir(&r).args(["build", "-q", "--release", "-p", "rg-native"]).env("RG_ENGINE_LIB", &lib);
@@ -428,4 +431,26 @@ pub fn img_diff(args: &[String]) -> R<()> {
 /// set here and those in .cargo/config.toml (crt-static on Windows).
 fn no_rustflags(c: &mut Command) {
     c.env_remove("RUSTFLAGS").env_remove("CARGO_ENCODED_RUSTFLAGS");
+}
+
+/// `ar rcs LIB OBJS…`.
+pub fn archive(ar: &Path, lib: &Path, objs: &[PathBuf]) -> R<()> {
+    let mut c = Command::new(ar);
+    c.arg("rcs").arg(lib);
+    obj_args(&mut c, objs, &lib.with_extension("rsp"))?;
+    run(&mut c)
+}
+
+/// Adds object files to a compiler/archiver command. On Windows they go in a response file
+/// (`@file`, which clang and llvm-ar read): thousands of paths overflow the 32 K command line,
+/// as on CI's longer paths. Forward slashes in quotes read the same with GNU and Windows quoting.
+pub fn obj_args(c: &mut Command, objs: &[PathBuf], rsp: &Path) -> R<()> {
+    if cfg!(windows) {
+        let list: String = objs.iter().map(|o| format!("\"{}\"\n", o.to_string_lossy().replace('\\', "/"))).collect();
+        std::fs::write(rsp, list)?;
+        c.arg(format!("@{}", rsp.display()));
+    } else {
+        c.args(objs);
+    }
+    Ok(())
 }
