@@ -10,3 +10,22 @@ license.workspace = true
 russh = { version = "0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "3.0.0"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+# Downloads (setup): the OS's own TLS stack and trust store.
+ureq = { version = "3", default-features = false, features = ["native-tls", "platform-verifier", "json", "gzip"] }
+serde_json = "1"
+sha2 = "0.10"
+zip = { version = "6", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+png = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_Xps",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }

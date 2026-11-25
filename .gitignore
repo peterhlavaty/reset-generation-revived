@@ -13,3 +13,4 @@ __pycache__/
 /target/
 # Local settings that must not be published (rgtool deploy)
 /deploy.local.ini
+/.toolchains/

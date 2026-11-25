@@ -3,11 +3,32 @@
 //! has Rust (some commands need the toolchains `cargo x setup` fetches).
 
 mod deploy;
+mod play;
+mod setup;
 mod util;
+mod windows;
 
 use util::R;
 
 const HELP: &str = "cargo x <command>
+
+Setup
+  setup [what…|all]      download toolchains into .toolchains/ (default: what the Windows build
+                         needs; known: jdk17-x86, llvm-mingw, jdk21, ghidra)
+  doctor                 show the toolchains found
+
+Build
+  build-windows          dist/ResetGeneration-Revived (+ .zip): the Windows game
+
+Play / test (Windows build)
+  run [game args…]       start the built game (e.g. --nickname=Bob --server=lan)
+  lan-test [N] [--server=auto|online|lan|ws://…]
+                         N games on this PC: one hosts, the others join with Quick Match
+  keys \"K1,K2,WAIT500\" [shot] [--pid=N]
+                         key presses to the game window (RETURN ESC UP DOWN LEFT RIGHT CTRL F5
+                         F11 …, hex codes), then optionally a screenshot to build/shots/<shot>.png
+  shot [name] [--pid=N]  screenshot of the game window
+  killgame               end the game processes (only the game, not other Java programs)
 
 Server
   deploy                 build the relay for Linux and put it on the public server
@@ -25,6 +46,14 @@ fn main() {
     };
     let rest = &args[1..];
     let r: R<()> = match cmd {
+        "setup" => setup::setup(rest),
+        "doctor" => setup::doctor(),
+        "build-windows" => windows::build(),
+        "run" => play::run(rest),
+        "lan-test" => play::lan_test(rest),
+        "keys" => play::keys(rest),
+        "shot" => play::shot(rest),
+        "killgame" => play::killgame(),
         "deploy" => deploy::deploy(),
         "deploy-status" => deploy::status(),
         "deploy-logs" => deploy::logs(rest.first().and_then(|n| n.parse().ok()).unwrap_or(100)),

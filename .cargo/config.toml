@@ -6,3 +6,10 @@ x = "run -q -p rgtool --release --"
 # needed on any OS.
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
+
+# Windows programs we ship (rg-relay.exe, LAN-Setup.exe) must run on PCs without the Visual C++
+# runtime installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
