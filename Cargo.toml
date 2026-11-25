@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["server", "tools/rgtool", "tools/lan-setup", "native/desktop"]
-# native/desktop links the recompiled engine, which `cargo x build-desktop` builds first
+members = ["server", "tools/rgtool", "tools/lan-setup", "native/desktop", "native/web"]
+# native/desktop and native/web link the recompiled engine, which `cargo x build-desktop` /
+# `cargo x build-web` build first
 default-members = ["server", "tools/rgtool", "tools/lan-setup"]
 
 [workspace.package]

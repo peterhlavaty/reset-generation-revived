@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define JNI_BASE 0x00500000u
+#define JNI_BASE RT_JNI_BASE
 #define OBJ_BASE 0x1000u
 #define MAX_OBJS 8192
 

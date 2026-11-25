@@ -1,6 +1,7 @@
 # Native builds that cannot be made on a Windows PC: the desktop game for Linux and macOS (and
-# the Android APK, from the Linux job). Each job is one `cargo x` command; the Ghidra analysis
-# of the engine DLL (decompiled/native/pcode.txt, never committed) is cached between runs.
+# the Android APK and the browser version, from the Linux job). Each job is one `cargo x` command;
+# the Ghidra analysis of the engine DLL (decompiled/native/pcode.txt, never committed) is cached
+# between runs.
 name: native
 
 on:
@@ -27,11 +28,12 @@ jobs:
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
-      - name: Toolchains cache (JDK 25, Ghidra)
+      - name: Toolchains cache (JDK 25, Ghidra, wasm-bindgen)
         uses: actions/cache@v6
         with:
           path: .toolchains
-          key: toolchains-${{ runner.os }}-${{ runner.arch }}-v1
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-v2-${{ hashFiles('Cargo.lock') }}
+          restore-keys: toolchains-${{ runner.os }}-${{ runner.arch }}-
       - name: P-code cache (Ghidra analysis of the engine DLL)
         uses: actions/cache@v6
         with:
@@ -42,10 +44,14 @@ jobs:
       - name: Android APK
         if: runner.os == 'Linux'
         run: cargo x build-android
+      - name: Browser version
+        if: runner.os == 'Linux'
+        run: cargo x build-web
       - uses: actions/upload-artifact@v7
         with:
           name: ResetGeneration-${{ runner.os }}
           path: |
             dist/ResetGeneration-Revived-*.zip
             dist/*.apk
+            dist/web/
           if-no-files-found: error

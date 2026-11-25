@@ -1,15 +1,15 @@
 # Reset Generation Revived
 
 Bringing **Reset Generation** (RedLynx / Nokia, 2008 — N-Gage and free web release) to Windows,
-Linux, macOS and Android as native programs (the engine statically recompiled), in widescreen, and
-back online with our own server.
+Linux, macOS and Android as native programs and to web browsers (the engine statically
+recompiled), in widescreen, and back online with our own server.
 
 | | Status |
 |---|---|
 | Desktop: Windows, Linux, macOS (one executable + data; fullscreen on Windows) | **Playable**, hosts and joins online and LAN games — `cargo x build-desktop` → `dist/ResetGeneration-Revived-<os>/` (+ .zip). Tested on Windows; Linux/macOS are built by CI (`.github/workflows/native.yml`) |
 | Android (phones, tablets, Chromebooks; touch + gamepad) | **Playable test build**, hosts and joins online games — `cargo x build-android` → `dist/ResetGeneration-Revived-<version>.apk` (sideload) |
 | Online server (relay + matchmaking, Rust) | **Running** at `resetgeneration.rustyapps.com` — `cargo x deploy` |
-| WebAssembly | Not yet: see `docs/NATIVE_PORT.md`, "WebAssembly" |
+| Web browser (WebAssembly) | **Playable, single-player** (keyboard, touch buttons; saves in the browser) — `cargo x build-web` → `dist/web/` (static files), `cargo x serve-web` to try it |
 
 Multiplayer in short: press **F5** in the main menu (Android: the HOST button), choose the number of
 players and a hero; everyone else (desktop or Android) chooses **Online → Quick Match**. The games
@@ -28,12 +28,14 @@ cargo x setup              # once, on Windows: llvm-mingw (the C compiler for th
 cargo x build-desktop      # dist/ResetGeneration-Revived-<os>/ (+ .zip); the first run also does
                            #   the one-time Ghidra analysis of the engine: JDK 25 + Ghidra, minutes
 cargo x build-android      # dist/ResetGeneration-Revived-<version>.apk (Android SDK + NDK)
+cargo x build-web          # dist/web/: the browser version (uses the NDK's clang)
 cargo test                 # server and rgtool tests
 ```
 
 Running and testing: `cargo x run`, `cargo x lan-test 3` (a host and two clients on this PC),
 `cargo x keys "RETURN,DOWN" shot` (drive the game window and take a screenshot), `cargo x
-native-test`, `cargo x android-run` / `android-keys` / `android-shot` (emulator). Server:
+native-test`, `cargo x android-run` / `android-keys` / `android-shot` (emulator). Browser: `cargo x
+serve-web`, then http://localhost:8080/. Server:
 `cargo x deploy`, `deploy-status`, `deploy-logs`, `undeploy` (settings in `deploy.local.ini`,
 see `deploy.example.ini`).
 
@@ -43,7 +45,7 @@ line tools. Windows needs nothing besides Rust.
 ## Start here
 
 * `docs/GAME_ANALYSIS.md` — what the downloads are, how the game and engine work, file formats, mechanics
-* `docs/NATIVE_PORT.md` — the static recompiler, the native runtime, desktop/Android/WebAssembly hosts
+* `docs/NATIVE_PORT.md` — the static recompiler, the native runtime, desktop/Android/browser hosts
 * `docs/WINDOWS_PORT.md` — the widescreen fixes, and the retired Java-hosted Windows build
 * `docs/ANDROID_PLAN.md` — why static recompilation (the options that were weighed)
 * `docs/MULTIPLAYER.md` — the original online stack, our relay and matchmaker, the reconstructed protocol, deployment

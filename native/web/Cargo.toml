@@ -1,0 +1,50 @@
+[package]
+name = "rg-web"
+description = "Reset Generation on the recompiled engine in a web browser (WebAssembly)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# keep in step with the wasm-bindgen CLI `cargo x build-web` installs (it reads Cargo.lock)
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+libm = "0.2"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioContext",
+    "AudioContextState",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioScheduledSourceNode",
+    "BaseAudioContext",
+    "CanvasRenderingContext2d",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "ImageData",
+    "KeyboardEvent",
+    "Performance",
+    "PointerEvent",
+    "MouseEvent",
+    "Node",
+    "NodeList",
+    "Location",
+    "RequestInit",
+    "Response",
+    "Storage",
+    "Window",
+    "console",
+]

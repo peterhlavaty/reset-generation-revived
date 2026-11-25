@@ -116,23 +116,42 @@ window and [tinyaudio](https://crates.io/crates/tinyaudio) sound:
 This is the Windows game since 2026-11-25; before, Windows had a build that ran the original
 engine DLL in a 32-bit Java host (`docs/WINDOWS_PORT.md`).
 
-## WebAssembly (not built yet)
+## Web browser (WebAssembly)
 
-The same C would compile with Emscripten; what it needs:
+`cargo x build-web` → `dist/web/` (a static site: `index.html`, `rg_web.js`, `rg_web_bg.wasm`
+~12 MB / ~3 MB compressed, `data/` ~32 MB); `cargo x serve-web [PORT]` serves it on
+`http://localhost:8080/`. Single-player (and the tutorial); online play needs the runtime's
+network threads (`net.c`, `link.c`), which this one-threaded build does not have — a browser
+WebSocket version of `link.c` would bring it back.
 
-* **Memory.** The runtime reserves the full 4 GB guest address space (`M` + 32-bit guest
-  address) and the guest heap sits at `0x20000000`, stack at `0x00100000`. wasm32 has at most
-  4 GB in total, so guest memory must shrink: map the DLL image, a heap of a few hundred MB and the
-  stack into one linear block and translate addresses (or rebase the heap low and build with
-  memory64).
-* **Main loop.** `rg_tick` sleeps to keep 32 fps; in a browser it has to be driven from
-  `requestAnimationFrame` with the virtual clock (`rg_use_virtual_clock`), and `Sleep` must not
-  block.
-* **Network.** `link.c` uses BSD sockets and threads; in the browser that becomes a WebSocket
-  (`wss://resetgeneration.rustyapps.com/ws` is already served) with callbacks.
-* **Data.** The ~35 MB of paks are fetched into the virtual file system (IndexedDB for saves).
-* **Size/speed.** ~90 MB of generated C; the per-function dispatch table and the code size are
-  the main risks for load time.
+* **Build.** The generated C, `native/rt` (without `link.c`) and `native/web/c/web.c` are compiled
+  for `wasm32-unknown-unknown` with clang (the Android NDK's, or `RG_WASM_CC`/`RG_WASM_AR`) against
+  a small C library of our own (`native/web/libc`: strings, printf family, a case-insensitive
+  in-memory file system, pthread stubs that refuse threads), archived as
+  `build/web/librgengine.a` and linked into the Rust crate `native/web` (`rg-web`), which
+  wasm-bindgen turns into the page's module (rgtool installs the wasm-bindgen CLI matching
+  `Cargo.lock` into `.toolchains/`). Rust supplies `malloc`/`free`, the transcendental math
+  (`libm` crate), the console and the clocks (`native/web/src/libc.rs`).
+* **Memory.** One linear memory, and guest addresses *are* memory addresses (`M = 0`): an offset
+  base does not work, because clang folds constant guest addresses into wasm load offsets, which
+  do not wrap. `rt_mem_init` grows the memory to `RT_GUEST_END` (~381 MB) before anything else
+  allocates, and the guest gets a fixed map above the Rust heap (`native/rt/host.h`): the image
+  at `0x10000000` (the loader checks it ends below the heap), a 96 MB heap (a match uses ~20),
+  VirtualAlloc space, stack, TEB and the JNI objects.
+* **Main loop.** `requestAnimationFrame` runs `rg_tick` on the virtual clock as rgtest does
+  (1 ms a tick plus what the engine sleeps, so `Sleep` never blocks) until the engine clock has
+  caught up with the page's; far behind (a hidden tab) it carries on instead of racing.
+* **Data and saves.** `data/files.txt` lists the patched data (`patched_data`, as for the other
+  builds); the page fetches it into the file system under `/game`. Files the engine writes
+  (settings, saved games, achievements) go to `localStorage` (`rg:<path>`, base64) and are put
+  back at the next start.
+* **Input and sound.** Keyboard (arrows, Enter, Esc/Backspace, Ctrl, Space, letters); on touch
+  screens on-screen buttons (`data-key` elements). Web Audio plays the 8 kHz mix in short
+  buffers ~0.1 s ahead, once the player has pressed something (browsers block sound before).
+* **Testing.** `?keys=F:KEY,…&shots=F,…` in the page address presses keys and takes screenshots
+  at engine frames like rgtest's `--keys`/`--shots` (the page then pulls sound like rgtest, so
+  the frames match); `serve-web` saves the shots as `build/shots/web-FFFFF.png`, and
+  `cargo x img-diff` compares them with `build/native/test/frame_FFFFF.png`.
 
 ## Android app
 
@@ -200,6 +219,10 @@ Verified (2026-11-25): the desktop game on Windows (intro, menus, an online matc
 the public server against a Windows host); the APK on an Android 17 x86_64 emulator (`cargo x
 android-run`, `android-keys`, `android-shot`): intro, menus and an online match against a
 Windows host. Linux and macOS builds come from CI and were not run here.
+
+Verified (2026-11-25): the browser build in headless Chrome (intro, menus, settings, the
+tutorial; saves kept across page loads); every compared frame equals rgtest's bit for bit
+(`img-diff`, frames 450–2000 with the same keys).
 
 Differential testing against the original: `RT_API_TRACE=file rgtest …` logs every Win32/JNI
 call; compared with the same log from the emulated original DLL, the first divergence pointed at

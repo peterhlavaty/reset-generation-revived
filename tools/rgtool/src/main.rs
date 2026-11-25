@@ -11,6 +11,7 @@ mod play;
 mod recomp;
 mod setup;
 mod util;
+mod web;
 
 use util::R;
 
@@ -18,12 +19,14 @@ const HELP: &str = "cargo x <command>
 
 Setup
   setup [what…|all]      download toolchains into .toolchains/ (default: what the Windows build
-                         needs; known: llvm-mingw, jdk25, ghidra)
+                         needs; known: llvm-mingw, jdk25, ghidra, bearssl)
   doctor                 show the toolchains found
 
 Build
   build-desktop          dist/ResetGeneration-Revived-<os> (+ .zip): the game for this OS
                          (Windows, Linux, macOS; build-windows is the same)
+  build-web              dist/web: the game in a web browser (WebAssembly; single-player)
+  serve-web [PORT]       serve dist/web on http://localhost:PORT (default 8080) to try it
 
 Play / test (the desktop build, Windows)
   run [game args…]       start the built game (e.g. --nickname=Bob --server=lan)
@@ -44,6 +47,7 @@ Native (recompiled engine)
                          build/native/rgtest: headless test driver for the recompiled engine
   native-test [FRAMES] [--size WxH] [--keys \"F:KEY,…\"] [--shots F,F] [--realtime]
                          run it (virtual clock; PPM screenshots in build/native/test)
+  img-diff A.png B.png   count the pixels that differ (e.g. a web screenshot vs rgtest)
 
 Android
   build-android [--abis=arm64-v8a,x86_64] [--diag]
@@ -91,6 +95,9 @@ fn main() {
         "native-test" => native::run_test(rest),
         "build-desktop" => native::build_desktop(rest),
         "build-android" => android::build(rest),
+        "build-web" => web::build(rest),
+        "img-diff" => native::img_diff(rest),
+        "serve-web" => web::serve(rest),
         "pak" => data::pak(rest),
         "pak-patch" => pakpatch::cmd(rest),
         "gfx" => data::gfx(rest),

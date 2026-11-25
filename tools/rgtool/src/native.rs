@@ -370,3 +370,30 @@ fn make_executable(ghidra: &Path) {
     #[cfg(not(unix))]
     let _ = ghidra;
 }
+
+fn read_rgb(p: &Path) -> R<(u32, u32, Vec<u8>)> {
+    let mut dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(p)?));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut rd = dec.read_info()?;
+    let mut buf = vec![0; rd.output_buffer_size().ok_or("image too large")?];
+    let info = rd.next_frame(&mut buf)?;
+    let ch = info.color_type.samples();
+    let rgb = buf[..info.buffer_size()].chunks_exact(ch).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    Ok((info.width, info.height, rgb))
+}
+
+/// `img-diff A.png B.png`: how many pixels differ (e.g. a browser screenshot against rgtest's).
+pub fn img_diff(args: &[String]) -> R<()> {
+    let [a, b] = args else { return Err("usage: img-diff A.png B.png".into()) };
+    let (wa, ha, pa) = read_rgb(Path::new(a))?;
+    let (wb, hb, pb) = read_rgb(Path::new(b))?;
+    if (wa, ha) != (wb, hb) {
+        return Err(format!("sizes differ: {wa}x{ha} vs {wb}x{hb}").into());
+    }
+    let diff = pa.chunks_exact(3).zip(pb.chunks_exact(3)).filter(|(x, y)| x != y).count();
+    println!("{diff} of {} pixels differ", wa * ha);
+    if diff > 0 {
+        return Err("the images differ".into());
+    }
+    Ok(())
+}

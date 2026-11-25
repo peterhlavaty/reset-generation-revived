@@ -806,7 +806,7 @@ void rg_server_pump(void) {
         connecting = 1;
         pthread_t t;
         if (pthread_create(&t, NULL, link_thread, NULL) == 0) pthread_detach(t);
-        else connecting = 0;
+        else connecting = 0, no_relay = 1;   /* no threads (the browser build) */
     }
     if (ws_up && now - last_ping > 15000) { last_ping = now; ws_send(1, "{\"t\":\"ping\"}", 12); }
     track_seats();

@@ -71,7 +71,7 @@ void host_sleep_ms(uint32_t ms) {
 
 static int keycode(const char *k) {
     static const struct { const char *n; int c; } t[] = {
-        {"RETURN", 10}, {"ESC", 27}, {"UP", 38}, {"DOWN", 40}, {"LEFT", 37}, {"RIGHT", 39}, {"CTRL", 17}, {"SPACE", 32}};
+        {"RETURN", 10}, {"ENTER", 10}, {"ESC", 27}, {"UP", 38}, {"DOWN", 40}, {"LEFT", 37}, {"RIGHT", 39}, {"CTRL", 17}, {"SPACE", 32}};
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) if (!strcmp(t[i].n, k)) return t[i].c;
     return atoi(k);
 }
@@ -178,6 +178,7 @@ int main(int argc, char **argv) {
         if (!alive) { fprintf(stderr, "engine exit at frame %d\n", i); i++; break; }
     }
     if (hf) fclose(hf);
+    rt_mem_report();
     fprintf(stderr, "%d frames, %.2f ms/frame engine time\n", i, 1000.0 * t_engine / (i ? i : 1));
     return 0;
 }

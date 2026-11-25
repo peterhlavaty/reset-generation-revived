@@ -23,6 +23,24 @@ void rt_trace_live_log(uint32_t a) {
 uint8_t *M;
 
 /* ------------------------------------------------------------------ memory */
+#if defined(__wasm__)
+/* The guest map (host.h): the linear memory is grown past RT_GUEST_END before the runtime's own
+ * heap reaches RT_GUEST_LOW (the host calls this first thing); its later allocations come from
+ * further memory.grow calls, above the guest. M stays 0. */
+void rt_mem_init(void) {
+    static int done;
+    if (done) return;
+    size_t have = __builtin_wasm_memory_size(0) * 65536;
+    if (have > RT_GUEST_LOW) rt_fatal("the runtime already uses the guest's memory (%u MB)", (unsigned)(have >> 20));
+    if (__builtin_wasm_memory_grow(0, (RT_GUEST_END - have + 65535) / 65536) == (size_t)-1)
+        rt_fatal("cannot get %u MB of memory for the game", RT_GUEST_END >> 20);
+    M = 0;
+    done = 1;
+}
+void rt_mem_commit(uint32_t addr, uint32_t size) {
+    if (addr < RT_GUEST_LOW || (uint64_t)addr + size > RT_GUEST_END) rt_fatal("guest memory %08x+%x is outside the browser map", addr, size);
+}
+#else
 #ifdef _WIN32
 #include <windows.h>
 static void *reserve(size_t n) { return VirtualAlloc(NULL, n, MEM_RESERVE, PAGE_NOACCESS); }
@@ -46,6 +64,7 @@ void rt_mem_commit(uint32_t addr, uint32_t size) {
     uint64_t end = ((uint64_t)addr + size + 0xfff) & ~(uint64_t)0xfff;
     if (!commit(M + start, (size_t)(end - start))) rt_fatal("cannot commit guest memory %08x+%x", addr, size);
 }
+#endif
 
 /* ------------------------------------------------------------------ errors */
 void rt_dump_calltrace(void) {

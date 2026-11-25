@@ -34,7 +34,13 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
 * Native (desktop, Android) = **static recompilation**: Ghidra P-code (`cargo x ghidra-export`)
   → `tools/rgtool/src/recomp.rs` → C in `build/native/gen` + `native/rt`. Code only reachable
   through vtables/stored callbacks must be recovered by the export's pre-pass; an "unknown
-  address" fatal means a missed entry point. The guest address space is a 4 GB reservation.
+  address" fatal means a missed entry point. The guest address space is a 4 GB reservation
+  (native builds).
+* Browser (`build-web`, `native/web`): the same C for wasm32 with our own small libc
+  (`native/web/libc`), linked into a Rust crate. Guest addresses are linear-memory addresses
+  (`M = 0`, fixed map above 0x10000000 in `native/rt/host.h`; an offset base breaks because clang
+  folds constant addresses into wasm load offsets). One thread: single-player only. Its frames
+  must equal rgtest's (`?keys=…&shots=…` + `cargo x img-diff`).
 * Online: the engine waits for the room's server to speak first; Quick Match and hosted rooms
   are served by `server/` (rg-relay, Rust). Matches run on the hosting player's engine
   (`native/rt/server.c`). The desktop game runs the relay in-process for LAN games (the
@@ -52,7 +58,7 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
   `.toolchains/` (`RG_TOOLCHAINS` overrides). The Android SDK is found via `ANDROID_HOME` or the
   Android Studio default location.
 * Builds: `build-desktop` (Windows, Linux, macOS; `build-windows` is an alias), `build-android`,
-  `build-native-test` (+ `native-test`).
+  `build-web` (+ `serve-web`), `build-native-test` (+ `native-test`; `img-diff` compares shots).
 * Play/test: `run`, `lan-test N`, `keys "RETURN,DOWN,WAIT500" [shot] [--pid=N]`, `shot`,
   `killgame` (only game processes — never kill all `java.exe`), `android-run`, `android-keys`,
   `android-shot`, `android-log`. Screenshots go to `build/shots/`, logs to `build/logs/`.

@@ -347,11 +347,17 @@ static void *pinger(void *arg) {
 }
 
 /* ------------------------------------------------------------------ engine-facing */
+static int no_threads;   /* threads cannot be started (the browser build): logins fail at once */
+
 int net_init(void) {
     if (!running) {
         running = 1;
         pthread_t t;
-        pthread_create(&t, NULL, worker, NULL);
+        if (pthread_create(&t, NULL, worker, NULL) != 0) {
+            no_threads = 1;
+            host_log("net: online play is not available in this build");
+            return 1;
+        }
         pthread_detach(t);
         pthread_create(&t, NULL, pinger, NULL);
         pthread_detach(t);
@@ -377,6 +383,7 @@ int net_is_logged_in(void) { return logged_in; }
 int net_login(void) {
     err_state = 0;
     cancelled = 0;
+    if (no_threads) { err_state = 3; return 1; }
     login_in_progress = 1;
     add_action(mk(A_LOGIN, 0, NULL, NULL, 0), 1);
     return 1;

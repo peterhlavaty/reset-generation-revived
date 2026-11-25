@@ -16,12 +16,38 @@ void host_sleep_ms(uint32_t ms);          /* Sleep() */
 
 /* ------------------------------------------------------------------ runtime internals */
 #define RT_STUB_BASE 0xF0000000u          /* fake code addresses of host imports / JNI functions */
+
+/* Guest address map. Native builds reserve all 4 GB (M + guest address). The browser build has
+ * one linear memory: guest addresses are memory addresses there (M = 0; a base below them would
+ * break, the compiler folds constant addresses into wasm load offsets, which do not wrap), and the
+ * guest gets the image (0x10000000) and one block after it, above the runtime's own memory. */
+#ifdef __wasm__
+#define RT_GUEST_LOW 0x10000000u          /* the image's base */
+#define RT_HEAP_BASE 0x10800000u          /* the image ends below this (checked when loading) */
+#define RT_HEAP_SIZE 0x06000000u          /* 96 MB; a match uses about 20 */
+#define RT_VIRT_BASE 0x16800000u
+#define RT_VIRT_SIZE 0x01000000u
+#define RT_STACK_BASE 0x17800000u
+#define RT_TEB_ADDR 0x17B00000u
+#define RT_JNI_BASE 0x17C00000u
+#define RT_GUEST_END 0x17D00000u
+#else
+#define RT_STACK_BASE 0x00100000u
+#define RT_TEB_ADDR 0x00400000u
+#define RT_JNI_BASE 0x00500000u
+#define RT_HEAP_BASE 0x20000000u
+#define RT_HEAP_SIZE 0x20000000u
+#define RT_VIRT_BASE 0x40000000u
+#define RT_VIRT_SIZE 0x20000000u
+#endif
+#define RT_STACK_SIZE 0x00300000u
 extern uint32_t rt_last_call;
 
 void rt_fatal(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 void rt_mem_init(void);
 void rt_dump_calltrace(void);
 void rt_mem_commit(uint32_t addr, uint32_t size);
+void rt_mem_report(void);   /* logs how much guest heap and VirtualAlloc space is in use */
 void rt_dispatch_init(void);
 uint32_t rt_guest_call(uint32_t addr, int nargs, const uint32_t *args);
 uint32_t rt_guest_thiscall(uint32_t addr, uint32_t ecx, int nargs, const uint32_t *args);

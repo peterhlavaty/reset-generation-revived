@@ -15,14 +15,14 @@
 #define mkdir_(p) mkdir(p, 0755)
 #endif
 
-/* guest address map */
-#define STACK_BASE 0x00100000u
-#define STACK_SIZE 0x00300000u
-#define TEB_ADDR 0x00400000u
-#define HEAP_BASE 0x20000000u
-#define HEAP_SIZE 0x20000000u
-#define VIRT_BASE 0x40000000u
-#define VIRT_SIZE 0x20000000u
+/* guest address map (host.h) */
+#define STACK_BASE RT_STACK_BASE
+#define STACK_SIZE RT_STACK_SIZE
+#define TEB_ADDR RT_TEB_ADDR
+#define HEAP_BASE RT_HEAP_BASE
+#define HEAP_SIZE RT_HEAP_SIZE
+#define VIRT_BASE RT_VIRT_BASE
+#define VIRT_SIZE RT_VIRT_SIZE
 
 /* ------------------------------------------------------------------ stubs */
 #define MAX_STUBS 1024
@@ -276,6 +276,9 @@ IMPORT(TlsGetValue) { last_error = 0; rt_ret(A(0) < 64 ? tls[A(0)] : 0, 1); }
 
 /* memory */
 static uint32_t virt_top = VIRT_BASE;
+void rt_mem_report(void) {
+    host_log("memory: guest heap %u KB, VirtualAlloc %u KB", (heap_top - HEAP_BASE) >> 10, (virt_top - VIRT_BASE) >> 10);
+}
 IMPORT(HeapCreate) { rt_ret(0x7000, 3); }
 IMPORT(HeapDestroy) { rt_ret(1, 1); }
 IMPORT(HeapAlloc) {
@@ -571,6 +574,9 @@ int rt_load_image(rt_image *img, const char *dll_path, const char *dir) {
     uint32_t base = U32(opt + 28), size = U32(opt + 56), hdrsize = U32(opt + 60);
     img->base = base;
     img->entry = base + U32(opt + 16);
+#ifdef __wasm__
+    if (base != RT_GUEST_LOW || base + size > RT_HEAP_BASE) { host_log("the DLL does not fit the browser memory map"); free(d); return 0; }
+#endif
     rt_mem_commit(STACK_BASE, STACK_SIZE);
     rt_mem_commit(HEAP_BASE, HEAP_SIZE);
     rt_mem_commit(VIRT_BASE, VIRT_SIZE);
