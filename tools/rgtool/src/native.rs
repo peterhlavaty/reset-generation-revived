@@ -176,11 +176,14 @@ pub fn build_test(args: &[String]) -> R<()> {
     Ok(())
 }
 
-/// A JDK for the build-time Java tools (javac, keytool, apksigner, PatchTool).
+/// A JDK for the build-time Java tools (javac, keytool, apksigner, PatchTool); jdk25 is installed
+/// if there is none (with a cached P-code export the Ghidra step, which also installs it, is skipped).
 pub fn tool_jdk() -> R<PathBuf> {
-    crate::setup::find("jdk17-x86")
-        .or_else(|| crate::setup::find("jdk25"))
-        .ok_or_else(|| "no JDK: run `cargo x setup` (or `cargo x setup jdk25`)".into())
+    if let Some(j) = crate::setup::find("jdk17-x86").or_else(|| crate::setup::find("jdk25")) {
+        return Ok(j);
+    }
+    crate::setup::setup(&["jdk25".to_string()])?;
+    crate::setup::need("jdk25")
 }
 
 /// The game data for the recompiled engine in `dest` (replaced): a copy of game/ResetGeneration
