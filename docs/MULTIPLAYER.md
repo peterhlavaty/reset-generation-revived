@@ -102,8 +102,9 @@ While hosting, a status strip at the top says how many players are in. The deskt
 shows the status in its title bar and saves `host_players`; `host=auto`, `host_players=`,
 `host_hero=` and `keys=` (timed keys, `T:KEY,…`) work as in the Windows build. Android has a HOST
 touch button in the main menu (hidden while hosting) and remembers `host_players` in
-`revived.ini`. Verified: native host ↔ native client over a local `rg-relay`, a 2-player match,
-the client killed mid-match and back in its seat on both screens.
+`revived.ini`. Verified: native host ↔ native client over a local `rg-relay` (a 2-player match,
+the client killed mid-match and back in its seat on both screens) and Android host ↔ native
+client over the public server.
 
 ### LAN relay (no setup)
 

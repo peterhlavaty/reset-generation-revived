@@ -215,7 +215,7 @@ static void layout_controls(void) {
     buttons[5] = (button){K_ENTER, lx, 1.1f * u, 0.7f * u, "select", 0};
     buttons[6] = (button){K_ESC, rx, 1.1f * u, 0.7f * u, "back", 0};
     buttons[B_DROP] = (button){K_CTRL, rx, ly - 3.0f * u, 0.95f * u, "drop", 0};
-    buttons[B_HOST] = (button){0, lx, 3.0f * u, 0.55f * u, "host", 0};
+    buttons[B_HOST] = (button){0, lx, 3.0f * u, 0.62f * u, "host", 0};
 }
 
 static void drop_release(void) {
