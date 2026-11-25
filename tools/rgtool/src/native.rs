@@ -270,3 +270,58 @@ fn ppm_to_png(p: &Path) -> R<()> {
     std::fs::remove_file(p)?;
     Ok(())
 }
+
+/// The native desktop game for this OS: dist/ResetGeneration-Native-<os>/ (+ .zip), a window
+/// program (native/desktop) linked with the recompiled engine, and its game data.
+pub fn build_desktop(_args: &[String]) -> R<()> {
+    let gen = generate(&[])?;
+    let r = root();
+    let rt = r.join("native/rt");
+    let (cc, ar, target) = if cfg!(windows) {
+        let bin = need("llvm-mingw")?.join("bin");
+        (bin.join("x86_64-w64-mingw32-clang.exe"), bin.join("llvm-ar.exe"), Some("x86_64-pc-windows-gnullvm"))
+    } else {
+        let env = |k: &str, d: &str| PathBuf::from(std::env::var(k).unwrap_or(d.into()));
+        (env("CC", "cc"), env("AR", "ar"), None)
+    };
+    let mut flags: Vec<String> = vec!["-O2".into(), "-fno-strict-aliasing".into(), "-fwrapv".into()];
+    flags.push(format!("-I{}", rt.display()));
+    flags.push(format!("-I{}", gen.display()));
+    let obj = r.join("build/native/obj-desktop");
+    let headers = crate::util::files_with_ext(&rt, "h");
+    let mut gen_flags = flags.clone();
+    gen_flags.push("-w".into());
+    let mut objs = compile_all(&cc, &gen_flags, &c_files(&gen), &obj, &headers)?;
+    let mut own = c_files(&rt);
+    own.push(r.join("native/host/desktop/host.c"));
+    flags.extend(["-Wall", "-Wno-unused-function"].iter().map(|s| s.to_string()));
+    objs.extend(compile_all(&cc, &flags, &own, &obj, &headers)?);
+    let lib = r.join("build/native/desktop/librgengine.a");
+    std::fs::create_dir_all(lib.parent().unwrap())?;
+    let _ = std::fs::remove_file(&lib);
+    run(Command::new(&ar).arg("rcs").arg(&lib).args(&objs))?;
+
+    let mut cargo = Command::new("cargo");
+    cargo.current_dir(&r).args(["build", "-q", "--release", "-p", "rg-native"]).env("RG_ENGINE_LIB", &lib);
+    let mut out = r.join("target");
+    if let Some(t) = target {
+        run(Command::new("rustup").args(["target", "add", t]))?;
+        let var = t.to_uppercase().replace('-', "_");
+        cargo.args(["--target", t]).env(format!("CARGO_TARGET_{var}_RUSTFLAGS"), "-C target-feature=+crt-static -C link-arg=-Wno-unused-command-line-argument").env(format!("CARGO_TARGET_{var}_LINKER"), &cc).env(format!("CC_{}", t.replace('-', "_")), &cc).env(format!("AR_{}", t.replace('-', "_")), &ar);
+        out = out.join(t);
+    }
+    run(&mut cargo)?;
+    let exe_name = format!("ResetGeneration{}", std::env::consts::EXE_SUFFIX);
+    let exe = out.join("release").join(&exe_name);
+
+    let name = format!("ResetGeneration-Native-{}", std::env::consts::OS);
+    let dist = r.join("dist").join(&name);
+    crate::util::remove_dir(&dist)?;
+    std::fs::create_dir_all(&dist)?;
+    std::fs::copy(&exe, dist.join(&exe_name))?;
+    patched_data(&dist.join("data"))?;
+    let zip = r.join("dist").join(format!("{name}.zip"));
+    crate::windows::zip_dir(&dist, &zip)?;
+    println!("built {} (+ {})", dist.display(), zip.display());
+    Ok(())
+}

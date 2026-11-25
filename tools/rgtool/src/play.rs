@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const GAME_EXE: &str = "ResetGeneration-Revived.exe";
+/// The game's processes: the Windows build (Java host) and the native build.
+const GAME_EXES: [&str; 2] = ["ResetGeneration-Revived.exe", "ResetGeneration.exe"];
 
 fn logs() -> PathBuf {
     let d = root().join("build/logs");
@@ -33,7 +34,7 @@ pub fn run(args: &[String]) -> R<()> {
 }
 
 pub fn killgame() -> R<()> {
-    for im in [GAME_EXE, "rg-relay.exe"] {
+    for im in GAME_EXES.iter().copied().chain(["rg-relay.exe"]) {
         let _ = Command::new("taskkill").args(["/IM", im, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
     Ok(())
@@ -174,7 +175,7 @@ mod win {
             let mut ok = Process32FirstW(snap, &mut e) != 0;
             while ok {
                 let n = String::from_utf16_lossy(&e.szExeFile[..e.szExeFile.iter().position(|&c| c == 0).unwrap_or(260)]);
-                if n.eq_ignore_ascii_case(super::GAME_EXE) {
+                if super::GAME_EXES.iter().any(|e| n.eq_ignore_ascii_case(e)) {
                     out.push(e.th32ProcessID);
                 }
                 ok = Process32NextW(snap, &mut e) != 0;

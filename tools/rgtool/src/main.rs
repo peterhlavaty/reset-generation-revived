@@ -43,6 +43,8 @@ Native (recompiled engine)
                          build/native/rgtest: headless test driver for the recompiled engine
   native-test [FRAMES] [--size WxH] [--keys \"F:KEY,…\"] [--shots F,F] [--realtime]
                          run it (virtual clock; PPM screenshots in build/native/test)
+  build-desktop          dist/ResetGeneration-Native-<os> (+ .zip): the game on the recompiled
+                         engine as a native program for this OS (window, sound, online play)
 
 Android
   build-android [--abis=arm64-v8a,x86_64] [--diag]
@@ -88,6 +90,7 @@ fn main() {
         "recomp" => recomp::cmd(rest),
         "build-native-test" => native::build_test(rest),
         "native-test" => native::run_test(rest),
+        "build-desktop" => native::build_desktop(rest),
         "build-android" => android::build(rest),
         "pak" => data::pak(rest),
         "gfx" => data::gfx(rest),
