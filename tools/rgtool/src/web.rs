@@ -130,6 +130,9 @@ const PAGE: &str = r#"<!doctype html>
   #pad button { pointer-events: auto; position: absolute; width: 64px; height: 64px; border-radius: 32px; border: 2px solid #fff6;
                 background: #fff2; color: #fffa; font: bold 20px sans-serif; touch-action: none; user-select: none; -webkit-user-select: none; }
   @media (pointer: coarse) { #pad { display: block; } #bar .hint { display: none; } }
+  body.touch #pad { display: block; } body.touch #bar .hint { display: none; }
+  #pad button.word { font-size: 12px; }
+  #bar a { color: #9cf; }
   #bar { position: fixed; top: 6px; left: 8px; font-size: 13px; opacity: .45; transition: opacity .2s; }
   #bar:hover, #bar:focus-within { opacity: 1; }
   #bar input { width: 9em; background: #111; color: #eee; border: 1px solid #555; border-radius: 3px; font: inherit; padding: 1px 4px; }
@@ -139,15 +142,18 @@ const PAGE: &str = r#"<!doctype html>
 <canvas id="screen" width="640" height="360"></canvas>
 <div id="status">Loading...</div>
 <div id="bar"><label>Online name <input id="nick" maxlength="15" spellcheck="false" autocomplete="off"></label>
-  <span class="hint">&middot; F5 hosts a game, others join it with Quick Match</span></div>
+  <span class="hint">&middot; F5 hosts a game, others join it with Quick Match</span>
+  &middot; <a href="https://github.com/peterhlavaty/reset-generation-revived/releases/tag/latest" target="_blank" rel="noopener">Download the game</a></div>
 <div id="pad">
   <button data-key="38" style="left:80px; bottom:144px">&#9650;</button>
   <button data-key="37" style="left:12px; bottom:76px">&#9664;</button>
   <button data-key="39" style="left:148px; bottom:76px">&#9654;</button>
   <button data-key="40" style="left:80px; bottom:8px">&#9660;</button>
-  <button data-key="10" style="right:12px; bottom:60px; width:80px; height:80px; border-radius:40px">OK</button>
-  <button data-key="27" style="right:12px; top:12px">X</button>
-  <button data-key="116" style="right:12px; top:84px; font-size:13px">HOST</button>
+  <button data-key="17" class="word" style="right:12px; bottom:60px; width:80px; height:80px; border-radius:40px">ROTATE<br>/ OK</button>
+  <button data-key="17" data-hold="700" class="word" style="right:20px; bottom:156px">DROP</button>
+  <button data-key="10" class="word" style="left:12px; top:40px">SELECT</button>
+  <button data-key="27" class="word" style="right:12px; top:12px">BACK</button>
+  <button data-key="116" class="word" style="right:12px; top:84px">HOST</button>
 </div>
 <script type="module">import init from "./rg_web.js"; init();</script>
 </body>

@@ -174,6 +174,11 @@ pub fn build(args: &[String]) -> R<()> {
     run(Command::new(exe(bt.join("zipalign"))).args(["-f", "-p", "4"]).arg(&unsigned).arg(&aligned))?;
     let jdk = tool_jdk()?;
     let ks = out.join("debug.keystore");
+    // CI: the key comes from a repository secret (the keystore in base64), so that every release
+    // APK can update the app players installed (Android requires the same key)
+    if let Some(b64) = std::env::var("RG_APK_KEYSTORE").ok().filter(|s| !s.trim().is_empty()) {
+        std::fs::write(&ks, crate::util::base64_decode(&b64)?)?;
+    }
     if !ks.exists() {
         run(Command::new(jdk.join("bin/keytool"))
             .args(["-genkeypair", "-keystore"])

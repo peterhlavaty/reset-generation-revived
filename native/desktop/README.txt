@@ -6,8 +6,10 @@ and macOS, in widescreen. Single-player: Tutorial, Story Mode and Arcade (you vs
 up to 3 AI); multiplayer for 2-4 players over the internet or a LAN.
 
 RUN
-  Windows: double-click ResetGeneration.exe. Linux/macOS: run ./ResetGeneration
-  (macOS: the first time, right-click it -> Open, it is not signed).
+  Windows: double-click ResetGeneration.exe (if Windows says "Windows protected
+  your PC": More info -> Run anyway; the game is not signed by a publisher).
+  Linux/macOS: run ./ResetGeneration (macOS: the first time macOS blocks it, as
+  it is not signed: System Settings -> Privacy & Security -> Open Anyway).
   Nothing to install. Keep this folder somewhere you can write to (Desktop,
   Documents, Games), not "Program Files": the game saves progress and settings
   inside it (data/, revived.ini, ResetGeneration.log).
@@ -16,7 +18,7 @@ CONTROLS (keyboard)
   Arrow keys ........ move cursor / blocks / menu selection
   Ctrl .............. action: tap to rotate blocks or select, HOLD to drop blocks
   Enter ............. Select (left soft key)
-  Esc ............... Back / skip intro
+  Esc or Backspace .. Back / skip intro
   F11 or Alt+Enter .. toggle fullscreen (Windows; elsewhere maximize the window)
   F5 ................ host a multiplayer game (main menu)
   Keys can be remapped in Settings > Custom Keys.
@@ -39,7 +41,7 @@ MULTIPLAYER (2-4 players over the internet, on a LAN or on one PC; nothing to se
   1. The host presses F5 in the main menu, chooses the number of players
      (Left/Right, Enter) and a hero (Esc cancels). The host's game is the
      match's server; the title bar shows "Hosting, waiting for players".
-  2. The others choose Online -> Quick Match and pick a hero. When enough
+  2. The others choose Quick Match (main menu) and pick a hero. When enough
      players have joined, the match starts. The host plays too.
   After a match the host presses F5 again (the title bar says so) and the
   others choose Play Again.
@@ -65,7 +67,7 @@ MULTIPLAYER (2-4 players over the internet, on a LAN or on one PC; nothing to se
   If a player's game crashes or loses the connection during a match, the
   host keeps their place for as long as the match runs (their turns time out
   meanwhile): that player starts the game again with the same name and
-  chooses Online -> Quick Match. They go back into the same match, with the
+  chooses Quick Match. They go back into the same match, with the
   same colour, hero and board. (If the host quits, the match ends for
   everyone.)
   To try it alone on one PC, start the game several times (the second one
@@ -75,6 +77,10 @@ NOTES
   * "Online" friendly casinos and rankings are not implemented.
   * The Android version (APK) plays with the same server and can host too.
 
+Newest version, Android app: https://github.com/peterhlavaty/reset-generation-revived
+Play in the browser, no download: https://resetgeneration.rustyapps.com/
+
 Credits: Reset Generation (c) 2008 RedLynx / Nokia. 2020 standalone revival by
 curoviyxru, bodyz and bs0dd. Reset Generation Revived: the engine statically
-recompiled to native code, widescreen, multiplayer servers.
+recompiled to native code, widescreen, multiplayer servers; a fork of
+github.com/rcadden/reset-generation-revived, where the project began.

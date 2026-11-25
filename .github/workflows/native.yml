@@ -1,7 +1,8 @@
-# Native builds that cannot be made on a Windows PC: the desktop game for Linux and macOS (and
-# the Android APK and the browser version, from the Linux job). Each job is one `cargo x` command;
-# the Ghidra analysis of the engine DLL (decompiled/native/pcode.txt, never committed) is cached
-# between runs.
+# The native builds, each one `cargo x` command: the desktop game for Windows, Linux and macOS
+# (and the Android APK and the browser version, from the Linux job). The Ghidra analysis of the
+# engine DLL (decompiled/native/pcode.txt, never committed) is cached between runs. A push to main
+# then publishes the builds as the rolling "latest" pre-release (`cargo x github-release`), which
+# the README links to for players.
 name: native
 
 on:
@@ -11,8 +12,13 @@ on:
     paths:
       - "native/**"
       - "tools/rgtool/**"
-      - "server/**"
+      - "tools/lan-setup/**"
       - "tools/ghidra_scripts/**"
+      - "server/**"
+      - "game/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
       - ".github/workflows/native.yml"
 
 jobs:
@@ -20,15 +26,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # a newer push replaces builds still in progress (the release job is never cancelled)
+    concurrency:
+      group: native-${{ github.ref }}-${{ matrix.os }}
+      cancel-in-progress: true
+    env:
+      # GitHub API lookups of toolchain releases (shared runner addresses hit the anonymous limit)
+      GITHUB_TOKEN: ${{ github.token }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      HAS_APK_KEY: ${{ secrets.APK_KEYSTORE != '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: "" # its default (-D warnings) would replace the crt-static flags of the build
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
-      - name: Toolchains cache (JDK 25, Ghidra, wasm-bindgen)
+      - name: Toolchains cache (JDK 25, Ghidra, llvm-mingw, wasm-bindgen)
         uses: actions/cache@v6
         with:
           path: .toolchains
@@ -39,11 +56,22 @@ jobs:
         with:
           path: decompiled/native/pcode.txt
           key: pcode-${{ hashFiles('game/ResetGeneration/ResetGeneration-Win32-Web.dll', 'tools/ghidra_scripts/*.java') }}
+      # Android only installs an update signed with the same key as the installed app. The key
+      # belongs in the repository secret APK_KEYSTORE (the keystore in base64); until that is set,
+      # one made here is kept in the cache (lost when unused for 7 days: players reinstall once).
+      - name: APK signing key (until the APK_KEYSTORE secret is set)
+        if: runner.os == 'Linux' && env.HAS_APK_KEY != 'true'
+        uses: actions/cache@v6
+        with:
+          path: build/android/debug.keystore
+          key: apk-signing-key-v1
       - name: Desktop game
         run: cargo x build-desktop
       - name: Android APK
         if: runner.os == 'Linux'
         run: cargo x build-android
+        env:
+          RG_APK_KEYSTORE: ${{ secrets.APK_KEYSTORE }}
       - name: Browser version
         if: runner.os == 'Linux'
         run: cargo x build-web
@@ -55,3 +83,27 @@ jobs:
             dist/*.apk
             dist/web/
           if-no-files-found: error
+
+  release:
+    needs: desktop
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # one at a time, never stopped halfway (files are replaced one by one)
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Publish the "latest" pre-release
+        run: cargo x github-release artifacts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

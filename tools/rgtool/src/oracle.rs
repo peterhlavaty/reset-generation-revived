@@ -11,7 +11,6 @@
 //! Windows only (the original is a Win32 DLL).
 
 use crate::native::{generate_into, link_driver, patched_data, ppm_to_png, WIN_LIBS};
-use crate::setup::need;
 use crate::util::{root, R};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,7 +25,7 @@ pub fn oracle(args: &[String]) -> R<()> {
     }
     let r = root();
     let dir = r.join("build/oracle");
-    let bin = need("llvm-mingw")?.join("bin");
+    let bin = crate::setup::ensure("llvm-mingw")?.join("bin");
     let rgtest = r.join("native/host/desktop/rgtest.c");
     let exes = [dir.join("rg-oracle.exe"), dir.join("rgtest-pure.exe")];
     let mut libs32 = WIN_LIBS.to_vec();

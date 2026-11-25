@@ -34,7 +34,7 @@ void rg_advance_ms(uint32_t ms);
 void rg_net_configure(const char *server_url, const char *nickname);
 
 /* Hosting a game: this player's engine runs the match (and plays in it); the others join with
- * Online -> Quick Match. F5 (keycode 116 to rg_key) or rg_host_request() in the main menu opens a
+ * Quick Match. F5 (keycode 116 to rg_key) or rg_host_request() in the main menu opens a
  * player-count picker drawn over the game (rg_pixels), then the engine's hero select. */
 void rg_host_configure(int players, int hero);  /* picker default 2..4; hero 0..9, -1 random, -2 choose (default) */
 void rg_host_request(void);

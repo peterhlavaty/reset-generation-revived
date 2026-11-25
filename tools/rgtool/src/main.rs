@@ -10,6 +10,7 @@ mod oracle;
 mod pakpatch;
 mod play;
 mod recomp;
+mod release;
 mod setup;
 mod util;
 mod web;
@@ -20,13 +21,14 @@ const HELP: &str = "cargo x <command>
 
 Setup
   setup [what…|all]      download toolchains into .toolchains/ (default: what the Windows build
-                         needs; known: llvm-mingw, jdk25, ghidra, bearssl)
+                         needs; known: llvm-mingw, jdk25, ghidra, bearssl). The builds
+                         also install what they need themselves
   doctor                 show the toolchains found
 
 Build
   build-desktop          dist/ResetGeneration-Revived-<os> (+ .zip): the game for this OS
                          (Windows, Linux, macOS; build-windows is the same)
-  build-web              dist/web: the game in a web browser (WebAssembly; single-player)
+  build-web              dist/web: the game in a web browser (WebAssembly)
   serve-web [PORT]       serve dist/web on http://localhost:PORT (default 8080) to try it
 
 Play / test (the desktop build, Windows)
@@ -40,8 +42,8 @@ Play / test (the desktop build, Windows)
   killgame               end the game processes (and rg-relay.exe)
 
 Native (recompiled engine)
-  ghidra-export [DLL]    headless Ghidra analysis -> decompiled/native/pcode.txt (needs
-                         `cargo x setup jdk25 ghidra`; the first run takes several minutes)
+  ghidra-export [DLL]    headless Ghidra analysis -> decompiled/native/pcode.txt (installs
+                         JDK 25 + Ghidra if needed; the first run takes several minutes)
   recomp PCODE OUT [--files N] [--dll DLL] [--trace a,b] [--hook a,b] [--pure]
                          P-code -> C (the build commands run it themselves when needed)
   build-native-test [--calltrace] [--trace a,b]
@@ -77,6 +79,11 @@ Server
   deploy-web             build the browser version and put it on the public server (nginx
                          serves it from the relay's site: https://<domain>/)
   undeploy               remove the relay and the browser version from the server again
+
+Releases
+  github-release DIR     (CI) publish the builds found in DIR (the CI artifacts) as the
+                         repository's \"latest\" pre-release (GITHUB_TOKEN, GITHUB_REPOSITORY,
+                         GITHUB_SHA)
 ";
 
 fn main() {
@@ -121,6 +128,7 @@ fn main() {
         "deploy-logs" => deploy::logs(rest.first().and_then(|n| n.parse().ok()).unwrap_or(100)),
         "deploy-ssh" => deploy::remote(&rest.join(" ")),
         "undeploy" => deploy::undeploy(),
+        "github-release" => release::publish(rest),
         "help" | "-h" | "--help" => {
             print!("{HELP}");
             Ok(())

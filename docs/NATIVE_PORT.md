@@ -85,8 +85,23 @@ Per platform:
 * **macOS**: the Xcode command line tools.
 * **Android**: Android SDK with NDK (≥ 26) and build-tools (found via `ANDROID_HOME` or the
   Android Studio default); the APK is debug-signed with `build/android/debug.keystore`.
-* CI (`.github/workflows/native.yml`) builds the Linux and macOS desktop games and the APK and
-  keeps them as workflow artifacts; the Ghidra P-code is cached between runs.
+* CI (`.github/workflows/native.yml`) builds the desktop game on Windows, Linux and macOS, the
+  APK and the browser version (the Ghidra P-code is cached between runs). A push to main then
+  publishes them as the rolling `latest` pre-release with fixed asset names
+  (`ResetGeneration-Revived-{windows,linux,macos}.zip`, `-android.apk`; `cargo x
+  github-release`, `tools/rgtool/src/release.rs`): the tag is moved to the commit and each asset
+  replaced (uploaded as `<name>.new`, then renamed, so the README's download links never
+  break). GitHub does not let the workflow's token create or move a tag over a commit that
+  changes workflow files: the tag then stays (or goes on the nearest parent that takes it) and
+  only the assets and notes are updated. The APK is signed with the repository secret
+  `APK_KEYSTORE` (base64 of `build/android/debug.keystore`, written by `RG_APK_KEYSTORE` in
+  `android.rs`): Android only updates an app signed with the same key. Without the secret a key
+  made in CI is kept in the Actions cache (`apk-signing-key-v1`), which GitHub evicts after 7
+  days unused, and fork pull requests can read caches: set the secret. CI unsets RUSTFLAGS for
+  the desktop builds (`no_rustflags`: the toolchain action's `-D warnings` would replace the
+  crt-static flags). macOS builds target macOS 11
+  (`MACOSX_DEPLOYMENT_TARGET`) on Apple Silicon. Zips keep the Unix mode bits (the program 755),
+  so unzipping on Linux/macOS leaves it executable.
 
 ## Desktop game
 
@@ -146,7 +161,9 @@ online play included (Quick Match, hosting with F5 or the HOST touch button), ex
   (settings, saved games, achievements) go to `localStorage` (`rg:<path>`, base64) and are put
   back at the next start.
 * **Input and sound.** Keyboard (arrows, Enter, Esc/Backspace, Ctrl, Space, letters); on touch
-  screens on-screen buttons (`data-key` elements). Web Audio plays the 8 kHz mix in short
+  screens on-screen buttons (`data-key` elements) laid out like Android's: d-pad, ROTATE / OK
+  (Ctrl), DROP (`data-hold="700"`: a tap holds Ctrl 700 ms by itself), SELECT, BACK, HOST;
+  `?touch=1` shows them without a touch screen. Web Audio plays the 8 kHz mix in short
   buffers ~0.1 s ahead, once the player has pressed something (browsers block sound before).
 * **Online.** One thread, so nothing may block (`RT_NO_THREADS`, set for wasm in `link.h`): the
   relay links are the page's WebSockets (`native/web/src/link.rs`: `link_open` returns at once,

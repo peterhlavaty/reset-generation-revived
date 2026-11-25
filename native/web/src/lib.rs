@@ -134,6 +134,12 @@ async fn run() -> Result<(), JsValue> {
     canvas.set_height(H as u32);
     let ctx: CanvasRenderingContext2d = canvas.get_context("2d")?.ok_or("no 2d canvas")?.dyn_into()?;
 
+    // ?touch=1 shows the on-screen buttons without a touch screen (to try them)
+    if param("touch") == "1" {
+        if let Some(b) = doc.body() {
+            b.set_class_name("touch");
+        }
+    }
     online(&doc)?;
     let c = |s: &str| CString::new(s).unwrap();
     unsafe {
@@ -296,15 +302,26 @@ fn input(doc: &web_sys::Document) -> Result<(), JsValue> {
     let tap = Closure::<dyn FnMut()>::new(|| GAME_STATE.with(|g| g.borrow_mut().as_mut().map(unlock_audio)).unwrap_or(()));
     w.add_event_listener_with_callback("pointerdown", tap.as_ref().unchecked_ref())?;
     tap.forget();
-    // on-screen buttons (touch screens): elements with data-key="<AWT code>"
+    // on-screen buttons (touch screens): elements with data-key="<AWT code>"; data-hold="MS"
+    // makes a tap hold the key for MS by itself (DROP: the engine drops a piece when Ctrl has
+    // been held 500 ms, as on Android)
     let buttons = doc.query_selector_all("[data-key]")?;
     for i in 0..buttons.length() {
         let Some(el) = buttons.item(i).and_then(|n| n.dyn_into::<web_sys::Element>().ok()) else { continue };
         let Some(code) = el.get_attribute("data-key").and_then(|k| k.parse::<c_int>().ok()) else { continue };
+        let hold = el.get_attribute("data-hold").and_then(|ms| ms.parse::<i32>().ok());
         for (ev, down) in [("pointerdown", true), ("pointerup", false), ("pointercancel", false), ("pointerleave", false)] {
             let f = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
                 e.prevent_default();
-                key(down, code);
+                match hold {
+                    None => key(down, code),
+                    Some(ms) if down => {
+                        key(true, code);
+                        let up = Closure::once_into_js(move || key(false, code));
+                        let _ = window().set_timeout_with_callback_and_timeout_and_arguments_0(up.unchecked_ref(), ms);
+                    }
+                    Some(_) => {}
+                }
             });
             el.add_event_listener_with_callback(ev, f.as_ref().unchecked_ref())?;
             f.forget();

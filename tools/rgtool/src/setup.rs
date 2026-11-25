@@ -29,7 +29,7 @@ fn os() -> &'static str {
     }
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -42,8 +42,13 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn get_json(url: &str) -> R<serde_json::Value> {
-    let mut resp = agent().get(url).call().map_err(|e| format!("{url}: {e}"))?;
+pub(crate) fn get_json(url: &str) -> R<serde_json::Value> {
+    let mut req = agent().get(url);
+    // in CI the workflow's token lifts GitHub's 60 requests an hour for shared runner addresses
+    if let Some(t) = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty() && url.starts_with("https://api.github.com/")) {
+        req = req.header("Authorization", &format!("Bearer {t}"));
+    }
+    let mut resp = req.call().map_err(|e| format!("{url}: {e}"))?;
     Ok(resp.body_mut().read_json()?)
 }
 
@@ -115,6 +120,14 @@ pub fn find(name: &str) -> Option<PathBuf> {
 /// Like [`find`], or an error that says how to get it.
 pub fn need(name: &str) -> R<PathBuf> {
     find(name).ok_or_else(|| format!("{name} is not installed: run `cargo x setup {name}`").into())
+}
+
+/// Like [`need`], but installs it first if it is missing (the builds fetch what they need).
+pub fn ensure(name: &str) -> R<PathBuf> {
+    if find(name).is_none() {
+        setup(&[name.to_string()])?;
+    }
+    need(name)
 }
 
 fn install(name: &str, url: &str, sha: &str, file: &str) -> R<()> {

@@ -168,7 +168,7 @@ pub fn build_test(args: &[String]) -> R<()> {
     let gen = generate(&recomp_args)?;
     let r = root();
     let (cc, libs): (PathBuf, &[&str]) = if cfg!(windows) {
-        (need("llvm-mingw")?.join("bin/x86_64-w64-mingw32-clang.exe"), WIN_LIBS)
+        (crate::setup::ensure("llvm-mingw")?.join("bin/x86_64-w64-mingw32-clang.exe"), WIN_LIBS)
     } else {
         (PathBuf::from(std::env::var("CC").unwrap_or("cc".into())), &["-lpthread", "-lm"])
     };
@@ -300,7 +300,7 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
     let r = root();
     let rt = r.join("native/rt");
     let (cc, ar, target) = if cfg!(windows) {
-        let bin = need("llvm-mingw")?.join("bin");
+        let bin = crate::setup::ensure("llvm-mingw")?.join("bin");
         (bin.join("x86_64-w64-mingw32-clang.exe"), bin.join("llvm-ar.exe"), Some("x86_64-pc-windows-gnullvm"))
     } else {
         let env = |k: &str, d: &str| PathBuf::from(std::env::var(k).unwrap_or(d.into()));
@@ -331,13 +331,14 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
 
     let mut cargo = Command::new("cargo");
     cargo.current_dir(&r).args(["build", "-q", "--release", "-p", "rg-native"]).env("RG_ENGINE_LIB", &lib);
+    no_rustflags(&mut cargo);
     if cfg!(windows) {
         // the exe's icon (a resource object the linker adds: native/desktop/build.rs)
         let rc = r.join("build/native/desktop/icon.rc");
         let ico = r.join("native/desktop/icon.ico").to_string_lossy().replace('\\', "/");
         std::fs::write(&rc, format!("1 ICON \"{ico}\"\n"))?;
         let res = r.join("build/native/desktop/icon.o");
-        let windres = need("llvm-mingw")?.join("bin/x86_64-w64-mingw32-windres.exe");
+        let windres = crate::setup::ensure("llvm-mingw")?.join("bin/x86_64-w64-mingw32-windres.exe");
         run(Command::new(windres).arg(&rc).arg("-O").arg("coff").arg("-o").arg(&res))?;
         cargo.env("RG_ICON_RES", &res);
     }
@@ -359,7 +360,10 @@ pub fn build_desktop(_args: &[String]) -> R<()> {
     std::fs::copy(&exe, dist.join(&exe_name))?;
     if cfg!(windows) {
         // opens the firewall for hosting LAN games (the hosting game's relay)
-        run(Command::new("cargo").current_dir(&r).args(["build", "-q", "--release", "-p", "lan-setup"]))?;
+        let mut lan = Command::new("cargo");
+        lan.current_dir(&r).args(["build", "-q", "--release", "-p", "lan-setup"]);
+        no_rustflags(&mut lan);
+        run(&mut lan)?;
         std::fs::copy(r.join("target/release/lan-setup.exe"), dist.join("LAN-Setup.exe"))?;
     }
     patched_data(&dist.join("data"))?;
@@ -417,4 +421,11 @@ pub fn img_diff(args: &[String]) -> R<()> {
         return Err("the images differ".into());
     }
     Ok(())
+}
+
+/// Builds without RUSTFLAGS from the environment (CI toolchain actions set it, e.g. to -D
+/// warnings): cargo uses only one source of flags, so it would silently drop the per-target ones
+/// set here and those in .cargo/config.toml (crt-static on Windows).
+fn no_rustflags(c: &mut Command) {
+    c.env_remove("RUSTFLAGS").env_remove("CARGO_ENCODED_RUSTFLAGS");
 }

@@ -138,7 +138,7 @@ Test aids (desktop game): `--keys=T:KEY,...` presses keys T ms after start (`ESC
 ### Dropped connections and going back into a match
 
 A client whose game crashed or lost the network can go back into the match it was in: start the
-game again (or go Online -> Quick Match) with the **same nickname** — at any time while the match
+game again (or choose Quick Match) with the **same nickname** — at any time while the match
 runs; there is no time limit. Meanwhile the match goes on; that player's turns time out.
 
 What the engine does on its own is not enough. Its acceptor is polled all match long and the

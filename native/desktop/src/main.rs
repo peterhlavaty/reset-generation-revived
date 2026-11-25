@@ -80,7 +80,7 @@ impl Config {
                      # server: auto (a game hosted on this network, else the public server; hosting\n\
                      # without internet runs a LAN server in this game), online, lan, or ws://HOST:PORT/ws\n\
                      server={}\n\
-                     # your name in online games (letters, digits, _)\n\
+                     # your name in online games (1-15 letters, digits or _)\n\
                      nickname={}\n\
                      # window size: fit (largest that fits the screen), 1, 2 or 4; F11 or Alt+Enter\n\
                      # toggles fullscreen (Windows)\n\
@@ -110,7 +110,8 @@ impl Config {
             match k.trim() {
                 "server" if !v.is_empty() => self.server = v,
                 "nickname" => {
-                    let n: String = v.chars().filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_').take(16).collect();
+                    // the relay takes names of 1-15 of these
+                    let n: String = v.chars().filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_').take(15).collect();
                     if !n.is_empty() {
                         self.nickname = n;
                     }

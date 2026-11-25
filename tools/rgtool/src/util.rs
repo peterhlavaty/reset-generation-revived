@@ -102,6 +102,29 @@ pub fn no_inherit() {
     }
 }
 
+/// Decodes standard base64 (padding optional, whitespace ignored).
+pub fn base64_decode(s: &str) -> R<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Err(format!("not base64: {:?}", c as char).into()),
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// Packs a folder into a zip (the folder itself at the top).
 pub fn zip_dir(dir: &Path, dest: &Path) -> R<()> {
     let base = dir.parent().unwrap();
@@ -115,15 +138,46 @@ pub fn zip_dir(dir: &Path, dest: &Path) -> R<()> {
         entries.sort();
         for p in entries {
             let name = p.strip_prefix(base)?.to_string_lossy().replace('\\', "/");
+            // Unix permission bits, which every unzip on Linux and macOS applies: the program
+            // (a file without an extension) must stay executable
             if p.is_dir() {
-                out.add_directory(format!("{name}/"), opts)?;
+                out.add_directory(format!("{name}/"), opts.unix_permissions(0o755))?;
                 stack.push(p);
             } else {
-                out.start_file(name, opts)?;
+                let mode = if p.extension().is_none() { 0o755 } else { 0o644 };
+                out.start_file(name, opts.unix_permissions(mode))?;
                 std::io::copy(&mut std::fs::File::open(&p)?, &mut out)?;
             }
         }
     }
     out.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod zip_tests {
+    #[test]
+    fn base64() {
+        assert_eq!(super::base64_decode("UmVzZXQ=").unwrap(), b"Reset");
+        assert_eq!(super::base64_decode("UmVz\nZXQgR2Vu").unwrap(), b"Reset Gen");
+        assert!(super::base64_decode("a*b").is_err());
+    }
+
+    /// Unzipped on Linux or macOS, the program must still be executable.
+    #[test]
+    fn zip_keeps_the_program_executable() {
+        let tmp = std::env::temp_dir().join(format!("rgtool-zip-{}", std::process::id()));
+        let dir = tmp.join("Game");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("ResetGeneration"), b"x").unwrap();
+        std::fs::write(dir.join("data/a.pak"), b"y").unwrap();
+        let zip = tmp.join("Game.zip");
+        super::zip_dir(&dir, &zip).unwrap();
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&zip).unwrap()).unwrap();
+        let mode = |z: &mut zip::ZipArchive<std::fs::File>, n: &str| z.by_name(n).unwrap().unix_mode().unwrap() & 0o777;
+        assert_eq!(mode(&mut z, "Game/ResetGeneration"), 0o755);
+        assert_eq!(mode(&mut z, "Game/data/a.pak"), 0o644);
+        assert_eq!(mode(&mut z, "Game/data/"), 0o755);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

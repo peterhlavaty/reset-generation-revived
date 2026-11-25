@@ -695,7 +695,7 @@ const char *rg_host_status(void) {
     case 3:
         if (!ws_up && no_relay) snprintf(status, sizeof status, "Cannot host: no server (no internet, and this device cannot run a LAN relay)");
         else if (!ws_up) snprintf(status, sizeof status, "Hosting: connecting to the server...");
-        else snprintf(status, sizeof status, "Hosting, waiting for players %d/%d (others: Online - Quick Match)", n, wanted);
+        else snprintf(status, sizeof status, "Hosting, waiting for players %d/%d (others: Quick Match)", n, wanted);
         return status;
     case 4:
         if (n < wanted) snprintf(status, sizeof status, "Hosting: match running, %d/%d players still connected", n, wanted);
@@ -790,7 +790,7 @@ const uint32_t *rg_server_compose(const uint32_t *fb, int w, int h) {
     char line[80];
     snprintf(line, sizeof line, "YOU + %d OTHER PLAYER%s", picker - 1, picker == 2 ? "" : "S");
     centred(buf, w, h, y + 37 * u, sc, line, pale);
-    centred(buf, w, h, y + 44 * u, 1, "THE OTHERS CHOOSE ONLINE - QUICK MATCH", pale);
+    centred(buf, w, h, y + 44 * u, 1, "THE OTHERS CHOOSE QUICK MATCH", pale);
     centred(buf, w, h, y + 50 * u, 1, "LEFT/RIGHT: CHANGE   OK/ENTER: CONTINUE   BACK/ESC: CANCEL", pale);
     return buf;
 }

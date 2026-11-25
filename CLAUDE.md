@@ -72,4 +72,7 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
 * Server: `server/` (`cargo test -p rg-server`, `cargo run -p rg-server -- --log-packets`);
   `deploy`, `deploy-web`, `deploy-status`, `deploy-logs`, `deploy-ssh`, `undeploy` (settings in
   `deploy.local.ini`; the server also runs other sites — touch only our unit and nginx site).
-* CI: `.github/workflows/native.yml` builds the desktop game on Linux/macOS and the APK.
+* CI: `.github/workflows/native.yml` builds the desktop game (Windows, Linux, macOS), the APK and
+  the browser version, and publishes them as the rolling `latest` pre-release (`cargo x
+  github-release`); the README's download links point there. Player downloads live on GitHub,
+  not on the rustyapps server.
