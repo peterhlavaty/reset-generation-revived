@@ -1,0 +1,20 @@
+[package]
+name = "rg-server"
+description = "Reset Generation Revived multiplayer server: relay, casino (matchmaking), game rooms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rg-relay"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "io-util"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = "2"
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }

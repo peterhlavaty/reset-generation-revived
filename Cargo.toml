@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["server"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/peterhlavaty/reset-generation-revived"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# The relay runs on a small VPS and in every hosting player's game: small and lean.
+[profile.release.package.rg-server]
+opt-level = "s"
+codegen-units = 1
