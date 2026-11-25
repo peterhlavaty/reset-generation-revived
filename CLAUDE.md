@@ -1,56 +1,58 @@
 # Reset Generation Revived — project notes for agents
 
-Read `README.md`, then the doc for the area you touch (`docs/`). Work on `dev`; `main` only on
-explicit instruction. Public repo: github.com/rcadden/reset-generation-revived. Never commit personal paths/emails or
-decompiled code (`decompiled/` is git-ignored). The original game files in `game/` are included
-with permission; keep them pristine (patch at build/launch time, never in place).
+Read `README.md`, then the doc for the area you touch (`docs/`). Public repo:
+github.com/peterhlavaty/reset-generation-revived (branch `main`). Never commit personal paths,
+emails, secrets (`deploy.local.ini`, SSH keys) or decompiled/generated code (`decompiled/`,
+`build/` are git-ignored). The original game files in `game/` are included with permission; keep
+them pristine (patch at build/launch time, never in place).
+
+Languages: Rust, Java, C (and C++ if ever needed). No Python, shell, PowerShell or JS/TS: tools go
+into rgtool (`tools/rgtool`, run as `cargo x <command>`).
 
 ## Facts that are easy to get wrong
 
 * The real game is the **native x86 DLL** `ResetGeneration-Win32-Web.dll`; Java is only a host.
-  The DLL is 32-bit, so any JVM that loads it must be **32-bit** (we use Temurin 17 x86 at
-  `C:\dev\toolchains\jdk-17.0.17+10`; JDK 21 x64 there is only for Ghidra).
+  The DLL is 32-bit, so any JVM that loads it must be **32-bit** (`.toolchains/jdk17-x86`; JDK 25
+  x64 is for Ghidra 12.2 and the build-time Java tools elsewhere).
 * The engine accepts **any screen size** at `init` and lays out its UI for it. Default is
-  640×360 (≥320 rows so 240×320 cutscenes fit).
+  640×360 (≥320 rows so 240×320 cutscenes fit). The native builds are fixed at 640×360 (their
+  data and layout patches are made for it).
 * The **N-Gage paks are DRM-encrypted**; only the web/standalone paks are usable.
 * Game data paks are patched at launch by `PakPatcher` from `*.pak.orig` (wipe masks, cutscene
-  offsets). Never edit `*.pak` by hand; change the transform and bump `PakPatcher.VERSION`.
+  offsets); the native builds pre-patch them with `rg.PatchTool`. Never edit `*.pak` by hand;
+  change the transform and bump `PakPatcher.VERSION`.
 * The engine only draws when ahead of its 32 fps schedule (frame limiter on `timeGetTime`);
   hosts must supply time and let `Sleep()` advance it.
 * No floating point in the engine's hot code (fixed-point).
 * The engine's file API is ANSI (`CreateFileA`) and gets its home directory as UTF-8: a non-ASCII
-  game folder crashes it, so `HostServer.engineHome` makes that folder the current directory
-  (`rghost.dll`) and passes a relative home.
+  game folder crashes it, so hosts make that folder the current directory and pass a relative
+  home (`HostServer.engineHome` / `rghost.dll`; the native desktop game does the same).
 * The engine's clock must start small: it misbehaves with large `timeGetTime` values (long
   uptimes), so hosts rebase it (`rt_now_ms` starts at 5,000,000).
-* Android/native = **static recompilation**: Ghidra P-code (`tools/ghidra_export.sh`) →
-  `tools/recomp/recomp.py` → C. Code only reachable through vtables/stored callbacks must be
-  recovered by the export's pre-pass; an "unknown address" fatal means a missed entry point.
-* Online: the engine waits for the room's server to speak first; `CasinoSystem` is served by
-  the casino bot in `server/src/casino.js`. Matches run on the hosting player's engine (`rghost.dll`).
-  The Windows build has a Java/Netty port of the relay + casino built in (`src/java/rg/relay/`,
-  started by the host; clients find it by UDP broadcast on 8787, `server=auto`): keep it in sync
-  with `server/src/{relay,casino,gameroom}.js`.
+* Native (desktop, Android) = **static recompilation**: Ghidra P-code (`cargo x ghidra-export`)
+  → `tools/rgtool/src/recomp.rs` → C in `build/native/gen` + `native/rt`. Code only reachable
+  through vtables/stored callbacks must be recovered by the export's pre-pass; an "unknown
+  address" fatal means a missed entry point. The guest address space is a 4 GB reservation.
+* Online: the engine waits for the room's server to speak first; Quick Match and hosted rooms
+  are served by `server/` (rg-relay, Rust). Matches run on the hosting player's engine
+  (`rghost.dll`, Windows build only); native/Android clients join. The Windows build bundles
+  `rg-relay.exe` for LAN games (clients find it by UDP broadcast on 8787, `server=auto`). A
+  dropped player's seat is held for as long as the match runs (`rejoin_ms: None`).
+* Windows child processes inherit our std handles unless `util::no_inherit()` ran: piped rgtool
+  commands then hang until the game exits.
+* aapt2 on Windows writes asset names with `\`; android.rs rewrites them (regression test).
 
 ## Tools
 
-* `tools/build_windows.sh` — full release build into `dist/`. `tools/fetch_deps.sh` — Netty jars
-  (pinned sha256) into `build/deps/`, used by the build and run scripts.
-* `tools/build_android.sh` — APK into `dist/` (NDK + aapt2, no Gradle). `tools/build_native_desktop.sh`
-  — `C:\dev\rgbuild\rgtest.exe`, headless test driver (`EXTRA_CFLAGS=-DRT_CALLTRACE`,
-  `RECOMP_ARGS="--trace addr,…"` for debugging). Native build output stays in `C:\dev\rgbuild`
-  (never in OneDrive).
-* `server/` — relay + casino: `npm start`, `npm test`, `--log-packets`.
-* `tools/setup_dev.sh` then `tools/run_revived.sh [--render_height=N …]` — run compiled classes against `extracted/standalone/`.
-* `tools/k.sh "KEYS" name [width]` — send keys (`RETURN,ESC,UP,DOWN,LEFT,RIGHT,CTRL,F11,WAIT500`)
-  to the game window and screenshot to the session scratchpad. `tools/killgame.sh` kills only the
-  game JVM (never `taskkill java.exe` — Ghidra is also a JVM).
-* `tools/pak.py`, `tools/gfx.py`, `tools/sisx.py`, `tools/split_ngage.py` — data extraction.
-* `tools/emu/rgemu.py` — engine under Unicorn emulation (oracle for the Android recompiler).
-* Ghidra 12.1.4 at `C:\dev\toolchains\ghidra_12.1.4_PUBLIC`, project `C:\dev\ghidra_proj\RG`.
-* Android SDK at `C:\dev\toolchains\android-sdk` (NDK 29, build-tools 36, emulator; AVD `rgtest` in
-  `C:\dev\avd`, WHPX-accelerated); llvm-mingw at `C:\dev\toolchains\llvm-mingw-20261006-ucrt-x86_64`.
-
-## Python
-
-Run scripts with `py -I`. Unpacked third-party data lives under `extracted/` — never run code from there.
+* `cargo x setup [all|jdk17-x86|llvm-mingw|jdk25|ghidra]`, `cargo x doctor` — toolchains in
+  `.toolchains/` (`RG_TOOLCHAINS` overrides). The Android SDK is found via `ANDROID_HOME` or the
+  Android Studio default location.
+* Builds: `build-windows`, `build-desktop`, `build-android`, `build-native-test` (+ `native-test`).
+* Play/test: `run`, `lan-test N`, `keys "RETURN,DOWN,WAIT500" [shot] [--pid=N]`, `shot`,
+  `killgame` (only game processes — never kill all `java.exe`), `android-run`, `android-keys`,
+  `android-shot`, `android-log`. Screenshots go to `build/shots/`, logs to `build/logs/`.
+* Data: `pak list|extract`, `gfx`, `spc`, `sisx`, `split-ngage`.
+* Server: `server/` (`cargo test -p rg-server`, `cargo run -p rg-server -- --log-packets`);
+  `deploy`, `deploy-status`, `deploy-logs`, `deploy-ssh`, `undeploy` (settings in
+  `deploy.local.ini`; the server also runs other sites — touch only our unit and nginx site).
+* CI: `.github/workflows/native.yml` builds the desktop game on Linux/macOS and the APK.

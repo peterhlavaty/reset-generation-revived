@@ -47,7 +47,7 @@ Java and in data.
   call (skipping text-box widgets called from RVA 0xa2xxx, which centre themselves). The wrappers and
   `xoff` live in a second cave at RVA 0x176580; `.text` is made writable and the caves address their data
   with call/pop so they survive relocation. `tools/testdata/single_player_game.save` is a post-tutorial
-  save for testing (copy it into the game folder; `build_windows.sh` wipes `dist/`).
+  save for testing (copy it into the game folder; `cargo x build-windows` replaces `dist/`).
 * Everything else is the original `ResetGeneration.jar` / `rg-signed.jar`, repacked.
 
 **Resolution choice.** `render_height=auto` takes the largest integer scale that keeps at least
@@ -58,19 +58,23 @@ tiny and cutscene art cannot fill it.
 
 ## Build
 
-Requirements: the game files in `game/` (checked in), a 32-bit JDK 17
-(`C:\dev\toolchains\jdk-17.0.17+10`, portable Temurin x86 zip; override with `JDK=`), Git Bash.
+Requirements: Rust; `cargo x setup` downloads a 32-bit Temurin JDK 17 and llvm-mingw (for
+`rghost.dll`) into `.toolchains/`. The game files are in `game/` (checked in); Netty is fetched
+with pinned checksums.
 
 ```bash
-tools/build_windows.sh
+cargo x setup
+cargo x build-windows
 ```
 
-Output: `dist/ResetGeneration-Revived/` — `ResetGeneration-Revived.exe`, `runtime/`, `app/`
-(jars, `revived.ini`, `ResetGeneration/` game data), `README.txt`. Zip the folder to distribute.
+Output: `dist/ResetGeneration-Revived/` — `ResetGeneration-Revived.exe`, `runtime/` (trimmed
+32-bit JRE), `app/` (jars, `revived.ini`, `rghost.dll`, `rg-relay.exe`, `ResetGeneration/` game
+data), `LAN-Setup.exe`, `README.txt` — and the same folder as `dist/ResetGeneration-Revived.zip`.
 
-Developer loop without packaging: `tools/setup_dev.sh` once, then `tools/run_revived.sh
-[--render_height=…]` runs the compiled classes against `extracted/standalone/`; `tools/k.sh "KEYS" name` sends keys to the window and
-takes a screenshot (`tools/rgkeys.ps1`, `tools/winshot.ps1`).
+Developer loop: `cargo x run [--render_height=… --nickname=…]` starts the built game (log in
+`build/logs/run.log`); `cargo x keys "RETURN,DOWN,WAIT500" name` sends keys to its window and
+takes a screenshot (`build/shots/name.png`); `cargo x lan-test 3` starts a host and two clients
+on this PC; `cargo x killgame` ends them.
 
 ## Known issues / polish backlog
 
@@ -90,8 +94,8 @@ takes a screenshot (`tools/rgkeys.ps1`, `tools/winshot.ps1`).
 6. Audio is the engine's original 8 kHz mono mix — faithful to the original, but low fidelity.
 7. Windows "Smart App Control"/SmartScreen may warn about the unsigned exe on other PCs.
 
-## Next step for Windows (optional)
+## Without Java
 
-Replacing Java entirely with a small native host (C + SDL2) that loads the engine DLL directly
-and implements the ~10 JNI calls it uses — the same host the Android plan needs. Benefits: tiny
-download, gamepads, better audio resampling, no JVM. See `ANDROID_PLAN.md` phase 1.
+The native desktop game (`cargo x build-desktop`, `docs/NATIVE_PORT.md`) runs the recompiled
+engine without a JVM on Windows, Linux and macOS (one 7 MB executable plus the data). It does not
+host online games yet, so the Java build stays the one to host from.

@@ -1,5 +1,10 @@
 # Android port plan
 
+> **History.** This is the plan that led to the native port; it is done (option C, static
+> recompilation): see `NATIVE_PORT.md`. The Unicorn emulator it mentions (`tools/emu/rgemu.py`, the
+> oracle the recompiler was validated against) has since been removed from the repository with
+> the other Python tools.
+
 Goal: Reset Generation as a real Android game (Play-distributable APK/AAB, landscape, touch
 controls, gamepad support), single-player first, multiplayer later.
 
@@ -124,10 +129,11 @@ closed → production tracks as with Drywater.
 | Performance on low-end phones | Native C; 640×360 software rendering is light (the original ran on ~330–370 MHz ARM11 N-Gage 2.0 phones at 240×320) |
 | Licensing of bundled fonts/libs | Larabie fonts permit commercial bundling; SDL2 is zlib; keep notices |
 
-## Immediate next actions
+## Outcome
 
-1. Install portable llvm-mingw + SDL2 dev libraries; build `rghost` (Phase 1) using
-   `tools/emu/rgemu.py` as the reference for every shim function.
-2. Extend the PoC into the **oracle**: scripted input files, framebuffer hash logging per frame.
-3. Prototype the recompiler on a handful of leaf functions (the RLE sprite decoder at RVA
-   `0x9df80` is a good first target: hot, pure integer, self-contained).
+The recompiler (now `tools/rgtool/src/recomp.rs`) translates the whole DLL; the runtime
+(`native/rt`) replaced the emulator's shim; the oracle comparison found the remaining bugs
+(155,659 Win32/JNI calls identical). The recompiled engine ships in the Android APK and in the
+native desktop game for Windows, Linux and macOS (`cargo x build-android`, `cargo x
+build-desktop`). SDL2 was not needed: Android uses NativeActivity/AAudio, the desktop game minifb
+and tinyaudio.

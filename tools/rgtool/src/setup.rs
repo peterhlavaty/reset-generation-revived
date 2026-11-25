@@ -106,6 +106,9 @@ pub fn find(name: &str) -> Option<PathBuf> {
     let d = dir().join(name);
     let marker = std::fs::read_to_string(d.join(".home")).ok()?;
     let p = d.join(marker.trim());
+    // a macOS JDK is a bundle: its home (bin/java, bin/javac) is Contents/Home
+    let bundle = p.join("Contents/Home");
+    let p = if bundle.join("bin").is_dir() { bundle } else { p };
     p.is_dir().then_some(p)
 }
 
@@ -230,4 +233,21 @@ pub fn doctor() -> R<()> {
         None => println!("  android-sdk -  (install Android Studio or the command-line tools; set ANDROID_HOME)"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression: on macOS the JDK's bin/ is under Contents/Home, so `javac` was not found.
+    #[test]
+    fn macos_jdk_bundle_home() {
+        let root = std::env::temp_dir().join(format!("rgtool-setup-test-{}", std::process::id()));
+        let tc = root.join("jdk25");
+        std::fs::create_dir_all(tc.join("x/jdk-25.jdk/Contents/Home/bin")).unwrap();
+        std::fs::write(tc.join(".home"), "x/jdk-25.jdk").unwrap();
+        std::env::set_var("RG_TOOLCHAINS", &root);
+        let home = super::find("jdk25").unwrap();
+        std::env::remove_var("RG_TOOLCHAINS");
+        assert!(home.ends_with("Contents/Home"), "{}", home.display());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

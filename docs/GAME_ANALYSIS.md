@@ -13,8 +13,9 @@ native engine with Ghidra, and running the game. Written 2026-10-16.
 The web version and the N-Gage version share the engine and data layout; the web version's
 paks are a superset (it adds `fonts.pak` with Chinese/Russian fonts) and are not encrypted.
 
-Tools written for this: `tools/split_ngage.py` (MIME split), `tools/sisx.py` (SIS v9 extractor),
-`tools/pak.py` (pak extractor with real file names).
+Tools written for this (in rgtool): `cargo x split-ngage` (MIME split), `cargo x sisx` (SIS v9
+extractor), `cargo x pak list|extract` (pak extractor with real file names), `cargo x gfx` (.gfx →
+PNG) and `cargo x spc` (.spc → WAV, tentative).
 
 ## 2. Architecture of the Windows (web) build
 
@@ -86,7 +87,7 @@ data…                   zlib streams when the flag is 1
 
 The **last entry of every pak is its file-name list** (`u32 n; n × {u16 len; char[len]}`), in
 entry order, so every file can be extracted with its original path
-(`py -I tools/pak.py extract <pak> <outdir>`).
+(`cargo x pak extract <pak> <outdir>`).
 
 | Pak | Entries | Contents |
 |-----|--------:|----------|

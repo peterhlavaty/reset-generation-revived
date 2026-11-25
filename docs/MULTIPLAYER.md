@@ -1,17 +1,18 @@
 # Multiplayer: our own server for Quick Match / Online
 
-Status (2026-11-17):
+Status (2026-11-25):
 
 | Piece | State |
 |---|---|
 | **Hosted games (Windows build)** | **Works, 2–4 players** — F5 makes a player's own engine the game server (the original LAN host mode) and they play as player 0; Quick Match puts the others into that game. See "Hosted games" |
-| Relay server (`server/`, Node + Cloudflare Worker) | **Done**, 19 tests (`npm test`) |
-| Built-in LAN relay (Windows, `src/java/rg/relay/`, Netty) | **Done** — the host's game runs it, clients find it by UDP broadcast (`server=auto`, the default); see "Built-in LAN relay" |
+| Server (`server/`, Rust: relay, casino, game rooms; binary `rg-relay`) | **Done**, tests in `server/tests` (`cargo test -p rg-server`); public instance at `ws://resetgeneration.rustyapps.com/ws` (`cargo x deploy`, see "Running a server") |
+| LAN without internet (Windows) | **Done** — the host's game starts the bundled `rg-relay.exe --lan`, clients find it by UDP broadcast (`server=auto`, the default); see "LAN relay" |
 | Client: Windows (Java replacement for `SNAPMobileClient`) | **Done** — logs in to the relay with a nickname, no Arena login screen |
-| Client: native/Android (`native/rt/net.c`) | **Done** (plain `ws://` only) |
+| Client: native desktop / Android (`native/rt/net.c`) | **Done** (plain `ws://`): joins hosted games; verified Android ↔ Windows and native Windows ↔ Windows matches through the public server |
 | Casino system (login, casino enter, Quick Match queue, lock, matched-up) | **Done** — both players listed in "Players in Match", "Game starting…" |
-| Game room bot (`server/src/gameroom.js`: handshake, seating on 0x15, forwarding) | **Done** — both players seated in a shared room |
-| Game server (channel 0x16: world setup, then the match) | **Phase 0 works**: a headless second engine instance (`rgtest --server`) serves M1..M4 and the client shows the match screen; a crash in the first game event is open (see "Phase 0 result") |
+| Game room bot (`server/src/gameroom.rs`: handshake, seating on 0x15, forwarding) | **Done** |
+| Game server (channel 0x16) | **Done** by the hosting player's engine (`rghost.dll`); the recompiled engine can serve too (`rgtest --server`, Phase 0) but no native host offers hosting yet |
+| Going back into a match after a crash / dropped connection | **Done**, no time limit: the seat is held as long as the match runs (see "Dropped connections") |
 | Friendly arenas, rankings, statistics, achievements, friends | Answered with empty/OK replies so the client does not stall; not implemented |
 
 ## Hosted games (Windows build) — working multiplayer
@@ -36,7 +37,7 @@ in the real engine DLL what `native/rt/server.c` does for the recompiled one:
   engine thread after every tick.
 
 Relay side: `serve` with `players` registers a hosted game with the casino; `matchmake()` fills
-hosted games first (once enough players are queued), and the node server's `--match-size`
+hosted games first (once enough players are queued), and `rg-relay --match-size`
 defaults to 0, so Quick Match never forms `QM_n` rooms that have no game server. When the host's
 engine closes the listener (match over, or the host left the host screen) rghost sends
 `{"t":"unserve"}`, so no one is matched into a dead room, and the title says "F5 = host a new
@@ -66,49 +67,50 @@ id had changed between casino visits (our casino used to hand out a new id per j
 match), the stale entry deleted the context's user object; the next tick after a dropped
 connection called through it (`0x100ecf90`) and the client crashed a few seconds after losing the
 relay. The member delete at `0x10094eac` now skips the context's own object, and the casino keeps
-a player's id per nickname (`Casino.playerId`, `casino.js` `playerId`), which alone also avoids it.
+a player's id per nickname (`player_id` in `server/src/casino.rs`), which alone also avoids it.
 
-Verified on one PC with the real Windows build (`tools/lan_test.sh 2|3|4`): 2-, 3- and 4-player
+Verified on one PC with the real Windows build (`cargo x lan-test 2|3|4`): 2-, 3- and 4-player
 matches start; boards, items, heroes and health stay identical on all screens over many rounds;
 a client quitting mid-match leaves the host running; when the players surrender one by one every
 client reaches the win screen, Battle Stats and the casino (2, 3 and 4 players, any order); the
 host then hosts again and "Play Again" starts the next match. The host's chosen hero (picked in
 the select, Random, or `host_hero=`) is the one every screen shows, and the host's nickname
-appears in Battle Stats. Known limits: if the host quits the match ends for everyone; Android
-clients should work through the same relay but were not tested.
+appears in Battle Stats. Android and native desktop clients join the same way (verified through
+the public server). Known limit: if the host quits the match ends for everyone.
 
-### Built-in LAN relay (no setup)
+### LAN relay (no setup)
 
-With `server=auto` (the default) nobody runs `server/` or types an address:
+With `server=auto` (the default) nobody types an address (`rg.relay.ServerChoice`): a game
+hosted on this network if there is one, else the public server; without internet the host's
+game runs the relay itself.
 
 * **F5** first shows a Java2D overlay drawn into the engine's backbuffer
   (`HostServer.drawPicker`, called from `ResetGeneration.drawBuffer`): number of players 2–4
   (Left/Right or 2–4, Enter, Esc). Keys reach it through Revived's key dispatcher and are kept
   from the engine; the choice is saved as `host_players`. Then the engine's hero select.
-* The host's game then starts `rg.relay.LanRelay` (once per process): Netty on TCP 8787 (HTTP
-  `GET /status`, WebSocket `/ws`) and a UDP responder on 8787, all on one event-loop thread, so
-  the relay code (`Relay`, `Casino`, `GameRoom` — a line-by-line port of `server/src/relay.js`,
-  `casino.js`, `gameroom.js`; keep them in sync) needs no locks. `rghost` connects to
-  `ws://127.0.0.1:8787/ws` as before. If 8787 is taken by another relay (`/status` answers),
-  that one is used; by anything else, hosting fails with a message in the title bar.
+* For LAN play the host's game starts the bundled **`rg-relay.exe --lan --host-name NICK
+  --exit-with-parent`** (`rg.relay.LocalRelay`, once per game session): the same Rust server as
+  the public one, on TCP 8787 (HTTP `GET /status`, WebSocket `/ws`) plus a UDP discovery
+  responder on 8787. It ends with the game (its stdin is a pipe from the JVM). `rghost` connects
+  to `ws://127.0.0.1:8787/ws`. If 8787 is taken by another relay (`/status` answers), that one is
+  used; by anything else, hosting fails with a message in the title bar.
 * Clients: `SNAPMobileClient` login calls `LanDiscovery.find` (up to 20 s): it broadcasts
   `RGR-DISCOVER 1` to every interface's broadcast address, 255.255.255.255 and 127.0.0.1 each
   second; hosts answer `RGR-HOST 1 <port> <waiting hosted games> <host nick>`. A host with a
-  waiting game wins; otherwise the first answer, 1.5 s later. Nothing found → the engine's
-  "cannot connect" error.
+  waiting game wins; otherwise the first answer, 1.5 s later. Nothing found → the public server
+  (`auto`) or the engine's "cannot connect" error (`lan`).
 * While the overlay is shown the launcher taps Right (a no-op in the main menu; Shift is Back)
   when it opens and every 10 s: the main menu otherwise replays the intro after ~35 s without
   input. The key that closes the overlay is kept from the engine until released.
-* Windows Firewall asks once, on the host only (inbound TCP/UDP 8787). If that prompt was
-  cancelled (Windows then adds inbound Block rules for the exe, which win over any Allow) or the
-  rule only covers the other network type, clients time out. `LAN-Setup.cmd` in the release
-  (`src/dist/LAN-Setup.cmd` -> `app\lan-setup.ps1`, self-elevating) removes those Block rules and
-  allows TCP/UDP 8787 from `LocalSubnet` in every profile (rule group "Reset Generation
-  Revived"; `-Remove` deletes it). A third-party firewall (ESET, Norton...; listed in
-  `root/SecurityCenter2 FirewallProduct`) replaces Windows Firewall and drops the connections
-  silently: the script warns and says where to allow the game. A VPN client can hide the PC too.
+* Windows Firewall asks once, on the host only (inbound TCP/UDP 8787 for `rg-relay.exe`). If that
+  prompt was cancelled (Windows then adds inbound Block rules for the exe, which win over any
+  Allow) or the rule only covers the other network type, clients time out. `LAN-Setup.exe` in the
+  release (`tools/lan-setup`, asks for elevation) removes those Block rules and allows TCP/UDP
+  8787 from `LocalSubnet` in every profile (rule group "Reset Generation Revived"; `--remove`
+  deletes it). A third-party firewall (ESET, Norton...) replaces Windows Firewall and drops the
+  connections silently; a VPN client can hide the PC too.
 
-A manual `server=ws://…` still works everywhere (internet play through `server/` or the Worker).
+A manual `server=ws://…` works everywhere (a relay you run yourself, see "Running a server").
 
 Test aids (Windows build): `--keys=T:KEY,...` presses keys T ms after start (`ESC`, `RETURN`,
 `UP`/`DOWN`/`LEFT`/`RIGHT`, `SPACE`, `F5`, or a hex VK), `--window_x=`/`--window_y=`,
@@ -120,8 +122,8 @@ slowest tick, Java heap and thread count every N seconds (`HostServer.perf`).
 ### Dropped connections and going back into a match
 
 A client whose game crashed or lost the network can go back into the match it was in: start the
-game again (or go Online -> Quick Match) with the **same nickname** within 3 minutes. Meanwhile
-the match goes on; that player's turns time out.
+game again (or go Online -> Quick Match) with the **same nickname** — at any time while the match
+runs; there is no time limit. Meanwhile the match goes on; that player's turns time out.
 
 What the engine does on its own is not enough. Its acceptor is polled all match long and the
 per-connection handshake (`0x1000d8c0`) takes a late joiner in, but always as a **new** player:
@@ -133,14 +135,15 @@ the seat instead:
 
 * Relay: `player_left` carries `lost: 1` when the connection dropped (not a normal leave or a
   surrender). rghost then does **not** tell the engine: the session stays "connected" (sends to
-  it are dropped) for `HOLD_MS` = 180 s, then it is closed and the engine sees the leave. A
+  it are dropped) for as long as the match runs (`HOLD_MS` = 0: no limit; a positive value would
+  close it after that long, and the engine would see the leave). A
   served room is kept while its host serves it, even with no members (in a 2-player match the
   only client's drop emptied it: the player came back into a new room without the host); it
   goes at `unserve`.
-* Casino (`Casino.java` / `casino.js`): a hosted room becomes `running` when its players are sent
+* Casino (`server/src/casino.rs`): a hosted room becomes `running` when its players are sent
   into it; a player whose connection drops in it is remembered in `dropped` with the time. Their
-  next Quick Match request (case 9) within `REJOIN_MS` = 170 s is answered as usual and then
-  starts a one-player match into that room instead of queueing. `unserve` (the host's listener
+  next Quick Match request (case 9), at any time while the room is served (`rejoin_ms: None`;
+  `rg-relay --rejoin-secs N` would set a limit), is answered as usual and then starts a one-player match into that room instead of queueing. `unserve` (the host's listener
   closed: match over) forgets the room.
 * rghost, host side (`track_seats`): a new connection with the same name as a held session gets
   its old seat (preset in the pending join, so state 3 skips the seat search) and key (hook on
@@ -157,8 +160,8 @@ the seat instead:
   objects from the battle state, or their game dies a few minutes later. rghost.dll is loaded
   by every Windows game, so it also hooks the client's join handler (vtable `0x10188d18` slot
   0x58, `0x100e16a0`): for a key and seat the game already has, the old objects are put back.
-  The Android build (recompiled engine, no rghost) does not have this: an Android player who
-  comes back is not safe.
+  The native desktop and Android builds (recompiled engine, no rghost) do not have this: a native
+  player who comes back is not safe yet (the hook would have to go into `native/rt`).
 * Relay `hello`: names are unique per server, so a restarted client used to become `Player22`
   while its old connection was still open (a crash or a frozen PC leaves a half-open TCP
   connection that only the 60 s idle timer closes). A connection with the same name that has
@@ -241,7 +244,7 @@ Inside a game packet: one or more frames `[u16 length][u8 channel][payload]`, li
 | 0x16 | the game protocol: client ↔ authoritative game server (see below) |
 
 Casino messages: `[u8 type][u8 action]` + fields; type 0 REQUEST, 1 RESPONSE, 2 EVENT; the
-42 actions are in `server/src/casino.js` (`ACTIONS`). Strings are the engine's string object
+42 actions are in `server/src/casino.rs`. Strings are the engine's string object
 `[u32 refcount|flags][u32 length][u32 capacity][bytes]` (flags bits 28–30 = 2: UTF-16).
 Key/value maps: `u32 count` + key/value string pairs. A generic RESPONSE is `[u8 result
 (0 = OK)][u32 value]`.
@@ -270,25 +273,33 @@ currently answered with empty OK responses.
 
 ## Running a server
 
+The server is one small Rust program (`server/`, binary `rg-relay`: tokio on one thread, about
+1 MB of memory). The public instance runs behind nginx on `resetgeneration.rustyapps.com` (plain
+`ws://` on port 80 for the games, `wss://` on 443 for browsers; `GET /status` for counters).
+
 ```bash
-cd server
-npm install
-npm start                       # ws://0.0.0.0:8787/ws   (--log-packets to hex-dump traffic;
-                                #   --match-size N also forms QM_n rooms for rgtest --server)
-npm test
-npx wrangler login && npx wrangler deploy     # Cloudflare (Durable Object), wss://…workers.dev/ws
+cargo run -p rg-server --release -- --listen 0.0.0.0:8787    # a server of your own
+                                 # --log-packets hex-dumps traffic; --match-size N also forms QM_n
+                                 # rooms (for rgtest --server); --rejoin-secs N limits going back
+cargo test -p rg-server
+cargo x deploy           # build for Linux (static musl) and install it on the public server:
+                         #   one binary, a systemd unit and an nginx site for the subdomain;
+                         #   nothing else on that machine is touched
+cargo x deploy-status    # GET /status          cargo x deploy-logs [N]    journal lines
+cargo x deploy-ssh CMD   # one command there    cargo x undeploy           remove it again
 ```
 
-Clients: Windows `app\revived.ini` → `server=ws://<host>:8787/ws`, `nickname=…` (default
-`server=auto`: LAN play through the host's built-in relay, see "Built-in LAN relay").
-Android: `files/revived.ini` in the app's storage (or the APK's built-in default,
-`tools/build_android.sh SERVER=ws://…`). The native client speaks `ws://` only for now, so
-Android needs a self-hosted server (LAN or a VPS) until TLS is added; the Java client supports
-`wss://` (Cloudflare).
+`deploy` reads `deploy.local.ini` (git-ignored; copy `deploy.example.ini`): host, user, SSH key
+(a passphrase can come from a file) and the domain. SSH is pure Rust (russh), no `ssh` needed.
+
+Clients: Windows `app\revived.ini` → `server=auto|online|lan|ws://<host>:8787/ws`,
+`nickname=…`. Native desktop: `revived.ini` next to the program (`server=online` or a
+`ws://` URL). Android: `files/revived.ini` in the app's storage (default: the public server, a
+`DroidNNNN` nickname). The native client speaks `ws://` only; the Java client also `wss://`.
 
 ## The game room (done)
 
-Quick Match end to end, as served by `casino.js` and `gameroom.js` (verified with two
+Quick Match end to end, as served by `casino.rs` and `gameroom.rs` (first verified with two
 `rgtest` clients):
 
 1. `CASINO_MATCHMAKING` → the "Players in Match" screen opens while the player waits; it lists
@@ -302,9 +313,10 @@ Quick Match end to end, as served by `casino.js` and `gameroom.js` (verified wit
    `0x100eb060` → `0x100ead20`) and sends EVENT `SEAT_TAKE` (string id) about every seated
    player to everyone; `SEAT_LEAVE` when a player leaves. Other channels are forwarded.
 
-Both clients then wait for the first game-server message on channel 0x16, which nothing sends.
+The clients then wait for the first game-server message on channel 0x16: in a hosted game the
+host's engine sends it (see "Hosted games").
 
-## The game protocol (channel 0x16) — reconstructed, not yet served
+## The game protocol (channel 0x16) — reconstructed
 
 Channel 0x16 is **client ↔ authoritative game server**, not peer-to-peer lockstep.
 
@@ -327,45 +339,17 @@ Channel 0x16 is **client ↔ authoritative game server**, not peer-to-peer locks
   plays against a local server. The DLL imports no socket API, so the `tcp://` transport
   has nothing underneath it in this build. Strings `MT_GAMESERVER`, `MT_HOSTMIGRATION`,
   `hosted`, `server`, `bluetooth` suggest the MT layer knew game-server and host roles.
-* Rebuilding the server in Node is not realistic (world and battle formats are large), so
-  the engine's own controller has to run somewhere.
+* Rebuilding the game server outside the engine is not realistic (world and battle formats are
+  large), so the engine's own controller runs on the hosting player's machine.
 
-## Next step: game server on the host player's device (plan "D")
+## History: the headless game server (plan "D", Phase 0)
 
-**Goal:** the player the matchmaker marks `hosted=yes` also runs a **headless second engine
-instance** in server mode (separate process, no rendering/input). It joins the relay room as
-the game server; the `GameRoom` bot routes channel 0x16 between each player and it. Players'
-clients stay unpatched (the server is the engine's own code), and the relay stays small enough
-for the free Cloudflare Worker. Trade-offs accepted: the match ends if the host drops, and the
-host has the latency advantage. The same server program can later run dedicated (VPS, fan PC).
-
-### Phase 0 — prove the headless server (desktop, `C:\dev\rgbuild`)
-
-Done = one `rgtest` client gets M1…M4 from a headless server instance and shows the match.
-
-1. Read the LAN host path: `0x100ca920` (host screen) → `0x1000ecd0` (controller, called at
-   `0x100ca99e`) and the acceptor `0x100df5f0`/`0x100df540` → `0x1000d730`. Record what the
-   controller needs (world/level, hero choices, settings — compare the single-player callers
-   `0x100dea4a`/`0x100dee2d` and `0x100debf0`/`0x100de940`) and what interface the session
-   objects implement (they are the MT connections the clients' code sends on with
-   `vt+0x68`/`vt+0x7c`).
-2. Decide the server's transport (first open question). In order of preference:
-   a. **The server engine is an MT peer in the relay room**, using the same SNAP/`net.c`
-      path as clients: find whether the MT listen/accept can take a `naf://…/QM_n?…server…`
-      URL (look at how `hosted`, `server`, `MT_GAMESERVER` are parsed near the URL parser
-      and `0x10110210`/`0x1010fd80`), so each player's in-room connection becomes a session.
-   b. Otherwise implement the `tcp://` transport the acceptor expects inside the recompiled
-      runtime (host-side sockets under the MT transport vtable), and have a small bridge map
-      relay players ↔ local TCP connections.
-   c. Otherwise create session objects ourselves and call `0x1000d730` from the host.
-3. Add a server mode to the desktop host (e.g. `native/host/server/rgserver.c`, or an
-   `rgtest --server ROOM` flag): load the engine, skip menus, build the controller like the
-   host screen does (`rt_guest_call`), run `tick` on the real clock without drawing. Watch for
-   UI objects the controller assumes (the per-frame path may touch screens).
-4. Debug with one `rgtest` client: `RECOMP_ARGS="--trace 1000d8c0,1000d730,1005d100,…"`,
-   `RT_LIVE_TRIGGER`, relay `--log-packets`. Check the client's 40 s join window
-   (`0x1000d730`: `timeGetTime()+40000`) and that M1 arrives only after the client's idle
-   frame (`0x100ebed0`).
+Before hosted games, the plan was a **headless second engine instance** in server mode (the
+recompiled engine, no rendering/input) joining the relay room as the game server. Phase 0 proved
+that the engine's own server-mode controller can serve real clients; the findings below are what
+`rghost.dll` and `native/rt/server.c` are built on. The later phases (launching that server on the
+host's device, a Cloudflare relay, TLS for Android) were overtaken: the Windows host's own engine
+serves the match (`rghost.dll`), the relay is the Rust server, and Android plays through it.
 
 ### Phase 0 result (2026-10-17)
 
@@ -396,14 +380,14 @@ screen (two castles on the field). Transport findings:
   the bytes written through its ByteStream at `+0xc`; the *ostream part at +8* has
   `write(buf, n)` at vtable slot 0 = `0x100f3b90`; slot 0 of the primary vtable is a double
   reader). Anything else is a fatal that names the slot.
-* **MT framing for large messages** (the relay's `mtPackets`/`mtMessages`): a message is
+* **MT framing for large messages** (`mt_packets`/`mt_messages` in `server/src/wire.rs`): a message is
   `[u8 channel][payload]`, cut into packets `[u16 header][bytes]`; header = length | piece << 10;
   the pieces of a split message are numbered 1, 2, … and the last one is 0, so a message that
   fits one packet has piece 0 (the earlier "frames" were this with piece 0). Packet payload is
   at most 874 bytes (the fragmenter cap = MTU 876 − 2 from `initNative`). The shift 10 is derived
   from that cap; the casino connection starts with cap 254 (shift 8), but only the game
   connection is fragmented by us.
-* **Relay protocol for the server role** (implemented, tested in `server/test`): the server says
+* **Relay protocol for the server role** (implemented, tested in `server/tests`): the server says
   `hello` then `{"t":"serve","room":"QM_1"}`; it gets `{"t":"player_joined","pid":N,"name":…}`
   when the player has taken its seat (its client session exists) and `player_left` (with
   `"lost":1` if the connection dropped); binary frames both
@@ -417,7 +401,7 @@ screen (two castles on the field). Transport findings:
 **Fixed: crash in the first game event** — a recompiler bug, not the event data. Ghidra's P-code for
 `BSR`/`BSF` writes 31 (or 0) to the destination when the source is 0, but hardware leaves it
 unchanged, and the compiler relies on that (`MOV EAX,-1; BSR EAX,ECX` at `0x1001e10c`). Cells with
-an empty piece mask therefore got type 31 instead of "no change"; `fix_bitscan` in `recomp.py`
+an empty piece mask therefore got type 31 instead of "no change"; `fix_bitscan` in the recompiler (`recomp.rs`)
 now skips the destination write. Original symptom: shortly after the match screen appears both the
 client and the server crash in `0x10018940` (the board's "existing combos" check, called from the
 event processor `0x1001dbe0`): it indexes a 5-entry colour table with the cell type, and at that
@@ -431,51 +415,16 @@ file, then read the `/* guest-address */` comments around that C line). Also sti
 client's 40 s join window and `hosted` semantics for two players, a headless build without the
 menu flow, and the relay's idle timeout handling when the server drops.
 
-### Phase 1 — relay and room bot
+### What is still open
 
-1. Relay protocol: let a connection join a room as its **game server**
-   (e.g. `{"t":"serve","room":"QM_n"}`), not counted as a player and not seated.
-2. `GameRoom`: forward channel 0x16 (and whatever else the controller uses) between each
-   player and the server member, tagged by player (binary prefix or a per-player virtual
-   connection, depending on the Phase 0 transport); greet the server like a peer.
-3. Casino: tell the hosted player's client to start the server (it already learns
-   `hosted=yes` from `CASINO_MATCHED_UP`; the host-side launcher can key off that), and keep
-   seated players waiting until the server member has joined (extend the 10 s start timeout).
-4. Tests in `server/test/` for the server role, routing and server-leaves-room handling
-   (all players get a clean disconnect).
+* Hosting from the native desktop and Android builds: `native/rt/server.c` has the server side for
+  the recompiled engine, but no native host offers F5/hosting yet, and the client-side join
+  handler hook that makes going back into a match safe (see "Dropped connections") exists only in
+  `rghost.dll`.
+* TLS (`wss://`) in `native/rt/net.c`; the public server accepts plain `ws://` on port 80.
+* The host-local player 0 in `rgtest --server`, a headless build without the menu flow.
 
-### Phase 2 — launching the server on the host device
-
-* **Windows:** build the headless server as an x64 recompiled `.exe` in `dist/`
-  (`tools/build_windows.sh`); the Java client starts it (room name, relay URL, game dir) when
-  it is matched with `hosted=yes`, and stops it after the match.
-* **Android:** run the same code in a separate process (a service with `android:process`),
-  since the runtime's guest memory and CPU state are global and a second engine cannot share
-  the game's process. Add it to `tools/build_android.sh`.
-* **Dedicated (optional):** `rgserver --relay ws://… --dedicated` registers with the relay and
-  serves rooms when no host is available.
-
-### Phase 3 — Android to Cloudflare
-
-Add TLS (`wss://`) to `native/rt/net.c` so Android can use the Worker; until then Android
-needs a self-hosted relay.
-
-### Phase 4 — a full match
-
-Two clients play a whole match: lockstep stays in sync (no `PLAYER_SYNC_ERROR`), the match
-ends cleanly back in the casino, and host / non-host disconnects end or continue the match as
-expected. Then 3–4 players.
-
-### Open questions / risks
-
-* Can the controller run without its UI (Phase 0.3)? Single-player suggests yes.
-* Which transport (Phase 0.2): `naf://` room peer is the cheapest if the MT layer allows it.
-* Does `hosted=yes` change the client's MT routing (e.g. expecting the game server on its
-  own side)? Test a client with `hosted=no` for both players if routing gets in the way.
-* Server CPU on low-end phones: the server does not draw, so it should be cheap.
-
-Debugging tools: `tools/build_native_desktop.sh` (`EXTRA_CFLAGS=-DRT_CALLTRACE`,
-`RECOMP_ARGS="--trace <hex,…>"`; delete `C:\dev\rgbuild\gen\rg_gen_table.c` to force
-regeneration when only `RECOMP_ARGS` changed), `RT_LIVE_TRIGGER=<addr>:<n>`, `RT_NET_DEBUG=1`,
-relay `--log-packets`. Two clients: `RG_NICK=Alice …` / `RG_NICK=Bob …` with keys
+Debugging tools: `cargo x build-native-test --calltrace --trace <hex,…>` then `cargo x
+native-test` (or `build/native/rgtest` directly), `RT_LIVE_TRIGGER=<addr>:<n>`, `RT_NET_DEBUG=1`,
+relay `--log-packets`. Two `rgtest` clients: `RG_NICK=Alice …` / `RG_NICK=Bob …` with keys
 `250:ESC,350:DOWN,400:RETURN,700:RETURN,800:RETURN,900:RETURN` (`--realtime`).
