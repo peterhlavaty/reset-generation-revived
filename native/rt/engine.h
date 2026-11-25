@@ -28,7 +28,9 @@ void rg_advance_ms(uint32_t ms);
 
 /* ------------------------------------------------------------------ online play
  * The engine's SNAP Mobile interface is served by a network client (net.c, relay protocol in
- * docs/MULTIPLAYER.md). The host sets the server and nickname before rg_init. */
+ * docs/MULTIPLAYER.md). The host sets the server and nickname before rg_init; the default is the
+ * public relay (server/, deployed with `cargo x deploy`). */
+#define RG_ONLINE_SERVER "ws://resetgeneration.rustyapps.com/ws"
 void rg_net_configure(const char *server_url, const char *nickname);
 
 #ifdef __cplusplus

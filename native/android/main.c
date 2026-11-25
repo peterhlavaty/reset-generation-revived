@@ -629,7 +629,7 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
 
 static void read_config(void) {
     /* optional files/revived.ini: server=ws://host:port/ws, nickname=Name */
-    char path[600], line[256], server[200] = RG_DEFAULT_SERVER, nick[32] = "";
+    char path[600], line[256], server[200] = RG_ONLINE_SERVER, nick[32] = "";
     snprintf(path, sizeof path, "%s/../revived.ini", data_dir);
     FILE *f = fopen(path, "r");
     while (f && fgets(line, sizeof line, f)) {

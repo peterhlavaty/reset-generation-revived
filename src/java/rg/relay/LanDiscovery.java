@@ -19,12 +19,15 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Finds a hosting game on the LAN (server=auto): broadcasts "RGR-DISCOVER 1" to UDP 8787 on every
- * network and this PC, and connects to whoever answers ({@link LanRelay}). Plain JDK sockets, so
- * joining players never load Netty. Windows lets the answer to our own broadcast in without a
- * firewall prompt; only the hosting PC has to allow the game once.
+ * Finds a hosting game on the LAN (server=auto or lan): broadcasts "RGR-DISCOVER 1" to UDP 8787
+ * on every network and this PC, and connects to whoever answers ({@link LocalRelay}). Windows lets
+ * the answer to our own broadcast in without a firewall prompt; only the hosting PC has to allow
+ * the game once.
  */
 public final class LanDiscovery {
+    static final String DISCOVER = "RGR-DISCOVER 1";
+    static final String ANSWER = "RGR-HOST 1";
+
     private LanDiscovery() {
     }
 
@@ -36,7 +39,7 @@ public final class LanDiscovery {
         long end = System.currentTimeMillis() + timeoutMs;
         String any = null;
         long settle = Long.MAX_VALUE;
-        byte[] probe = LanRelay.DISCOVER.getBytes(StandardCharsets.US_ASCII);
+        byte[] probe = DISCOVER.getBytes(StandardCharsets.US_ASCII);
         try (DatagramSocket s = new DatagramSocket()) {
             s.setBroadcast(true);
             s.setSoTimeout(200);
@@ -49,7 +52,7 @@ public final class LanDiscovery {
                     nextProbe = now + 1000;
                     for (InetAddress a : targets) {
                         try {
-                            s.send(new DatagramPacket(probe, probe.length, a, LanRelay.PORT));
+                            s.send(new DatagramPacket(probe, probe.length, a, LocalRelay.PORT));
                         } catch (IOException e) {
                             // network without broadcast: skip
                         }
@@ -64,7 +67,7 @@ public final class LanDiscovery {
                     continue;        // e.g. ICMP port unreachable from this PC
                 }
                 String[] f = new String(in.getData(), 0, in.getLength(), StandardCharsets.US_ASCII).trim().split(" ", 5);
-                if (f.length < 4 || !(f[0] + " " + f[1]).equals(LanRelay.ANSWER)) {
+                if (f.length < 4 || !(f[0] + " " + f[1]).equals(ANSWER)) {
                     continue;
                 }
                 int port, waiting;

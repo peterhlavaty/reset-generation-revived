@@ -18,8 +18,9 @@ import java.util.List;
  *
  * F5 in the main menu shows the player-count picker (drawn over the menu, remembered as
  * host_players in revived.ini), then the engine's hero select (host_hero=NAME / RANDOM skips it).
- * With server=auto (default) the game starts its built-in relay ({@link rg.relay.LanRelay}) and
- * the others find it on the LAN by themselves. Or automatically with host_players=N plus
+ * The relay is the public server or, without internet (or with server=lan), the bundled rg-relay
+ * the game starts ({@link rg.relay.LocalRelay}), which the others find on the LAN by themselves
+ * ({@link rg.relay.ServerChoice}). Or automatically with host_players=N plus
  * host=auto / --host=auto (hero: host_hero, default random). Test aid: --keys=T:KEY,... sends
  * key presses T milliseconds after start (KEY = ESC, RETURN, UP, DOWN, LEFT, RIGHT, SPACE,
  * F5 or a hex virtual-key code); they go to the picker while it is shown.
@@ -183,15 +184,13 @@ final class HostServer {
     /** Starts the built-in relay if needed (server=auto) and hosts; false if not possible now. */
     private static boolean startHosting(int players, int hero) {
         String nick = com.redlynx.mt.snapmobile.SNAPMobileClient.nickname;
-        String url = com.redlynx.mt.snapmobile.SNAPMobileClient.relayUrl;
-        if ("auto".equalsIgnoreCase(url)) {
-            url = rg.relay.LanRelay.start(nick);
-            if (url == null) {
-                Revived.setStatus("cannot host: port " + rg.relay.LanRelay.PORT + " is used by another program");
-                return false;
-            }
-            lanAddress = rg.relay.LanRelay.lanAddress();
+        String url = rg.relay.ServerChoice.forHosting(com.redlynx.mt.snapmobile.SNAPMobileClient.relayUrl, nick);
+        if (url == null) {
+            Revived.setStatus("cannot host: no relay (port " + rg.relay.LocalRelay.PORT + " used by another program?)");
+            return false;
         }
+        lanAddress = rg.relay.ServerChoice.isLocal(url) ? rg.relay.LocalRelay.lanAddress() : null;
+        System.out.println("HostServer: relay " + url);
         String room = "HOST_" + (nick == null ? "game" : nick) + "_" + (++games);
         if (!host(url, room, players, nick == null ? "" : nick, hero)) {
             System.out.println("HostServer: cannot host now (already hosting, or a hosted match is running)");

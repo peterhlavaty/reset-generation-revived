@@ -525,8 +525,8 @@ static int fix_member_clear(void) {
  * connection drop (a leave command, 0x1005c530) it sends that player nothing any more.
  *
  * So when a player's relay connection drops mid-match the engine is not told: the session stays
- * "connected" (messages to it are dropped) for HOLD_MS, like a player who does not move. If they
- * come back (same name) in that time, their new connection does the normal handshake, but with the
+ * "connected" (messages to it are dropped) like a player who does not move, as long as the match runs (HOLD_MS, 0 = no limit). If they
+ * come back (same name), their new connection does the normal handshake, but with the
  * old key and seat: the seat is preset in the pending join before state 3 (which then skips the
  * seat search) and the key comes from key_alloc. The engine sends the battle state on the new
  * connection, does not register it (0x1005c340 skips a key it already has) and goes on using the
@@ -540,7 +540,7 @@ static int fix_member_clear(void) {
  * battle state already has (their game died a few minutes after the join without it).
  * Pending joins: ctrl+0x94, list of {prev, next, entry}; entry = {conn wrapper, state, info,
  * key +0xc, seat +0x10}; our connection object is at wrapper+0x7c. */
-#define HOLD_MS 180000
+#define HOLD_MS 0 /* how long a seat is held, ms (0: until the match ends) */
 static volatile int force_key;
 static int rejoin_off;                   /* the hooks below could not be installed */
 typedef int(TC *key_pool_fn)(void *pool);
@@ -658,7 +658,7 @@ static void track_seats(void) {
     DWORD now = GetTickCount();
     for (int i = 0; i < nsess; i++) {
         sess_t *s = &sess[i];
-        if (s->used && s->away && now - s->away_since > HOLD_MS) {
+        if (HOLD_MS && s->used && s->away && now - s->away_since > HOLD_MS) {
             s->away = 0;
             s->closed = 1;
             lg("player %d (%s) did not come back; the engine is told", s->pid, s->name);

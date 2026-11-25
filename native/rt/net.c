@@ -29,7 +29,7 @@ typedef int sock_t;
 #define REQUEST_TIMEOUT_MS 10000
 #define MAX_PACKET 2048
 
-static char server_url[256] = "ws://127.0.0.1:8787/ws";
+static char server_url[256] = RG_ONLINE_SERVER;
 static char nickname[32] = "";
 static uint8_t *netbuf;
 static int netbuf_size;

@@ -33,10 +33,8 @@ import java.util.Map;
  */
 public class SNAPMobileClient implements Runnable {
     /** Relay endpoint and player nickname; set by the launcher before the client is created. */
-    /** Relay address, or "auto": the relay of a game hosted on this network (rg.relay.LanDiscovery). */
+    /** revived.ini server=: auto, online, lan or a relay address (rg.relay.ServerChoice). */
     public static String relayUrl = "auto";
-    /** How long Quick Match looks for a hosted game on the LAN. */
-    private static final long AUTO_FIND_MS = 20000;
     public static String nickname = null;
     /** -Drg.netdebug=true prints every action, event, relay reply and game packet to stdout. */
     static final boolean DEBUG = Boolean.getBoolean("rg.netdebug");
@@ -281,14 +279,11 @@ public class SNAPMobileClient implements Runnable {
                 this.loginErrorState = ERROR_LOGIN_AUTHENTICATION_ERROR;
                 return;
             }
-            String url = relayUrl;
-            if ("auto".equalsIgnoreCase(url)) {        // LAN: find the game hosted with F5
-                url = rg.relay.LanDiscovery.find(AUTO_FIND_MS);
-                if (url == null) {
-                    SMLog.printf("No hosted game found on this network\n");
-                    this.loginErrorState = ERROR_CLOUD_NOT_CONNECT;
-                    return;
-                }
+            String url = rg.relay.ServerChoice.forJoining(relayUrl);
+            if (url == null) {
+                SMLog.printf("No hosted game found on this network\n");
+                this.loginErrorState = ERROR_CLOUD_NOT_CONNECT;
+                return;
             }
             RelayConnection r = RelayConnection.open(url, this);
             if (r == null) {

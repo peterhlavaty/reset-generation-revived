@@ -1,0 +1,12 @@
+[package]
+name = "rgtool"
+description = "Reset Generation Revived developer tool: setup, builds, running, data tools, deploy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# SSH + SFTP in pure Rust (deploy): ring, not aws-lc (no NASM needed on Windows).
+russh = { version = "0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "3.0.0"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }

@@ -1,0 +1,8 @@
+# `cargo x <command>`: the project's build / run / deploy tool (tools/rgtool).
+[alias]
+x = "run -q -p rgtool --release --"
+
+# The public server is a static Linux binary, linked with Rust's own linker: no C toolchain
+# needed on any OS.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"

@@ -11,3 +11,5 @@
 hs_err_pid*.log
 __pycache__/
 /target/
+# Local settings that must not be published (rgtool deploy)
+/deploy.local.ini
