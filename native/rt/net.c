@@ -2,6 +2,7 @@
  * Mobile login/room state machine: on a worker thread, or without threads (the browser build,
  * RT_NO_THREADS) stepped on the game thread. */
 #include "net.h"
+#include "lobby.h"
 #include "engine.h"
 #include "host.h"
 #include "link.h"
@@ -114,6 +115,7 @@ static int json_str(const char *j, const char *key, char *out, size_t n) {
 }
 
 static void on_disconnect(int gen) {
+    rg_lobby_reset();
     pthread_mutex_lock(&lock);
     int was = logged_in && gen == ws_generation && !logout_queued;
     pthread_mutex_unlock(&lock);
@@ -143,6 +145,7 @@ static void on_frame(int op, const uint8_t *msg, size_t len) {
         char t[24];
         json_str((const char *)msg, "t", t, sizeof t);
         if (!strcmp(t, "pong") || !strcmp(t, "peer_joined") || !strcmp(t, "peer_left")) return;
+        if (!strcmp(t, "games")) { rg_lobby_message((const char *)msg); return; }   /* Quick Match: lobby.c */
         pthread_mutex_lock(&lock);
         if (!strcmp(t, "joined") && entering[0]) {   /* before the packets behind it */
             snprintf(room, sizeof room, "%s", entering);
@@ -288,7 +291,7 @@ static void do_login(void) {
     if (!nickname[0]) snprintf(nickname, sizeof nickname, "Player%04d", rand() % 9000 + 1000);
     if (!ws_connect()) { err_state = 3; login_in_progress = 0; return; }
     char json[120], out[512];
-    snprintf(json, sizeof json, "{\"t\":\"hello\",\"v\":1,\"name\":\"%s\"}", nickname);
+    snprintf(json, sizeof json, "{\"t\":\"hello\",\"v\":1,\"name\":\"%s\",\"pick\":true}", nickname);   /* pick: lobby.c */
     if (!request(json, "welcome", out, sizeof out)) {
         host_log("net: login rejected: %s", out);
         ws_close();
@@ -431,7 +434,7 @@ static int step_login(void) {   /* 1 when done */
         int s = link_state(ws);
         if (s == 0 && !due(wait_until)) return 0;
         if (s != 1) { host_log("net: cannot connect to %s", ws_url); ws_close(); err_state = 3; login_in_progress = 0; return 1; }
-        snprintf(json, sizeof json, "{\"t\":\"hello\",\"v\":1,\"name\":\"%s\"}", nickname);
+        snprintf(json, sizeof json, "{\"t\":\"hello\",\"v\":1,\"name\":\"%s\",\"pick\":true}", nickname);   /* pick: lobby.c */
         req_start(json, "welcome");
         stage = 2;
         return 0;
@@ -600,6 +603,7 @@ int net_send(int len) {
     if (len > 0 && len <= netbuf_size) add_action(mk(A_SEND, 0, NULL, netbuf, len), 0);
     return len;
 }
+int net_control(const char *json) { return ws_send(1, json, strlen(json)); }
 void net_friend_list(void) { add_action(mk(A_FRIENDS, 0, NULL, NULL, 0), 0); }
 
 void net_dispatch_events(void) {

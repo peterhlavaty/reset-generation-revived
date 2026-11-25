@@ -14,7 +14,7 @@
 //! The core is a single-threaded state machine without I/O: the transport ([`crate::net`])
 //! feeds it events with the current time and it answers through each client's [`Sink`].
 
-use crate::casino::Casino;
+use crate::casino::{Casino, Offer};
 use crate::gameroom::GameRoom;
 use crate::wire::{frame, hex, CH_SYSTEM};
 use indexmap::IndexMap;
@@ -50,6 +50,8 @@ pub struct Client {
     pub name: Option<String>,
     /// Where it connects from (the player's public address behind the proxy), if known.
     pub addr: Option<IpAddr>,
+    /// Its game lets the player choose a hosted game (`hello` with `pick`, since 2026-11-25).
+    pub picks: bool,
     room: Option<String>,
     serves: Option<String>,
     pub last_seen: u64,
@@ -85,6 +87,9 @@ impl Net {
     }
     pub fn addr(&self, c: ClientId) -> Option<IpAddr> {
         self.clients.get(&c).and_then(|c| c.addr)
+    }
+    pub fn picks(&self, c: ClientId) -> bool {
+        self.clients.get(&c).is_some_and(|c| c.picks)
     }
     pub fn name(&self, c: ClientId) -> &str {
         self.clients.get(&c).and_then(|c| c.name.as_deref()).unwrap_or("?")
@@ -193,7 +198,7 @@ impl Relay {
         self.next_id += 1;
         self.net.clients.insert(
             id,
-            Client { id, name: None, addr, room: None, serves: None, last_seen: now, greeted: HashSet::new(), out },
+            Client { id, name: None, addr, picks: false, room: None, serves: None, last_seen: now, greeted: HashSet::new(), out },
         );
         self.stats.connections += 1;
         id
@@ -230,6 +235,18 @@ impl Relay {
                 }
             }
             "rooms" => self.ctl(c, json!({"t": "rooms", "rooms": self.room_list()})),
+            // Quick Match: a player picks a hosted game; its host starts it or sends a player away
+            "pick" => {
+                if let Some(id) = m.get("id").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
+                    self.casino.choose(&mut self.net, c, id);
+                }
+            }
+            "start" => self.casino.host_start(&mut self.net, c),
+            "kick" => {
+                if let Some(name) = m.get("name").and_then(Value::as_str) {
+                    self.casino.host_kick(&mut self.net, c, name);
+                }
+            }
             _ => self.ctl(c, json!({"t": "error", "op": t, "code": "unknown_type"})),
         }
     }
@@ -278,7 +295,9 @@ impl Relay {
             i += 1;
         }
         self.net.log(&format!("hello c{c} as {name}"));
-        self.net.clients.get_mut(&c).unwrap().name = Some(name.clone());
+        let cl = self.net.clients.get_mut(&c).unwrap();
+        cl.name = Some(name.clone());
+        cl.picks = m.get("pick").and_then(Value::as_bool) == Some(true);
         self.ctl(c, json!({"t": "welcome", "v": PROTOCOL_VERSION, "id": format!("c{c}"), "name": name}));
     }
 
@@ -347,7 +366,8 @@ impl Relay {
 
     /// A game server process (a host player's engine) offers to serve a matchmade room: it is not
     /// a player and is not seated. With `players`, Quick Match fills the room with that many;
-    /// `name` and `hero` (the host's, the engine's hero index) show on the joiners' waiting list.
+    /// `name` and `hero` (the host's, the engine's hero index) show on the joiners' lists; with
+    /// `approve` the game starts when the host says so (`start`).
     fn serve(&mut self, c: ClientId, room_name: Option<&str>, m: &Value) {
         let Some(room_name) = room_name.filter(|r| valid_room(r)) else {
             return self.ctl(c, json!({"t": "error", "op": "serve", "code": "bad_room"}));
@@ -377,10 +397,16 @@ impl Relay {
         // A host player's game (rg.HostServer): Quick Match fills its room with `players` players.
         if let Some(n) = m.get("players").and_then(Value::as_f64) {
             if n.fract() == 0.0 && n > 0.0 && n < 100.0 && !exists {
-                let host = m.get("name").and_then(Value::as_str).filter(|n| valid_name(n));
-                let hero = m.get("hero").and_then(Value::as_i64);
-                let addr = self.net.addr(c);
-                self.casino.add_hosted(&mut self.net, room_name, n as usize, host, hero, addr);
+                let offer = Offer {
+                    room: room_name,
+                    players: n as usize,
+                    host: m.get("name").and_then(Value::as_str).filter(|n| valid_name(n)),
+                    hero: m.get("hero").and_then(Value::as_i64),
+                    addr: self.net.addr(c),
+                    owner: Some(c),
+                    approve: m.get("approve").and_then(Value::as_bool) == Some(true),
+                };
+                self.casino.add_hosted(&mut self.net, offer);
             }
         }
     }

@@ -12,7 +12,9 @@
  * The host's engine is the game server and player 0, like the original LAN mode.
  *
  * F5 (rg_key) or rg_host_request() opens a player-count picker drawn over the game
- * (rg_server_compose), then the engine's own hero select, then the LAN host screen. Everything
+ * (rg_server_compose), then the engine's own hero select, then the LAN host screen. The relay
+ * seats the players who pick this game; a panel shows who sat down and the host starts the game
+ * (or removes a player) there: "seats", "start" and "kick" (server/src/casino.rs). Everything
  * engine-facing runs on the game thread (rg_server_pump before each tick, and the stubs and hooks
  * the engine calls); the relay socket has a thread that only queues events (in the browser build
  * the same work is polled from rg_server_pump).
@@ -62,7 +64,7 @@ static uint32_t tcall(uint32_t fn, uint32_t self, int n, uint32_t a0, uint32_t a
 
 /* ------------------------------------------------------------------ relay link (WebSocket) */
 typedef struct ev { struct ev *next; int kind, pid, len; uint8_t data[]; } ev;
-enum { EV_JOIN, EV_LEAVE, EV_LOST, EV_DATA, EV_CLOSED };
+enum { EV_JOIN, EV_LEAVE, EV_LOST, EV_DATA, EV_CLOSED, EV_SEATS };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER, send_lock = PTHREAD_MUTEX_INITIALIZER;
 static ev *ev_head, *ev_tail;
@@ -117,10 +119,11 @@ static int json_int(const char *j, const char *key, int dflt) {
 }
 
 static void send_serve(void) {
-    /* name and hero: the joiners' "Players in Match" list shows whose game they are in */
+    /* name and hero: the joiners' lists show whose game it is; approve: the host starts it (not
+     * in test mode: rgtest hosts start by themselves) */
     char json[256];
-    snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d,\"name\":\"%s\",\"hero\":%d}",
-             room, remote_players, net_nickname(), host_hero <= 9 ? (int)host_hero : -1);
+    snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d,\"name\":\"%s\",\"hero\":%d,\"approve\":%s}",
+             room, remote_players, net_nickname(), host_hero <= 9 ? (int)host_hero : -1, test_mode ? "false" : "true");
     ws_send(1, json, strlen(json));
     host_log("host: offering room %s on %s for %d remote player(s)", room, url, remote_players);
 }
@@ -136,6 +139,8 @@ static void on_relay_frame(int op, const uint8_t *msg, size_t len) {
             push_ev(EV_JOIN, json_int((const char *)msg, "pid", -1), name, (int)strlen(name) + 1);
         } else if (!strcmp(t, "player_left")) {
             push_ev(json_int((const char *)msg, "lost", 0) ? EV_LOST : EV_LEAVE, json_int((const char *)msg, "pid", -1), NULL, 0);
+        } else if (!strcmp(t, "seats")) {
+            push_ev(EV_SEATS, 0, msg, (int)len + 1);
         } else if (!strcmp(t, "error")) host_log("host: relay error %s", (const char *)msg);
         else if (getenv("RT_NET_DEBUG")) host_log("host: relay %s", (const char *)msg);
     } else if (len >= 2) {
@@ -337,6 +342,62 @@ static int match_live(void) {
 /* ------------------------------------------------------------------ guest objects (MT transport) */
 static uint32_t listener_obj, conn_vt, addr_vt, hs_vt, hs_str;
 
+/* ------------------------------------------------------------------ the start panel */
+#define MAX_SEATS 3
+static char seat_name[MAX_SEATS][32];    /* the players seated in our waiting game (relay "seats") */
+static int nseated, start_sel, starting;
+static uint32_t starting_since;
+static uint8_t held[256];                /* keys whose press the panel took: their release too */
+
+static void seats_clear(void) { nseated = 0; start_sel = 0; starting = 0; }
+
+/* {"t":"seats","room":"..","names":["Pia","Quinn"],"of":2} */
+static void seats_update(const char *j) {
+    const char *p = strstr(j, "\"names\":[");
+    nseated = 0;
+    starting = 0;
+    if (p) {
+        p += 9;
+        while (*p == '"' && nseated < MAX_SEATS) {
+            char *o = seat_name[nseated];
+            size_t i = 0;
+            for (p++; *p && *p != '"'; p++)
+                if (i + 1 < sizeof seat_name[0]) o[i++] = *p;
+            o[i] = 0;
+            nseated++;
+            if (*p) p++;
+            if (*p == ',') p++;
+        }
+    }
+    if (start_sel > nseated) start_sel = nseated;
+    host_log("host: %d of %d player(s) seated", nseated, remote_players);
+}
+
+static int start_panel(void) { return serving && !match_started && nseated > 0; }
+
+/* Up/Down choose, OK starts the game (all seats taken) or removes that player */
+static int start_panel_key(int k) {
+    if (k != 38 && k != 40 && k != 10 && k != 32 && k != 17) return 0;
+    if (starting) return 1;
+    if (k == 38 && start_sel > 0) start_sel--;
+    else if (k == 40 && start_sel < nseated) start_sel++;
+    else if (k != 38 && k != 40 && start_sel == 0) {
+        if (nseated >= remote_players) {
+            ws_send(1, "{\"t\":\"start\"}", 13);
+            starting = 1;
+            starting_since = host_time_ms();
+            host_log("host: starting the game");
+        }
+    } else if (k != 38 && k != 40) {
+        char json[96];
+        snprintf(json, sizeof json, "{\"t\":\"kick\",\"name\":\"%s\"}", seat_name[start_sel - 1]);
+        ws_send(1, json, strlen(json));
+        host_log("host: removing %s from the game", seat_name[start_sel - 1]);
+        start_sel = 0;
+    }
+    return 1;
+}
+
 static void bad_slot(int slot) {
     rt_fatal("host: unimplemented MT object method (vtable slot 0x%x, this=%08x, ret=%08x)", slot, cpu.r[ECX], LD32(cpu.r[ESP]));
 }
@@ -385,6 +446,7 @@ static void l_close(int arg) {
     (void)arg;
     host_log("host: listener closed");
     serving = 0;
+    seats_clear();
     for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;   /* that game's players */
     ws_send(1, "{\"t\":\"unserve\"}", 15);
     rt_ret(0, 0);
@@ -579,6 +641,7 @@ static void start_serving(void) {
     for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;    /* a previous game's players */
     serving = 1;
     match_started = 0;
+    seats_clear();
     if (hosting && ws_up) send_serve();   /* hosting again on the open relay connection */
     hosting = 1;
 }
@@ -697,10 +760,13 @@ const char *rg_host_status(void) {
     case 3:
         if (!ws_up && no_relay) snprintf(status, sizeof status, "Cannot host: no server (no internet, and this device cannot run a LAN relay)");
         else if (!ws_up) snprintf(status, sizeof status, "Hosting: connecting to the server...");
-        else snprintf(status, sizeof status, "Hosting, waiting for players %d/%d (others: Quick Match)", n, wanted);
+        else if (starting) snprintf(status, sizeof status, "Hosting: starting the game...");
+        else if (nseated >= wanted) snprintf(status, sizeof status, "Hosting: all players are in, OK/Enter starts the game");
+        else if (nseated) snprintf(status, sizeof status, "Hosting: %d/%d players are in (others: Quick Match)", nseated + 1, wanted + 1);
+        else snprintf(status, sizeof status, "Hosting, waiting for players %d/%d (others: Quick Match)", n + 1, wanted + 1);
         return status;
     case 4:
-        if (n < wanted) snprintf(status, sizeof status, "Hosting: match running, %d/%d players still connected", n, wanted);
+        if (n < wanted) snprintf(status, sizeof status, "Hosting: match running, %d/%d players still connected", n + 1, wanted + 1);
         else snprintf(status, sizeof status, "Hosting: match running");
         return status;
     }
@@ -710,6 +776,8 @@ const char *rg_host_status(void) {
 /* key filter in front of the engine (rg_key): F5 and the picker's keys */
 int rg_server_key(int down, int k) {
     if (swallow_key && k == swallow_key) { if (!down) swallow_key = 0; return 1; }
+    if (k >= 0 && k < 256 && !down && held[k]) { held[k] = 0; return 1; }
+    if (down && start_panel() && start_panel_key(k)) { if (k >= 0 && k < 256) held[k] = 1; return 1; }
     if (k == AWT_F5) { if (down && !test_mode) rg_host_request(); return 1; }
     if (!picker) return 0;
     if (!down) return 1;
@@ -736,23 +804,40 @@ int rg_server_key(int down, int k) {
 }
 
 /* ------------------------------------------------------------------ drawing */
-static void shade(uint32_t *px, int w, int x0, int y0, int x1, int y1, int keep) {   /* keep/256 of the colour */
-    for (int y = y0; y < y1; y++)
-        for (int x = x0; x < x1; x++) {
-            uint32_t c = px[(size_t)y * w + x];
-            px[(size_t)y * w + x] = (((c >> 16 & 0xff) * keep >> 8) << 16) | (((c >> 8 & 0xff) * keep >> 8) << 8) | ((c & 0xff) * keep >> 8);
-        }
-}
-static void fill(uint32_t *px, int w, int x0, int y0, int x1, int y1, uint32_t c) {
-    for (int y = y0; y < y1; y++)
-        for (int x = x0; x < x1; x++) px[(size_t)y * w + x] = c;
-}
-static void centred(uint32_t *px, int w, int h, int y, int sc, const char *s, uint32_t c) {
-    rt_draw_text(px, w, h, (w - rt_text_width(s, sc)) / 2, y, sc, s, c);
-}
 static void triangle(uint32_t *px, int w, int cx, int cy, int dir, int r, uint32_t c) {
     for (int dx = 0; dx <= r; dx++)                                 /* tip at cx + dir*r */
         for (int dy = -(r - dx); dy <= r - dx; dy++) px[(size_t)(cy + dy) * w + cx + dir * dx] = c;
+}
+
+/* the start panel: who sat down, START, and REMOVE for each of them */
+static void draw_start_panel(uint32_t *buf, int w, int h) {
+    const uint32_t gold = 0xffc828, white = 0xffffff, pale = 0xc8d2ff, dim = 0x8088a8;
+    int u = h / 90 < 2 ? 2 : h / 90, sc = u >= 4 ? u / 2 : 1;
+    int items = 1 + nseated, rowh = 6 * u;
+    int bw = w - 4 * u < 120 * u ? w - 4 * u : 120 * u, bh = 30 * u + items * rowh;
+    if (bh > h - 2 * u) bh = h - 2 * u;
+    int x = (w - bw) / 2, y = (h - bh) / 2, ly = y + 15 * u;
+    char line[96];
+    rt_draw_panel(buf, w, h, x, y, bw, bh);
+    rt_draw_text_centred(buf, w, h, y + 4 * u, sc + 1, "YOUR GAME", gold);
+    snprintf(line, sizeof line, "%d OF %d PLAYERS ARE IN (WITH YOU)", nseated + 1, remote_players + 1);
+    rt_draw_text_centred(buf, w, h, y + 10 * u, 1, line, pale);
+    int full = nseated >= remote_players;
+    for (int i = 0; i < items; i++) {
+        int ry = ly + i * rowh, ty = ry + (rowh - u - 7 * sc) / 2;
+        if (i == start_sel) rt_fill_rect(buf, w, h, x + 3 * u, ry, x + bw - 3 * u, ry + rowh - u, 0x34468a);
+        if (i == 0) {
+            if (starting) snprintf(line, sizeof line, "STARTING...");
+            else if (full) snprintf(line, sizeof line, "START THE GAME");
+            else snprintf(line, sizeof line, "START: WAITING FOR %d MORE", remote_players - nseated);
+            rt_draw_text_centred(buf, w, h, ty, sc, line, full ? gold : dim);
+        } else {
+            rt_draw_text(buf, w, h, x + 6 * u, ty, sc, seat_name[i - 1], white);
+            rt_draw_text(buf, w, h, x + bw - 6 * u - rt_text_width("REMOVE", sc), ty, sc, "REMOVE", pale);
+        }
+    }
+    rt_draw_text_centred(buf, w, h, y + bh - 9 * u, 1, "PLAYERS YOU DO NOT KNOW: REMOVE THEM, OTHERS GET THE SEAT", pale);
+    rt_draw_text_centred(buf, w, h, y + bh - 4 * u - 2, 1, "UP/DOWN: CHOOSE   OK/ENTER: DO IT   BACK/ESC: STOP HOSTING", pale);
 }
 
 const uint32_t *rg_server_compose(const uint32_t *fb, int w, int h) {
@@ -765,35 +850,34 @@ const uint32_t *rg_server_compose(const uint32_t *fb, int w, int h) {
     if (!buf) return fb;
     memcpy(buf, fb, n * 4);
     const uint32_t gold = 0xffc828, white = 0xffffff, pale = 0xc8d2ff;
+    if (st == 3 && start_panel()) {
+        draw_start_panel(buf, w, h);
+        return buf;
+    }
     if (st == 3) {                                                  /* status line at the top */
         const char *s = rg_host_status();
-        shade(buf, w, 0, 0, w, 11 < h ? 11 : h, 80);
-        centred(buf, w, h, 2, 1, s, white);
+        rt_shade_rect(buf, w, h, 0, 0, w, 11, 80);
+        rt_draw_text_centred(buf, w, h, 2, 1, s, white);
         return buf;
     }
     int u = h / 90 < 2 ? 2 : h / 90;                                /* 4 px at 360 rows */
     int bw = w - 4 * u < 110 * u ? w - 4 * u : 110 * u, bh = 58 * u;
     if (bh > h - 2 * u) bh = h - 2 * u;
     int x = (w - bw) / 2, y = (h - bh) / 2;
-    shade(buf, w, 0, 0, w, h, 90);
-    fill(buf, w, x, y, x + bw, y + bh, 0x182040);
-    fill(buf, w, x, y, x + bw, y + 2, gold);
-    fill(buf, w, x, y + bh - 2, x + bw, y + bh, gold);
-    fill(buf, w, x, y, x + 2, y + bh, gold);
-    fill(buf, w, x + bw - 2, y, x + bw, y + bh, gold);
+    rt_draw_panel(buf, w, h, x, y, bw, bh);
     int sc = u >= 4 ? u / 2 : 1;                                    /* 2 at 360 rows */
-    centred(buf, w, h, y + 4 * u, sc + 1, "HOST A GAME", gold);
-    centred(buf, w, h, y + 12 * u, sc, "NUMBER OF PLAYERS", white);
+    rt_draw_text_centred(buf, w, h, y + 4 * u, sc + 1, "HOST A GAME", gold);
+    rt_draw_text_centred(buf, w, h, y + 12 * u, sc, "NUMBER OF PLAYERS", white);
     char d[2] = {(char)('0' + picker), 0};
     int big = 3 * sc + 1, cy = y + 26 * u;
-    centred(buf, w, h, cy - 7 * big / 2, big, d, white);
+    rt_draw_text_centred(buf, w, h, cy - 7 * big / 2, big, d, white);
     if (picker > 2) triangle(buf, w, w / 2 - 14 * u, cy, -1, 3 * u, gold);
     if (picker < 4) triangle(buf, w, w / 2 + 14 * u, cy, 1, 3 * u, gold);
     char line[80];
     snprintf(line, sizeof line, "YOU + %d OTHER PLAYER%s", picker - 1, picker == 2 ? "" : "S");
-    centred(buf, w, h, y + 37 * u, sc, line, pale);
-    centred(buf, w, h, y + 44 * u, 1, "THE OTHERS CHOOSE QUICK MATCH", pale);
-    centred(buf, w, h, y + 50 * u, 1, "LEFT/RIGHT: CHANGE   OK/ENTER: CONTINUE   BACK/ESC: CANCEL", pale);
+    rt_draw_text_centred(buf, w, h, y + 37 * u, sc, line, pale);
+    rt_draw_text_centred(buf, w, h, y + 44 * u, 1, "THE OTHERS CHOOSE QUICK MATCH, THEN YOUR GAME", pale);
+    rt_draw_text_centred(buf, w, h, y + 50 * u, 1, "LEFT/RIGHT: CHANGE   OK/ENTER: CONTINUE   BACK/ESC: CANCEL", pale);
     return buf;
 }
 
@@ -875,6 +959,7 @@ void rg_server_pump(void) {
     if (ws_up && now - last_ping > 15000) { last_ping = now; ws_send(1, "{\"t\":\"ping\"}", 12); }
     track_seats();
     if (serving && !match_started && remote_players > 0 && remote_connected() >= remote_players) match_started = 1;
+    if (starting && now - starting_since > 20000) starting = 0;      /* the players did not come: show the panel again */
     ev *e;
     while ((e = pop_ev())) {
         sess_t *s = by_pid(e->pid);
@@ -907,8 +992,12 @@ void rg_server_pump(void) {
             e->next = NULL;
             if (s->in_tail) s->in_tail->next = e; else s->in_head = e;
             s->in_tail = e;
+        } else if (e->kind == EV_SEATS) {
+            if (serving && !match_started) seats_update((const char *)e->data);
+            free(e);
         } else if (e->kind == EV_CLOSED) {
             host_log("host: relay connection lost");
+            seats_clear();
             pthread_mutex_lock(&send_lock);
             rt_link *l = ws;
             ws = NULL;

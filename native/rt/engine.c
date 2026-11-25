@@ -4,6 +4,7 @@
 #include "host.h"
 #include "net.h"
 #include "server.h"
+#include "lobby.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -156,12 +157,12 @@ int rg_tick(void) {
     return r;
 }
 
-const uint32_t *rg_pixels(void) { return rg_server_compose((const uint32_t *)(M + fb), W, H); }
+const uint32_t *rg_pixels(void) { return rg_lobby_compose(rg_server_compose((const uint32_t *)(M + fb), W, H), W, H); }
 
 /* Same arguments the Java host passed (java.awt.event.KeyEvent): Ctrl is KEY_LOCATION_LEFT (2),
  * other keys STANDARD (1); the key char is the character for Enter/Esc, CHAR_UNDEFINED otherwise. */
 void rg_key(int down, int keycode) {
-    if (!rg_server_key(down, keycode)) rg_engine_key(down, keycode);
+    if (!rg_server_key(down, keycode) && !rg_lobby_key(down, keycode)) rg_engine_key(down, keycode);
 }
 
 void rg_engine_key(int down, int keycode) {

@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// A casino message: (channel, type, action, rest).
+type Msg = (u8, u8, u8, Vec<u8>);
+
 struct T {
     relay: Relay,
     now: u64,
@@ -43,6 +46,21 @@ impl C {
             }
         }
         out
+    }
+    /// Text and casino messages received.
+    fn split(&self) -> (Vec<Value>, Vec<Msg>) {
+        let all = self.take();
+        let (texts, bins): (Vec<Out>, Vec<Out>) = all.into_iter().partition(|o| matches!(o, Out::Text(_)));
+        self.inbox.borrow_mut().extend(bins);
+        let msgs = self.msgs();
+        let texts = texts
+            .into_iter()
+            .filter_map(|o| match o {
+                Out::Text(s) => Some(serde_json::from_str(&s).unwrap()),
+                _ => None,
+            })
+            .collect();
+        (texts, msgs)
     }
     fn closed(&self) -> Option<u16> {
         self.inbox.borrow().iter().find_map(|o| match o {
@@ -99,6 +117,23 @@ impl T {
         self.send(&h, json!({"t": "hello", "v": 1, "name": "RGHost"}));
         let room = format!("HOST_{nick}_1");
         self.send(&h, json!({"t": "serve", "room": room, "players": players, "name": nick, "hero": hero}));
+        h.take();
+        h
+    }
+    /// A player whose game lets them choose a hosted game (since 2026-11-25), in the casino lobby.
+    fn chooser_at(&mut self, name: &str, addr: &str) -> C {
+        let c = self.conn_from(Some(addr));
+        self.send(&c, json!({"t": "hello", "v": 1, "name": name, "pick": true}));
+        self.send(&c, json!({"t": "join", "room": "CasinoSystem"}));
+        c.take();
+        c
+    }
+    /// A host's game that starts when the host says so (since 2026-11-25).
+    fn host_approving(&mut self, nick: &str, players: u32, addr: &str) -> C {
+        let h = self.conn_from(Some(addr));
+        self.send(&h, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+        let room = format!("HOST_{nick}_1");
+        self.send(&h, json!({"t": "serve", "room": room, "players": players, "name": nick, "hero": 7, "approve": true}));
         h.take();
         h
     }
@@ -166,6 +201,22 @@ fn waiting_list(msgs: &[(u8, u8, u8, Vec<u8>)], list: &mut Vec<(String, String, 
             _ => {}
         }
     }
+}
+
+/// The last `games` message among these.
+fn last_games(texts: &[Value]) -> Option<&Value> {
+    texts.iter().rev().find(|t| t["t"] == "games")
+}
+
+/// The hosts of the games offered in a `games` message.
+fn offered(g: &Value) -> Vec<&str> {
+    g["games"].as_array().unwrap().iter().map(|e| e[1].as_str().unwrap()).collect()
+}
+
+/// The seated players a host last heard of.
+fn seats(texts: &[Value]) -> Option<Vec<&str>> {
+    let s = texts.iter().rev().find(|t| t["t"] == "seats")?;
+    Some(s["names"].as_array().unwrap().iter().map(|n| n.as_str().unwrap()).collect())
 }
 
 fn names(list: &[(String, String, String)]) -> Vec<&str> {
@@ -500,10 +551,10 @@ fn game_room_greets_once_everyone_is_in_and_routes_the_match() {
 #[test]
 fn hosted_games_fill_independently_newest_first() {
     let mut t = T::new(Config::default());
-    let _old = t.host_at("Ann", 3, 1, "10.0.0.1"); // hosted long ago, waits for 3
+    let _old = t.host_at("Ann", 3, 1, "82.0.0.1"); // hosted long ago, waits for 3
     t.tick(60_000);
-    let _new = t.host_at("Ben", 1, 7, "10.0.0.2"); // a friend just hosted a 2-player game
-    let p = t.player_at("Pia", "10.0.0.3");
+    let _new = t.host_at("Ben", 1, 7, "82.0.0.2"); // a friend just hosted a 2-player game
+    let p = t.player_at("Pia", "82.0.0.3");
     t.quick_match(&p);
     let m = p.msgs();
     let mut list = Vec::new();
@@ -513,7 +564,7 @@ fn hosted_games_fill_independently_newest_first() {
     t.lock_ok(&p);
     assert_eq!(matched_room(&p.msgs()).as_deref(), Some("HOST_Ben_1"));
     // the next player goes into Ann's game, the only one left
-    let q = t.player_at("Quinn", "10.0.0.4");
+    let q = t.player_at("Quinn", "82.0.0.4");
     t.quick_match(&q);
     let m = q.msgs();
     assert!(!got_lock(&m));
@@ -554,15 +605,15 @@ fn a_game_from_the_same_home_comes_first() {
 #[test]
 fn back_and_quick_match_again_goes_to_the_next_game() {
     let mut t = T::new(Config::default());
-    t.host_at("Ann", 3, 1, "10.0.0.1");
+    t.host_at("Ann", 3, 1, "82.0.0.1");
     t.tick(1_000);
-    t.host_at("Ben", 3, 1, "10.0.0.2");
-    let p = t.player_at("Pia", "10.0.0.3");
+    t.host_at("Ben", 3, 1, "82.0.0.2");
+    let p = t.player_at("Pia", "82.0.0.3");
     let mut list = Vec::new();
     t.quick_match(&p);
     waiting_list(&p.msgs(), &mut list);
     assert_eq!(names(&list), ["Ben"]);
-    let q = t.player_at("Quinn", "10.0.0.4");
+    let q = t.player_at("Quinn", "82.0.0.4");
     t.quick_match(&q);
     let mut qlist = Vec::new();
     waiting_list(&q.msgs(), &mut qlist);
@@ -586,10 +637,10 @@ fn back_and_quick_match_again_goes_to_the_next_game() {
 #[test]
 fn players_of_a_game_whose_host_stops_get_another() {
     let mut t = T::new(Config::default());
-    let ann = t.host_at("Ann", 2, 1, "10.0.0.1");
+    let ann = t.host_at("Ann", 2, 1, "82.0.0.1");
     t.tick(1_000);
-    let ben = t.host_at("Ben", 2, 1, "10.0.0.2");
-    let p = t.player_at("Pia", "10.0.0.3");
+    let ben = t.host_at("Ben", 2, 1, "82.0.0.2");
+    let p = t.player_at("Pia", "82.0.0.3");
     let mut list = Vec::new();
     t.quick_match(&p);
     t.send(&ben, json!({"t": "unserve"}));
@@ -604,4 +655,103 @@ fn players_of_a_game_whose_host_stops_get_another() {
     waiting_list(&m, &mut list);
     assert_eq!(list, vec![("900000003".into(), "Old_Timer".into(), "PLUMBER".into())]);
     assert!(got_lock(&m));
+}
+
+/// A player whose game chooses sees the waiting games, picks one, and waits there until its host
+/// starts it.
+#[test]
+fn a_player_picks_a_game_and_its_host_starts_it() {
+    let mut t = T::new(Config::default());
+    let ann = t.host_approving("Ann", 1, "82.0.0.1");
+    t.tick(1_000);
+    let _ben = t.host_approving("Ben", 2, "82.0.0.2");
+    let p = t.chooser_at("Pia", "82.0.0.3");
+    t.quick_match(&p);
+    let (texts, m) = p.split();
+    let g = last_games(&texts).expect("the games are offered");
+    assert_eq!(g["on"], true);
+    assert_eq!(g["seat"], 0, "not seated: Pia chooses");
+    assert_eq!(offered(g), ["Ben", "Ann"], "newest first");
+    assert_eq!(g["games"][1], json!([900000001, "Ann", 7, 0, 1, 0, 1]));
+    let mut list = Vec::new();
+    waiting_list(&m, &mut list);
+    assert!(list.is_empty());
+    // Pia picks Ann's game: it is full, but waits for Ann
+    t.send(&p, json!({"t": "pick", "id": 900000001}));
+    let (texts, m) = p.split();
+    assert_eq!(last_games(&texts).unwrap()["seat"], 900000001);
+    waiting_list(&m, &mut list);
+    assert_eq!(names(&list), ["Ann"]);
+    assert!(!got_lock(&m), "the host starts it");
+    assert_eq!(seats(&ann.texts()), Some(vec!["Pia"]));
+    t.send(&ann, json!({"t": "start"}));
+    let (texts, m) = p.split();
+    assert!(got_lock(&m));
+    assert_eq!(last_games(&texts).unwrap()["on"], false, "no longer choosing");
+    t.lock_ok(&p);
+    assert_eq!(matched_room(&p.msgs()).as_deref(), Some("HOST_Ann_1"));
+    assert_eq!(t.relay.status()["hosted"], 1, "Ben's game still waits");
+}
+
+/// The host sends a player away: that game is no longer offered to them, and an older game's
+/// player is not put back into it. A host's start before the seats are taken does nothing.
+#[test]
+fn the_host_sends_a_player_away() {
+    let mut t = T::new(Config::default());
+    let ann = t.host_approving("Ann", 2, "82.0.0.1");
+    let p = t.chooser_at("Pia", "82.0.0.3");
+    t.quick_match(&p);
+    t.send(&p, json!({"t": "pick", "id": 900000001}));
+    let q = t.player_at("Quinn", "82.0.0.4"); // an older game: seated by itself
+    t.quick_match(&q);
+    let mut qlist = Vec::new();
+    waiting_list(&q.msgs(), &mut qlist);
+    assert_eq!(names(&qlist), ["Ann", "Pia"]);
+    assert_eq!(seats(&ann.texts()), Some(vec!["Pia", "Quinn"]));
+    t.send(&ann, json!({"t": "kick", "name": "quinn"}));
+    assert_eq!(seats(&ann.texts()), Some(vec!["Pia"]));
+    waiting_list(&q.msgs(), &mut qlist);
+    assert!(qlist.is_empty(), "Quinn waits for another game");
+    let (texts, m) = p.split();
+    assert_eq!(last_games(&texts).unwrap()["games"][0][3], 1, "one seat taken");
+    t.send(&ann, json!({"t": "start"}));
+    assert!(!got_lock(&p.msgs()), "a seat is free: no start");
+    assert_eq!(seats(&ann.texts()), Some(vec!["Pia"]), "the host hears who is there");
+    // the next player who chooses is offered Ann's game; Quinn's next try does not get it
+    let r = t.chooser_at("Rex", "82.0.0.5");
+    t.quick_match(&r);
+    assert_eq!(offered(last_games(&r.texts()).unwrap()), ["Ann"]);
+    t.cancel(&q);
+    t.quick_match(&q);
+    waiting_list(&q.msgs(), &mut qlist);
+    assert_eq!(names(&qlist), ["Rex"], "not in Ann's game: waiting, like Rex");
+    drop(m);
+}
+
+/// A game hosted at home seats a player who chooses by itself; they can still pick another,
+/// and stay there. Back ends the list; an older host's game starts once its seats are taken.
+#[test]
+fn choosing_with_a_game_at_home_and_an_older_host() {
+    let mut t = T::new(Config::default());
+    let _ann = t.host_approving("Ann", 2, "81.0.0.1");
+    t.tick(1_000);
+    let _old = t.host("RGHost", "HOST_Old_7", 1);
+    let p = t.chooser_at("Pia", "81.0.0.1");
+    t.quick_match(&p);
+    let (texts, m) = p.split();
+    let g = last_games(&texts).unwrap();
+    assert_eq!(g["seat"], 900000001, "seated at home");
+    assert_eq!(offered(g), ["Ann", "Old"], "home first");
+    let mut list = Vec::new();
+    waiting_list(&m, &mut list);
+    assert_eq!(names(&list), ["Ann"]);
+    t.cancel(&p);
+    assert_eq!(last_games(&p.texts()).unwrap()["on"], false);
+    t.quick_match(&p);
+    p.take();
+    t.send(&p, json!({"t": "pick", "id": 900000002}));
+    let (_, m) = p.split();
+    assert!(got_lock(&m), "the older host's game starts when full");
+    t.lock_ok(&p);
+    assert_eq!(matched_room(&p.msgs()).as_deref(), Some("HOST_Old_7"));
 }

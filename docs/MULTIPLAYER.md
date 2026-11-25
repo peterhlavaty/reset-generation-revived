@@ -52,26 +52,32 @@ What happens:
 * The TCP acceptor's `setController` (vtable `0x10188b64`, slot 1) installs a fake listener.
 * The relay link (`native/rt/link.c`) runs on its own thread: it picks the relay
   (`relay_for_hosting`, see "LAN relay"), connects as `RGHost` and sends
-  `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1,"name":"<nick>","hero":H}` (`hero`: the
-  engine's hero index 0-9, -1 random; `name` and `hero` since 2026-11-25, for the joiners' list). Each `player_joined` becomes a
+  `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1,"name":"<nick>","hero":H,"approve":true}`
+  (`hero`: the engine's hero index 0-9, -1 random; `name`, `hero` and `approve` since 2026-11-25:
+  the joiners' list, and the host starts the game, see "Choosing a game"; rgtest hosts send false). Each `player_joined` becomes a
   connection object (`accept`); channel 0x16 travels as `[u16 pid][zlib message]` exactly as in
   the Phase 0 design. The game thread takes the link's events in `rg_server_pump()` after every
   tick.
-* While hosting, a status strip at the top says how many players are in; the desktop game also
-  shows it in its title bar and saves `host_players`. Android has a HOST touch button in the main
+* While hosting, a status strip at the top says how many players are in (counts include the
+  host); once a player sits down the start panel replaces it. The desktop game also shows the
+  status in its title bar and saves `host_players`. Android has a HOST touch button in the main
   menu (hidden while hosting) and remembers `host_players` in `revived.ini`.
 
 Relay side: `serve` with `players` registers a hosted game with the casino (`casino.rs`). Every
-hosted game has its own seats and starts as soon as they are taken, whatever the other games do
-(until 2026-11-25 the queue only fed the oldest game, so a 3-4 player game nobody joined held up
-every other one). A player asking for Quick Match is seated at once if a game has a free seat:
+hosted game has its own seats, whatever the other games do (until 2026-11-25 the queue only fed
+the oldest game, so a 3-4 player game nobody joined held up every other one); it starts when its
+host says so (`approve`), an older host's game as soon as its seats are taken. Players choose
+their game (see "Choosing a game"); a player of an older game asking for Quick Match is seated at
+once if a game has a free seat:
 
-1. a game hosted from the player's own network first: the same public IPv4 address or IPv6 /64
-   (the relay takes the address from nginx's `X-Real-IP` when the connection comes from
-   loopback); a player seated elsewhere moves over when such a game appears;
+1. a game hosted from the player's own network first: the same public IPv4 address or IPv6 /64,
+   or two local addresses (a LAN relay; the relay takes the address from nginx's `X-Real-IP` when
+   the connection comes from loopback); a player seated elsewhere moves over when such a game
+   appears (a choosing player only while not seated);
 2. otherwise the newest waiting game (a game left waiting for hours does not catch everyone);
 3. not one the player left with Back (CASINO_CANCEL_MATCHMAKING) in the last 10 minutes, while
-   another is waiting: Back and Quick Match again goes through the games, then round again.
+   another is waiting: Back and Quick Match again goes through the games, then round again;
+   never one whose host sent the player away in the last 10 minutes.
 
 The "Players in Match" list shows the host as an entry of its own (profile id 900000000 + n, the
 host's name and hero from `serve`; older hosts: the name from the room) and the players seated in
@@ -116,6 +122,37 @@ every screen shows, and the host's nickname appears in Battle Stats. Native host
 (the client killed mid-match and back in its seat on both screens), LAN discovery with the
 in-game relay, and Android host ↔ desktop client over the public server are verified too. Known
 limit: if the host quits the match ends for everyone.
+
+### Choosing a game
+
+Since 2026-11-25 the player picks the hosted game and its host starts it. Games say
+`"pick":true` in `hello`; the relay then seats them by itself only in a game from their own
+network (a chooser, `Client.picks`).
+
+* While a chooser waits in Quick Match (the "Players in Match" screen) the relay sends
+  `{"t":"games","on":true,"seat":ID,"games":[[ID,"host",hero,seated,seats,home,ask],...]}`
+  whenever that changes: up to 20 games with a free seat (or the player's), own network first,
+  then the newest, not those whose host sent the player away. `ID` is the host's list entry id
+  (900000000 + n), `seat` the player's game (0: none), `seated`/`seats` count the other players
+  (not the host), `home` 1 = the player's own network, `ask` 1 = its host starts it.
+  `{"t":"games","on":false}` once the player no longer waits.
+* `native/rt/lobby.c` draws it over the engine's frame (`rg_lobby_compose`, after
+  `rg_server_compose`; counts shown include the host). Without a seat: a list, Up/Down and
+  OK/Enter/Space/Ctrl send `{"t":"pick","id":ID}` (the relay moves the player there, or resends
+  the list when that game is full or gone); Back leaves Quick Match through the engine as before.
+  With a seat: a line at the top, Up/Down open the list again, Back closes it.
+* The host's relay link gets `{"t":"seats","room":R,"names":[...],"of":N}` whenever its seated
+  players change, and `server.c` shows the start panel (state 3, a player seated): START, only
+  when all seats are taken, sends `{"t":"start"}` and the relay starts the match as before
+  (MATCHED_UP to everyone in it); a name sends `{"t":"kick","name":X}`: that player goes back to
+  the front of the queue and is not offered that game for 10 minutes. Back/Esc still stops
+  hosting (the engine's host screen). The panel's and the list's keys, releases too, are kept
+  from the engine.
+* A game starts only with all its seats taken (no starting with fewer players). Older games are
+  seated as before (never in a game whose host sent them away); older hosts' games start when
+  full. `cargo x lan-test N` waits for "host: N of N player(s) seated" and presses Enter in the
+  host's window (rgtool posts keys to the window itself: `keys --pid=N` reaches the game without
+  the focus).
 
 ### LAN relay (no setup)
 

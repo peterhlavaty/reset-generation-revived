@@ -2,10 +2,18 @@
 //! engine's message classes (docs/MULTIPLAYER.md, "Casino protocol").
 //!
 //! Quick Match fills games hosted by a player (F5: the host's engine is the game server). Each
-//! hosted game has its own seats and starts as soon as they are taken, whatever the other games
-//! do. A player asking for Quick Match gets a seat right away when a game is waiting:
+//! hosted game has its own seats, whatever the other games do.
 //!
-//! 1. a game hosted from their own network (the same public address: the same home) first;
+//! Games since 2026-11-25 choose: a player's game shows the waiting games (`games` messages to
+//! the client, drawn by native/rt/lobby.c over the "Players in Match" screen) and the player
+//! picks one (`pick`); only a game hosted from their own network (the same public address: the
+//! same home) seats them by itself. The host sees who sat down (`seats`) and starts the game once
+//! its seats are taken (`start`), or sends a player away (`kick`).
+//!
+//! Older games (and older hosts, whose games start as soon as the seats are taken) get a seat
+//! right away when a game is waiting:
+//!
+//! 1. a game hosted from their own network first;
 //! 2. otherwise the newest waiting game (a friend who just hosted, not one left waiting long ago);
 //! 3. not one they left with Back: Back and Quick Match again goes on to the next game (and
 //!    round again once they have seen them all).
@@ -22,6 +30,7 @@
 use crate::relay::{ClientId, Net};
 use crate::wire::*;
 use std::collections::{HashMap, HashSet};
+use serde_json::{json, Value};
 use std::net::IpAddr;
 
 const KEEPALIVE_MS: u64 = 10_000; // clients drop a peer that is silent for 20 s
@@ -32,6 +41,8 @@ const DECLINE_MS: u64 = 10 * 60_000;
 const HOST_ID_BASE: u32 = 900_000_000;
 /// The waiting list's player count is a u8.
 const LIST_MAX: usize = 255;
+/// Games offered to a player who chooses.
+const GAMES_MAX: usize = 20;
 pub const MATCHMAKER_NAME: &str = "QuickMatch";
 
 /// The heroes by the engine's index, as the profile's `heroType` names them (0x10038940).
@@ -66,6 +77,25 @@ struct Hosted {
     list_id: u32,
     /// The players Quick Match gave it so far.
     seated: Vec<Waiting>,
+    /// The host's connection, and whether the game starts only when they say so.
+    owner: Option<ClientId>,
+    approve: bool,
+    /// The seated players' names as the host last heard them.
+    told: Option<Vec<String>>,
+}
+
+/// A hosted game as the host's engine offers it (`serve`).
+pub struct Offer<'a> {
+    pub room: &'a str,
+    /// Players it takes (not counting the host).
+    pub players: usize,
+    /// The host's name and hero (the engine's index; other values: random) for the lists.
+    pub host: Option<&'a str>,
+    pub hero: Option<i64>,
+    pub addr: Option<IpAddr>,
+    pub owner: Option<ClientId>,
+    /// Starts when the host says so (`start`), not as soon as the seats are taken.
+    pub approve: bool,
 }
 
 struct Match {
@@ -93,6 +123,10 @@ pub struct Casino {
     dropped: HashMap<String, HashMap<String, u64>>,
     /// Lower-case name -> the hosted games (room keys) they left with Back, and when they last did.
     declined: HashMap<String, (Vec<String>, u64)>,
+    /// Lower-case name -> the hosted games whose host sent them away, and when.
+    kicked: HashMap<String, Vec<(String, u64)>>,
+    /// The game list each choosing player was last sent.
+    games_shown: HashMap<ClientId, String>,
     /// The profile ids each waiting player's "Players in Match" list shows.
     shown: HashMap<ClientId, Vec<String>>,
     /// Nickname -> player id (a player keeps their id between casino visits).
@@ -113,14 +147,20 @@ fn write_casino(w: &mut Writer) {
     w.u8(1).u32(1).u32(0).u32(0).u32(0).str(MATCHMAKER_NAME);
 }
 
-/// Two addresses of one network: the same IPv4 address (a home behind one router) or the same
-/// IPv6 /64.
+/// Two addresses of one network: the same IPv4 address (a home behind one router), the same
+/// IPv6 /64, or two local addresses (a LAN relay: the host's own game comes from 127.0.0.1, the
+/// others from 192.168.x.y).
 fn same_network(a: Option<IpAddr>, b: Option<IpAddr>) -> bool {
     let plain = |ip: IpAddr| match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,
     };
+    let local = |ip: IpAddr| match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[0] & 0xfe00 == 0xfc00 || v6.segments()[0] & 0xffc0 == 0xfe80,
+    };
     match (a.map(plain), b.map(plain)) {
+        (Some(x), Some(y)) if local(x) && local(y) => true,
         (Some(IpAddr::V4(x)), Some(IpAddr::V4(y))) => x == y,
         (Some(IpAddr::V6(x)), Some(IpAddr::V6(y))) => x.segments()[..4] == y.segments()[..4],
         _ => false,
@@ -213,31 +253,99 @@ impl Casino {
     }
 
     /// A host player's game (its engine is the game server) takes the next `players` players.
-    /// `host` and `hero` (the engine's index, other values: random) are for the waiting list.
-    pub fn add_hosted(
-        &mut self,
-        net: &mut Net,
-        room: &str,
-        players: usize,
-        host: Option<&str>,
-        hero: Option<i64>,
-        addr: Option<IpAddr>,
-    ) {
-        let key = room.to_lowercase();
+    pub fn add_hosted(&mut self, net: &mut Net, o: Offer) {
+        let key = o.room.to_lowercase();
         self.remove_hosted(&key);
         self.next_list_id += 1;
+        let host = o.host.map_or_else(|| host_from_room(o.room), str::to_string);
         self.hosted.push(Hosted {
-            room: room.to_string(),
+            room: o.room.to_string(),
             key,
-            players,
-            host: host.map_or_else(|| host_from_room(room), str::to_string),
-            hero: hero.and_then(|h| usize::try_from(h).ok()).and_then(|h| HEROES.get(h).copied()),
-            addr,
+            players: o.players,
+            host: host.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect(),
+            hero: o.hero.and_then(|h| usize::try_from(h).ok()).and_then(|h| HEROES.get(h).copied()),
+            addr: o.addr,
             list_id: HOST_ID_BASE + self.next_list_id,
             seated: Vec::new(),
+            owner: o.owner,
+            approve: o.approve,
+            told: None,
         });
-        net.log(&format!("casino: hosted game {room} for {players} player(s)"));
+        let when = if o.approve { "when the host says so" } else { "when full" };
+        net.log(&format!("casino: hosted game {} for {} player(s), starts {when}", o.room, o.players));
         self.matchmake(net);
+    }
+
+    /// A choosing player picks a waiting game (by its list id).
+    pub fn choose(&mut self, net: &mut Net, c: ClientId, id: u32) {
+        let Some(j) = self.hosted.iter().position(|h| h.list_id == id) else {
+            return self.resend_games(net, c); // gone meanwhile
+        };
+        let h = &self.hosted[j];
+        if h.seated.iter().any(|q| q.client == c) {
+            return;
+        }
+        if h.seated.len() >= h.players || self.was_kicked(net, c, &h.key) {
+            return self.resend_games(net, c);
+        }
+        let q = if let Some(i) = self.queue.iter().position(|q| q.client == c) {
+            self.queue.remove(i)
+        } else if let Some(o) = self.hosted.iter_mut().find(|o| o.seated.iter().any(|q| q.client == c)) {
+            let i = o.seated.iter().position(|q| q.client == c).unwrap();
+            o.seated.remove(i)
+        } else {
+            return; // not in Quick Match
+        };
+        net.log(&format!("casino: {} picks {}", net.name(c), self.hosted[j].room));
+        self.hosted[j].seated.push(q);
+        self.matchmake(net);
+    }
+
+    fn resend_games(&mut self, net: &mut Net, c: ClientId) {
+        self.games_shown.remove(&c);
+        self.refresh(net);
+    }
+
+    /// The host starts their game (`start`): only when every seat is taken.
+    pub fn host_start(&mut self, net: &mut Net, owner: ClientId) {
+        let Some(i) = self.hosted.iter().position(|h| h.owner == Some(owner)) else { return };
+        if self.hosted[i].seated.len() >= self.hosted[i].players {
+            net.log(&format!("casino: the host starts {}", self.hosted[i].room));
+            self.launch(net, i);
+        } else {
+            self.hosted[i].told = None; // someone left meanwhile: the host hears who is there
+        }
+        self.refresh(net);
+    }
+
+    /// The host sends a seated player away (`kick`): that game is not offered to them again for
+    /// a while.
+    pub fn host_kick(&mut self, net: &mut Net, owner: ClientId, name: &str) {
+        let Some(h) = self.hosted.iter_mut().find(|h| h.owner == Some(owner)) else { return };
+        let Some(i) = h.seated.iter().position(|q| net.name(q.client).eq_ignore_ascii_case(name)) else {
+            h.told = None;
+            return self.refresh(net);
+        };
+        let q = h.seated.remove(i);
+        let key = h.key.clone();
+        net.log(&format!("casino: the host of {} sends {} away", h.room, net.name(q.client)));
+        self.kicked.entry(net.name(q.client).to_lowercase()).or_default().push((key, net.now));
+        self.queue.insert(0, q);
+        self.matchmake(net);
+    }
+
+    fn was_kicked(&self, net: &Net, c: ClientId, key: &str) -> bool {
+        self.kicked.get(&net.name(c).to_lowercase()).is_some_and(|k| k.iter().any(|(k, _)| k == key))
+    }
+
+    /// Starts a hosted game with the players seated in it.
+    fn launch(&mut self, net: &mut Net, i: usize) {
+        let h = self.hosted.remove(i);
+        for q in &h.seated {
+            self.shown.remove(&q.client);
+            self.declined.remove(&net.name(q.client).to_lowercase());
+        }
+        self.start_match(net, h.seated, h.room);
     }
 
     /// The game is no longer waiting: its seated players wait again (at the front).
@@ -299,6 +407,7 @@ impl Casino {
         if free.is_empty() {
             return None;
         }
+        let free: Vec<usize> = free.into_iter().filter(|&i| !self.was_kicked(net, c, &self.hosted[i].key)).collect();
         let mut open: Vec<usize> = free.iter().copied().filter(|&i| !self.declined(net, c, &self.hosted[i].key)).collect();
         if open.is_empty() {
             // seen them all: round again
@@ -309,11 +418,16 @@ impl Casino {
         open.iter().copied().find(|&i| same_network(self.hosted[i].addr, addr)).or(open.first().copied())
     }
 
-    /// Seats waiting players: anyone (also seated elsewhere) in a game from their own network,
-    /// then the others in the game `pick` gives them.
+    /// Seats waiting players: anyone in a game from their own network (also a player of an
+    /// older game seated elsewhere; one who chooses only while they have not), then the older
+    /// games' players in the game `pick` gives them. Players who choose pick a game themselves.
     fn place(&mut self, net: &Net) {
         let now = net.now;
         self.declined.retain(|_, (_, t)| now.saturating_sub(*t) < DECLINE_MS);
+        for k in self.kicked.values_mut() {
+            k.retain(|(_, t)| now.saturating_sub(*t) < DECLINE_MS);
+        }
+        self.kicked.retain(|_, k| !k.is_empty());
         let waiting: Vec<(Waiting, Option<usize>)> = self
             .queue
             .iter()
@@ -322,12 +436,15 @@ impl Casino {
             .collect();
         for (q, at) in waiting {
             let addr = net.addr(q.client);
-            if at.is_some_and(|i| same_network(self.hosted[i].addr, addr)) {
+            if at.is_some_and(|i| same_network(self.hosted[i].addr, addr)) || (at.is_some() && net.picks(q.client)) {
                 continue;
             }
             let home = (0..self.hosted.len()).rev().find(|&i| {
                 let h = &self.hosted[i];
-                h.seated.len() < h.players && same_network(h.addr, addr) && !self.declined(net, q.client, &h.key)
+                h.seated.len() < h.players
+                    && same_network(h.addr, addr)
+                    && !self.declined(net, q.client, &h.key)
+                    && !self.was_kicked(net, q.client, &h.key)
             });
             if let Some(j) = home {
                 match at {
@@ -339,6 +456,10 @@ impl Casino {
         }
         let mut i = 0;
         while i < self.queue.len() {
+            if net.picks(self.queue[i].client) {
+                i += 1;
+                continue;
+            }
             match self.pick(net, self.queue[i].client) {
                 Some(j) => {
                     let q = self.queue.remove(i);
@@ -349,18 +470,14 @@ impl Casino {
         }
     }
 
-    /// Seats waiting players, starts the games whose seats are all taken and updates the
-    /// waiting lists. Without a hosted game, `QM_n` rooms of `match_size` players (if enabled).
+    /// Seats waiting players, starts the games whose seats are all taken (unless their host
+    /// starts them) and updates the lists. Without a hosted game, `QM_n` rooms of `match_size`
+    /// players (if enabled).
     fn matchmake(&mut self, net: &mut Net) {
         self.place(net);
         self.refresh(net); // also those whose game starts now see whose it is
-        while let Some(i) = self.hosted.iter().position(|h| h.seated.len() >= h.players) {
-            let h = self.hosted.remove(i);
-            for q in &h.seated {
-                self.shown.remove(&q.client);
-                self.declined.remove(&net.name(q.client).to_lowercase());
-            }
-            self.start_match(net, h.seated, h.room);
+        while let Some(i) = self.hosted.iter().position(|h| !h.approve && h.seated.len() >= h.players) {
+            self.launch(net, i);
         }
         if self.hosted.is_empty() {
             while self.match_size > 0 && self.queue.len() >= self.match_size {
@@ -398,11 +515,59 @@ impl Casino {
         list
     }
 
+    /// The games a choosing player is offered: `[list id, host, hero index or -1, seated,
+    /// seats, same network (0/1), the host starts it (0/1)]`, their own network's first, then the newest; and the list id
+    /// of the game they sit in (0: none).
+    fn games_for(&self, net: &Net, c: ClientId) -> (Vec<Value>, u32) {
+        let addr = net.addr(c);
+        let seat = self.hosted.iter().find(|h| h.seated.iter().any(|q| q.client == c)).map_or(0, |h| h.list_id);
+        let mut games: Vec<&Hosted> = self
+            .hosted
+            .iter()
+            .rev()
+            .filter(|h| h.list_id == seat || (h.seated.len() < h.players && !self.was_kicked(net, c, &h.key)))
+            .collect();
+        games.sort_by_key(|h| !same_network(h.addr, addr)); // stable: newest first within
+        let games = games
+            .into_iter()
+            .take(GAMES_MAX)
+            .map(|h| {
+                let hero = h.hero.and_then(|n| HEROES.iter().position(|&x| x == n)).map_or(-1, |i| i as i64);
+                json!([h.list_id, h.host, hero, h.seated.len(), h.players, same_network(h.addr, addr) as u8, h.approve as u8])
+            })
+            .collect();
+        (games, seat)
+    }
+
     /// Brings every waiting player's list up to date: EVENT CASINO_CANCEL_MATCHMAKING (10,
     /// `[string id]`) removes an entry, EVENT CASINO_MATCHMAKING (9, `[string id][profile]`) adds
-    /// one.
+    /// one. Players who choose also get the games (`games`, `on: false` once they no longer
+    /// wait), hosts who start their game the players seated in it (`seats`).
     fn refresh(&mut self, net: &Net) {
         let waiting: Vec<Waiting> = self.queue.iter().chain(self.hosted.iter().flat_map(|h| h.seated.iter())).copied().collect();
+        for q in waiting.iter().filter(|q| net.picks(q.client)) {
+            let (games, seat) = self.games_for(net, q.client);
+            let msg = json!({"t": "games", "on": true, "seat": seat, "games": games});
+            let text = msg.to_string();
+            if self.games_shown.get(&q.client) != Some(&text) {
+                net.ctl(q.client, msg);
+                self.games_shown.insert(q.client, text);
+            }
+        }
+        let gone: Vec<ClientId> = self.games_shown.keys().copied().filter(|c| !waiting.iter().any(|q| q.client == *c)).collect();
+        for c in gone {
+            self.games_shown.remove(&c);
+            net.ctl(c, json!({"t": "games", "on": false}));
+        }
+        for h in self.hosted.iter_mut().filter(|h| h.approve) {
+            let names: Vec<String> = h.seated.iter().map(|q| net.name(q.client).to_string()).collect();
+            if h.told.as_ref() != Some(&names) {
+                if let Some(o) = h.owner {
+                    net.ctl(o, json!({"t": "seats", "room": h.room, "names": names, "of": h.players}));
+                }
+                h.told = Some(names);
+            }
+        }
         for q in waiting {
             let want = self.list_for(net, q.client);
             let had = self.shown.remove(&q.client).unwrap_or_default();
@@ -614,7 +779,7 @@ impl Casino {
             10 => {
                 // CASINO_CANCEL_MATCHMAKING (Back on the "Players in Match" screen): next time
                 // the player gets another game, if there is one
-                if let Some(key) = self.withdraw(c).filter(|k| !k.is_empty()) {
+                if let Some(key) = self.withdraw(c).filter(|k| !k.is_empty() && !net.picks(c)) {
                     let d = self.declined.entry(net.name(c).to_lowercase()).or_default();
                     if !d.0.contains(&key) {
                         d.0.push(key);
@@ -658,6 +823,9 @@ mod tests {
         assert!(same_network(ip("2a02:1:2:3:aaaa::1"), ip("2a02:1:2:3:bbbb::2")));
         assert!(!same_network(ip("2a02:1:2:3::1"), ip("2a02:1:2:4::1")));
         assert!(!same_network(None, None));
+        assert!(same_network(ip("127.0.0.1"), ip("192.168.0.59")));
+        assert!(same_network(ip("10.0.0.2"), ip("fe80::1")));
+        assert!(!same_network(ip("127.0.0.1"), ip("81.2.3.4")));
     }
 
     #[test]

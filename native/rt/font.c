@@ -1,9 +1,10 @@
-/* 5x7 bitmap font (upper case, digits, a little punctuation): the hosting picker and status line
- * (server.c) and the Android host's button labels and diagnostics. */
+/* 5x7 bitmap font (upper case, digits, a little punctuation) and a few boxes: the hosting picker,
+ * status line and start panel (server.c), the game list (lobby.c) and the Android host's button
+ * labels and diagnostics. */
 #include "host.h"
 #include <string.h>
 
-static const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:.-/=,+()!";
+static const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:.-/=,+()!'_>";
 static const uint8_t font5x7[][7] = {
     {0x0e,0x11,0x11,0x1f,0x11,0x11,0x11}, {0x1e,0x11,0x11,0x1e,0x11,0x11,0x1e}, {0x0e,0x11,0x10,0x10,0x10,0x11,0x0e},
     {0x1e,0x11,0x11,0x11,0x11,0x11,0x1e}, {0x1f,0x10,0x10,0x1e,0x10,0x10,0x1f}, {0x1f,0x10,0x10,0x1e,0x10,0x10,0x10},
@@ -21,7 +22,8 @@ static const uint8_t font5x7[][7] = {
     {0x00,0x0c,0x0c,0x00,0x0c,0x0c,0x00}, {0x00,0x00,0x00,0x00,0x00,0x0c,0x0c}, {0x00,0x00,0x00,0x1f,0x00,0x00,0x00},
     {0x01,0x01,0x02,0x04,0x08,0x10,0x10}, {0x00,0x00,0x1f,0x00,0x1f,0x00,0x00}, {0x00,0x00,0x00,0x00,0x0c,0x04,0x08},
     {0x00,0x04,0x04,0x1f,0x04,0x04,0x00}, {0x02,0x04,0x08,0x08,0x08,0x04,0x02}, {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
-    {0x04,0x04,0x04,0x04,0x04,0x00,0x04},
+    {0x04,0x04,0x04,0x04,0x04,0x00,0x04}, {0x04,0x04,0x08,0x00,0x00,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00,0x00,0x1f},
+    {0x08,0x04,0x02,0x01,0x02,0x04,0x08},
 };
 
 const uint8_t *rt_glyph(char c) {
@@ -45,4 +47,39 @@ void rt_draw_text(uint32_t *px, int w, int h, int x, int y, int scale, const cha
                             if (xx >= 0 && xx < w && yy >= 0 && yy < h) px[(size_t)yy * w + xx] = color;
                         }
     }
+}
+
+void rt_fill_rect(uint32_t *px, int w, int h, int x0, int y0, int x1, int y1, uint32_t c) {
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) px[(size_t)y * w + x] = c;
+}
+
+void rt_shade_rect(uint32_t *px, int w, int h, int x0, int y0, int x1, int y1, int keep) {
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            uint32_t c = px[(size_t)y * w + x];
+            px[(size_t)y * w + x] = (((c >> 16 & 0xff) * keep >> 8) << 16) | (((c >> 8 & 0xff) * keep >> 8) << 8) | ((c & 0xff) * keep >> 8);
+        }
+}
+
+void rt_draw_text_centred(uint32_t *px, int w, int h, int y, int scale, const char *s, uint32_t color) {
+    rt_draw_text(px, w, h, (w - rt_text_width(s, scale)) / 2, y, scale, s, color);
+}
+
+void rt_draw_panel(uint32_t *px, int w, int h, int x, int y, int bw, int bh) {
+    const uint32_t gold = 0xffc828;
+    rt_shade_rect(px, w, h, 0, 0, w, h, 90);
+    rt_fill_rect(px, w, h, x, y, x + bw, y + bh, 0x182040);
+    rt_fill_rect(px, w, h, x, y, x + bw, y + 2, gold);
+    rt_fill_rect(px, w, h, x, y + bh - 2, x + bw, y + bh, gold);
+    rt_fill_rect(px, w, h, x, y, x + 2, y + bh, gold);
+    rt_fill_rect(px, w, h, x + bw - 2, y, x + bw, y + bh, gold);
 }

@@ -53,7 +53,8 @@ pub fn killgame() -> R<()> {
 }
 
 /// Several games on this PC: one hosts a match for N players, the others join it with Quick
-/// Match (menus driven by --keys). `--server=X` picks the relay (default auto).
+/// Match (menus driven by --keys; the relay seats them in the game from their own network), then
+/// the host starts it (Enter on its start panel). `--server=X` picks the relay (default auto).
 pub fn lan_test(args: &[String]) -> R<()> {
     let mut n = 2;
     let mut server = "auto".to_string();
@@ -67,7 +68,7 @@ pub fn lan_test(args: &[String]) -> R<()> {
     killgame()?;
     let s = format!("--server={server}");
     let host_log = logs().join("host.log");
-    spawn(
+    let host = spawn(
         &[
             "--nickname=Host".into(),
             s.clone(),
@@ -105,7 +106,20 @@ pub fn lan_test(args: &[String]) -> R<()> {
         )?;
         std::thread::sleep(Duration::from_secs(2));
     }
-    println!("started {n} games (logs: {}); the match begins about 15 s after the last one", logs().display());
+    // the host starts the game once everybody sat down
+    let seated = format!("host: {m} of {m} player(s) seated", m = n - 1);
+    let t = Instant::now();
+    while !std::fs::read_to_string(&host_log).unwrap_or_default().contains(&seated) {
+        if t.elapsed() > Duration::from_secs(90) {
+            return Err(format!("the players did not sit down, see {}", logs().display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    match win::find(Some(host)).and_then(|w| win::send_keys(w, "RETURN")) {
+        Ok(()) => println!("started {n} games, the host started the match (logs: {})", logs().display()),
+        Err(e) => println!("started {n} games (logs: {}); press Enter in the host's window to start ({e})", logs().display()),
+    }
     Ok(())
 }
 
@@ -172,7 +186,7 @@ mod win {
     use windows_sys::Win32::Graphics::Gdi::*;
     use windows_sys::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{keybd_event, MapVirtualKeyW, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::MapVirtualKeyW;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     #[derive(Clone, Copy)]
@@ -258,25 +272,23 @@ mod win {
         })
     }
 
-    /// RETURN,DOWN,WAIT500,…: each key held 80 ms, 300 ms apart.
+    /// RETURN,DOWN,WAIT500,…: each key held 80 ms, 300 ms apart, posted to that window: it
+    /// need not have the focus, and no other window gets them (with several games open, or the
+    /// user typing elsewhere).
     pub fn send_keys(w: Window, keys: &str) -> R<()> {
-        unsafe {
-            ShowWindow(w.0, SW_RESTORE);
-            SetForegroundWindow(w.0);
-        }
-        std::thread::sleep(Duration::from_millis(150));
         for k in keys.split(',').map(|k| k.trim().to_ascii_uppercase()).filter(|k| !k.is_empty()) {
             if let Some(ms) = k.strip_prefix("WAIT") {
                 std::thread::sleep(Duration::from_millis(ms.parse().unwrap_or(500)));
                 continue;
             }
             let code = vk(&k)?;
-            let ext = if (0x21..=0x2e).contains(&code) { KEYEVENTF_EXTENDEDKEY } else { 0 };
             unsafe {
-                let sc = MapVirtualKeyW(code as u32, 0) as u8;
-                keybd_event(code, sc, ext, 0);
+                // lParam: repeat 1, scan code, extended key (the arrows and their block)
+                let sc = MapVirtualKeyW(code as u32, 0) as isize;
+                let l = 1 | sc << 16 | if (0x21..=0x2e).contains(&code) { 1 << 24 } else { 0 };
+                PostMessageW(w.0, WM_KEYDOWN, code as usize, l);
                 std::thread::sleep(Duration::from_millis(80));
-                keybd_event(code, sc, ext | KEYEVENTF_KEYUP, 0);
+                PostMessageW(w.0, WM_KEYUP, code as usize, l | 3 << 30);
             }
             std::thread::sleep(Duration::from_millis(300));
         }

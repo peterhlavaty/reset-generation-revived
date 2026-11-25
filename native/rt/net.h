@@ -9,6 +9,7 @@ void net_attach(uint8_t *netbuf, int size);      /* the engine's shared packet b
 void net_dispatch_events(void);                   /* game thread, before each tick */
 const char *net_server_url(void);                 /* the configured relay */
 const char *net_nickname(void);                   /* this player's name (made up if none is set) */
+int net_control(const char *json);                /* a control message to the relay (any thread) */
 
 /* NativeSNAPMobileInterface methods */
 int net_init(void);

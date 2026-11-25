@@ -71,6 +71,10 @@ void rt_ret(uint32_t eax, int pop_args);
 const uint8_t *rt_glyph(char c);
 int rt_text_width(const char *s, int scale);
 void rt_draw_text(uint32_t *px, int w, int h, int x, int y, int scale, const char *s, uint32_t color);
+void rt_draw_text_centred(uint32_t *px, int w, int h, int y, int scale, const char *s, uint32_t color);
+void rt_fill_rect(uint32_t *px, int w, int h, int x0, int y0, int x1, int y1, uint32_t color);
+void rt_shade_rect(uint32_t *px, int w, int h, int x0, int y0, int x1, int y1, int keep);   /* keep/256 of the colour */
+void rt_draw_panel(uint32_t *px, int w, int h, int x, int y, int bw, int bh);   /* the frame darkened, a gold-edged box */
 
 /* guest heap (win32.c) */
 uint32_t rt_heap_alloc(uint32_t n);
