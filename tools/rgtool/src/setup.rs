@@ -4,7 +4,8 @@
 //!
 //! * jdk17-x86: Temurin 17, 32-bit (the engine DLL is 32-bit, so is the JVM that loads it)
 //! * llvm-mingw: clang for Windows targets (rghost.dll is i686, needs thiscall + GNU asm)
-//! * jdk21, ghidra: the headless Ghidra export the native builds start from
+//! * jdk25, ghidra: the headless Ghidra export the native builds start from (Ghidra 12.2+ needs
+//!   JDK 25); jdk25 also runs the build-time Java tools on other OSes
 //!
 //! Android SDK / NDK: an existing installation (ANDROID_HOME, ANDROID_SDK_ROOT or the Android
 //! Studio default) is used; `cargo x doctor` shows what was found.
@@ -18,7 +19,7 @@ pub fn dir() -> PathBuf {
     std::env::var_os("RG_TOOLCHAINS").map(PathBuf::from).unwrap_or_else(|| root().join(".toolchains"))
 }
 
-pub const ALL: &[&str] = &["jdk17-x86", "llvm-mingw", "jdk21", "ghidra"];
+pub const ALL: &[&str] = &["jdk17-x86", "llvm-mingw", "jdk25", "ghidra"];
 
 fn os() -> &'static str {
     match std::env::consts::OS {
@@ -172,7 +173,7 @@ pub fn setup(what: &[String]) -> R<()> {
         }
         match name {
             "jdk17-x86" => temurin(name, 17, "x32")?,
-            "jdk21" => temurin(name, 21, if cfg!(target_arch = "aarch64") { "aarch64" } else { "x64" })?,
+            "jdk25" => temurin(name, 25, if cfg!(target_arch = "aarch64") { "aarch64" } else { "x64" })?,
             "llvm-mingw" => {
                 let host = if cfg!(windows) { "ucrt-x86_64.zip" } else if cfg!(target_os = "macos") { "macos-universal.tar.xz" } else { "ucrt-ubuntu-22.04-x86_64.tar.xz" };
                 if !cfg!(windows) {

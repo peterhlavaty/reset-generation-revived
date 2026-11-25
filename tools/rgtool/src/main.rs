@@ -2,8 +2,12 @@
 //! repository. It replaces the old shell / PowerShell / Python scripts and builds on any OS that
 //! has Rust (some commands need the toolchains `cargo x setup` fetches).
 
+mod android;
+mod data;
 mod deploy;
+mod native;
 mod play;
+mod recomp;
 mod setup;
 mod util;
 mod windows;
@@ -14,7 +18,7 @@ const HELP: &str = "cargo x <command>
 
 Setup
   setup [what…|all]      download toolchains into .toolchains/ (default: what the Windows build
-                         needs; known: jdk17-x86, llvm-mingw, jdk21, ghidra)
+                         needs; known: jdk17-x86, llvm-mingw, jdk25, ghidra)
   doctor                 show the toolchains found
 
 Build
@@ -29,6 +33,32 @@ Play / test (Windows build)
                          F11 …, hex codes), then optionally a screenshot to build/shots/<shot>.png
   shot [name] [--pid=N]  screenshot of the game window
   killgame               end the game processes (only the game, not other Java programs)
+
+Native (recompiled engine)
+  ghidra-export [DLL]    headless Ghidra analysis -> decompiled/native/pcode.txt (needs
+                         `cargo x setup jdk25 ghidra`; the first run takes several minutes)
+  recomp PCODE OUT [--files N] [--dll DLL] [--trace a,b] [--hook a,b]
+                         P-code -> C (the build commands run it themselves when needed)
+  build-native-test [--calltrace] [--trace a,b]
+                         build/native/rgtest: headless test driver for the recompiled engine
+  native-test [FRAMES] [--size WxH] [--keys \"F:KEY,…\"] [--shots F,F] [--realtime]
+                         run it (virtual clock; PPM screenshots in build/native/test)
+
+Android
+  build-android [--abis=arm64-v8a,x86_64] [--diag]
+                         dist/ResetGeneration-Revived-<version>.apk (needs the Android SDK + NDK)
+  android-run [--avd=NAME]
+                         start the emulator if no device is connected, install the APK, start it
+  android-keys K1,K2     key presses (ENTER ESC UP DOWN LEFT RIGHT CTRL, WAITms)
+  android-shot [name]    screenshot to build/shots/<name>.png
+  android-log [N]        the game's last N log lines (logcat)
+
+Game data
+  pak list|extract FILE.pak [OUTDIR]   list / unpack a .pak (real file names from its name list)
+  gfx FILE.gfx OUT.png                 a .gfx image (format 0, raw ARGB) to PNG
+  spc FILE.spc OUT.wav [--low-first]   a .spc sound to WAV (tentative decoder)
+  sisx FILE.sis OUTDIR                 unpack a Symbian 9 .sis (N-Gage packages)
+  split-ngage FILE.n-gage OUTDIR       split an N-Gage 2.0 install file into its parts
 
 Server
   deploy                 build the relay for Linux and put it on the public server
@@ -54,6 +84,20 @@ fn main() {
         "keys" => play::keys(rest),
         "shot" => play::shot(rest),
         "killgame" => play::killgame(),
+        "ghidra-export" => native::ghidra_export(rest),
+        "recomp" => recomp::cmd(rest),
+        "build-native-test" => native::build_test(rest),
+        "native-test" => native::run_test(rest),
+        "build-android" => android::build(rest),
+        "pak" => data::pak(rest),
+        "gfx" => data::gfx(rest),
+        "spc" => data::spc(rest),
+        "sisx" => data::sisx(rest),
+        "split-ngage" => data::split_ngage(rest),
+        "android-run" => android::run_emulator(rest),
+        "android-keys" => android::keys(rest),
+        "android-shot" => android::shot(rest),
+        "android-log" => android::log(rest),
         "deploy" => deploy::deploy(),
         "deploy-status" => deploy::status(),
         "deploy-logs" => deploy::logs(rest.first().and_then(|n| n.parse().ok()).unwrap_or(100)),

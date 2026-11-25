@@ -34,8 +34,6 @@ pub fn expand(p: &str) -> PathBuf {
     }
 }
 
-pub const EXE: &str = std::env::consts::EXE_SUFFIX;
-
 /// Runs a program, echoing it; fails on a non-zero exit.
 pub fn run(cmd: &mut Command) -> R<()> {
     let shown = format!("{cmd:?}").replace('"', "");
@@ -46,21 +44,6 @@ pub fn run(cmd: &mut Command) -> R<()> {
         return Err(format!("{:?} failed ({st})", cmd.get_program()).into());
     }
     Ok(())
-}
-
-/// A program's stdout (trimmed); fails on a non-zero exit.
-pub fn output(cmd: &mut Command) -> R<String> {
-    let o = cmd.output().map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
-    if !o.status.success() {
-        return Err(format!("{:?} failed: {}", cmd.get_program(), String::from_utf8_lossy(&o.stderr)).into());
-    }
-    Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
-}
-
-/// A program on PATH.
-pub fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(format!("{name}{EXE}"))).find(|p| p.is_file())
 }
 
 /// All files under `dir` (recursively) with this extension.
@@ -115,4 +98,19 @@ pub fn read_ini(p: &Path) -> R<Vec<(String, String)>> {
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect())
+}
+
+/// Long-running programs we start (the game, the emulator) must not inherit our stdout / stderr:
+/// a caller reading them through a pipe would wait until those programs end.
+pub fn no_inherit() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+        for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe {
+                SetHandleInformation(GetStdHandle(h), HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }

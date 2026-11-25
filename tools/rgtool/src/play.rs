@@ -20,7 +20,7 @@ fn spawn(args: &[String], log: &str) -> R<u32> {
         return Err("build first: cargo x build-windows".into());
     }
     let f = std::fs::File::create(logs().join(log))?;
-    win::no_inherit();
+    crate::util::no_inherit();
     let child = Command::new(exe()).args(args).stdin(Stdio::null()).stdout(f.try_clone()?).stderr(f).spawn()?;
     Ok(child.id())
 }
@@ -137,7 +137,6 @@ mod win {
     use crate::util::R;
     #[derive(Clone, Copy)]
     pub struct Window;
-    pub fn no_inherit() {}
     pub fn find(_: Option<u32>) -> R<Window> {
         Err("only on Windows".into())
     }
@@ -165,18 +164,6 @@ mod win {
 
     #[derive(Clone, Copy)]
     pub struct Window(HWND);
-
-    /// The game must not inherit our stdout / stderr: a caller reading them (a pipe) would wait
-    /// until the game ends.
-    pub fn no_inherit() {
-        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
-        for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-            unsafe {
-                SetHandleInformation(GetStdHandle(h), HANDLE_FLAG_INHERIT, 0);
-            }
-        }
-    }
 
     fn game_pids() -> Vec<u32> {
         let mut out = Vec::new();
