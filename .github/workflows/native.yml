@@ -65,6 +65,9 @@ jobs:
         with:
           path: build/android/debug.keystore
           key: apk-signing-key-v1
+      - name: Relay tests (casino, rooms, edge cases, fuzz)
+        if: runner.os == 'Linux'
+        run: cargo test -q -p rg-server
       - name: Desktop game
         run: cargo x build-desktop
       - name: Android APK

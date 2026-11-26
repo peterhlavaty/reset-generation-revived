@@ -40,7 +40,10 @@ into an online host; the recompiler emits the hooks it needs:
 
 What happens:
 
-* **F5** (keycode 116 to `rg_key`, or `rg_host_request()`) opens the player-count picker (2–4,
+* **F5** (keycode 116 to `rg_key`, or `rg_host_request()`) works only on the main menu while
+  nothing is hosted and the player is not logged in online (`rg_host_can_start()`: the main menu
+  is the current screen of the engine's screen stack; the Android HOST button and `host=auto` use
+  it too). It opens the player-count picker (2–4,
   Left/Right or 2–4, Enter, Esc), drawn by `rg_server_compose()` over the engine's frame with a
   small built-in font (`native/rt/font.c`); its keys are kept from the engine. While it is shown
   the host taps Right (a no-op in the main menu) when it opens and every 10 s: the main menu
@@ -52,9 +55,12 @@ What happens:
 * The TCP acceptor's `setController` (vtable `0x10188b64`, slot 1) installs a fake listener.
 * The relay link (`native/rt/link.c`) runs on its own thread: it picks the relay
   (`relay_for_hosting`, see "LAN relay"), connects as `RGHost` and sends
-  `{"t":"serve","room":"HOST_<nick>_<n>","players":N-1,"name":"<nick>","hero":H,"approve":true}`
+  `{"t":"serve","room":"HOST_<nick>_<n>","key":K,"players":N-1,"name":"<nick>","hero":H,"approve":true}`
   (`hero`: the engine's hero index 0-9, -1 random; `name`, `hero` and `approve` since 2026-11-25:
-  the joiners' list, and the host starts the game, see "Choosing a game"; rgtest hosts send false). Each `player_joined` becomes a
+  the joiners' list, and the host starts the game, see "Choosing a game"; rgtest hosts send false).
+  `n` is random (1..999999) and `key` 16 random hex digits, new for every hosted game (see "When
+  the host's link drops"); a room name the relay refuses (`{"t":"error","op":"serve","code":
+  "taken"}`) is retried with a new `n`. Each `player_joined` becomes a
   connection object (`accept`); channel 0x16 travels as `[u16 pid][zlib message]` exactly as in
   the Phase 0 design. The game thread takes the link's events in `rg_server_pump()` after every
   tick.
@@ -86,7 +92,7 @@ has a free seat see each other and are seated when a game is hosted. `rg-relay -
 defaults to 0, so Quick Match never forms `QM_n` rooms that have no game server. When the host's
 engine closes the listener (match over, or the host left the host screen) the host sends
 `{"t":"unserve"}`, so no one is matched into a dead room, and the status says "F5 = host a new
-game" (`host=auto` re-hosts by itself). Once a game server serves a room, the game room stops
+game" (`host=auto` hosts again by itself whenever a hosting ends, unless the player left it with Back/Esc). Once a game server serves a room, the game room stops
 sending EVENT SEAT_LEAVE (the match reports leavers itself): a client still on its win screen that
 got it stayed on a black screen.
 
@@ -120,8 +126,8 @@ players surrender one by one every client reaches the win screen, Battle Stats a
 host then hosts again and "Play Again" starts the next match. The host's chosen hero is the one
 every screen shows, and the host's nickname appears in Battle Stats. Native host ↔ native client
 (the client killed mid-match and back in its seat on both screens), LAN discovery with the
-in-game relay, and Android host ↔ desktop client over the public server are verified too. Known
-limit: if the host quits the match ends for everyone.
+in-game relay, and Android host ↔ desktop client over the public server are verified too. If
+the host quits, the match ends for everyone (see "When the host's link drops").
 
 ### Choosing a game
 
@@ -145,14 +151,55 @@ network (a chooser, `Client.picks`).
   players change, and `server.c` shows the start panel (state 3, a player seated): START, only
   when all seats are taken, sends `{"t":"start"}` and the relay starts the match as before
   (MATCHED_UP to everyone in it); a name sends `{"t":"kick","name":X}`: that player goes back to
-  the front of the queue and is not offered that game for 10 minutes. Back/Esc still stops
-  hosting (the engine's host screen). The panel's and the list's keys, releases too, are kept
-  from the engine.
+  the front of the queue and is not offered that host's games (this one and the next) for
+  exactly 10 minutes; the kick holds for the player's name, and for their address unless that is
+  the host's own network. When it runs out, the game is offered again by itself. The panel's
+  and the list's keys, releases too, are kept from the engine; the selection stays on the same
+  player when the seats change.
+* After START the panel shows "STARTING: k OF m PLAYERS ARE IN" without START/REMOVE rows until
+  the match runs. The players launched by START are the match's players: one who presses Back
+  during the lock or whose connection drops before entering the room is recorded as dropped, and
+  their next Quick Match puts them into that match (the host's engine waits for every seat).
+* Back/Esc (Android: Back) stops hosting while the game waits: host screen, start panel,
+  STARTING. `server.c` clears the acceptor's "listening" byte (+0x18); the LAN host screen's
+  update (`0x100ca8d0`) then returns to the main menu, its exit deletes the acceptor and the host
+  sends `unserve`. That key, its repeats and its release never reach the engine.
+* The relay ignores picks beyond 4 at once, then more than one per 500 ms. The player's own game
+  is always in the list, even past the 20th entry. On a LAN relay 100.64.0.0/10 (Tailscale)
+  counts as a local network too (Hamachi's 25.0.0.0/8 does not: it is public address space).
 * A game starts only with all its seats taken (no starting with fewer players). Older games are
   seated as before (never in a game whose host sent them away); older hosts' games start when
   full. `cargo x lan-test N` waits for "host: N of N player(s) seated" and presses Enter in the
   host's window (rgtool posts keys to the window itself: `keys --pid=N` reaches the game without
   the focus).
+
+### When the host's link drops
+
+* The host's relay link reconnects every 2 s and serves the same room and key again. The relay
+  takes the room over for a `serve` with the same `key`: the new connection becomes the room's
+  server, an old connection still present is closed (WebSocket close 4002, "replaced") and the
+  waiting game keeps its seats. Another key, or none, gets `taken`: an older host without a key
+  does not get its started match back either (anyone could serve that name), its players are sent
+  away after `HOST_BACK_MS`. The room of a started match whose host left stays until then, also
+  when it is empty.
+* Once the match runs the host serves it as `{"t":"serve","room","key","running":true,
+  "held":[names]}`: never listed as a waiting game (also after a relay restart; older hosts
+  without `running` are listed again then). While the host's link is down, its engine holds the
+  seats of its relay players; when the link comes back, the relay closes those players (4004,
+  "host back") and records them as dropped, so their next Quick Match puts them back in; one who
+  already waits in Quick Match is sent back at once. A `running` serve the relay does not know
+  (a restarted relay, or the host came back after `HOST_BACK_MS`) is taken as that match: the
+  `held` names (up to 8) are recorded as dropped from it and go back in the same way.
+* If the server of a started match leaves and does not come back within 15 s (`HOST_BACK_MS`),
+  the relay closes every player of that room (4003, "host gone"); their engines show "connection
+  lost". The relay never forwards game packets (channel 0x16) between the players of a served
+  room: after the host died, the clients answered each other's packets endlessly and each received
+  packet used up a JNI slot until the table was full (`native/rt/jni.c` now makes classes and IDs
+  once and reuses local references in a ring: the engine never deletes them, a JVM drops them
+  when the native call returns).
+* A `hello` with the name of a connection that is still in a match, from the same address, takes
+  that connection over (a restarted game keeps its name and goes back in), as does any `hello`
+  for a connection that has been silent for a while.
 
 ### LAN relay (no setup)
 

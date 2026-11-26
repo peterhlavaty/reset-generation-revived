@@ -7,8 +7,13 @@
 //!   mask with its own stride: the shipped 240x320 masks make any taller screen read past the
 //!   mask (crash) and any wider one show stripes.
 //! * intro.pak / story.pak: cutscene scripts place sprites in absolute 240x320 coordinates; they
-//!   are shifted so the scene sits in the centre of the screen. (Not menus.pak: its win/lose
-//!   screens and fight.pak's cut-ins render into a fixed 240x320 surface.)
+//!   are shifted so the scene sits in the centre of the screen. (Not the rest of menus.pak: its
+//!   win/lose screens are shifted by the recompiler, and fight.pak's cut-ins render into a fixed
+//!   240x320 surface.)
+//! * menus.pak: the error / question dialog's scene (panel, speech bubble, hedgehog: "Connection
+//!   lost", "Could not connect", …) is shifted to the centre like a cutscene, under the dialog's
+//!   text, which the recompiler lays out 240 px wide at x + 200 (`recomp.rs`, `FUN_100cc530`).
+//!   The end screen's "View replay at www.ResetGeneration.com" line is dropped (the site is gone).
 //!
 //! Pak layout (little endian): `u32 header_size, u32 count`, then `count` entries of
 //! `{u32 name_hash, u32 stored_size, u32 raw_size, u8 zlib, u32 offset}`; the last entry lists
@@ -23,6 +28,13 @@ use std::path::Path;
 const MASK_PREFIX: &str = "data\\base\\gfx\\fadewipe";
 const GFX_HEADER: usize = 40;
 const SCENE_PAKS: [&str; 2] = ["intro", "story"];
+/// The scene behind the engine's error / question dialog (FUN_100cc350 plays it, FUN_100cc530 draws
+/// it with the text); `_bg2` is an unused variant, shifted alike in case a code path loads it.
+const ERROR_SCENES: [&str; 2] = ["data\\menus\\errorscreen_bg.xml", "data\\menus\\errorscreen_bg2.xml"];
+const END_MENU: &str = "data\\menus\\end_arena_menu.xml";
+/// The info line of the end screen's buttons: "View replay at www.ResetGeneration.com" (every
+/// language). The key is only used there, so dropping the `<info>` lines removes it.
+const DEAD_SITE_INFO: &str = "<info>REPLAY_SAVED_TXT</info>";
 
 struct Entry {
     hash: u32,
@@ -119,7 +131,30 @@ pub fn patch_dir(dir: &Path, w: u32, h: u32) -> R<()> {
         let n = patch_pak(dir, base, |name, raw| if name.ends_with(".xml") { offset_scene(raw, dx, dy) } else { None })?;
         eprintln!("patched {n} entries in {base}.pak ({dx},{dy})");
     }
+    let n = patch_pak(dir, "menus", |name, raw| menus_entry(name, raw, dx))?;
+    eprintln!("patched {n} entries in menus.pak");
     Ok(())
+}
+
+/// menus.pak: the error dialog's scene moves by `dx` only. The engine places the dialog's text at a
+/// constant y of the 240x320 layout (centred on y 125, inside the bubble), so moving the bubble
+/// down would leave the text at its top edge.
+fn menus_entry(name: &str, raw: &[u8], dx: i32) -> Option<Vec<u8>> {
+    if ERROR_SCENES.contains(&name) {
+        offset_scene(raw, dx, 0)
+    } else if name == END_MENU {
+        drop_lines(raw, DEAD_SITE_INFO)
+    } else {
+        None
+    }
+}
+
+/// Removes every line that contains `text`; None when there is none.
+fn drop_lines(raw: &[u8], text: &str) -> Option<Vec<u8>> {
+    let t = text.as_bytes();
+    let out: Vec<u8> =
+        raw.split_inclusive(|&c| c == b'\n').filter(|l| !l.windows(t.len()).any(|w| w == t)).flatten().copied().collect();
+    (out.len() != raw.len()).then_some(out)
 }
 
 /// Nearest-neighbour horizontal stretch, vertical tiling: keeps the halftone look.
@@ -249,6 +284,41 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!((back[0].hash, back[0].zlib, back[0].raw.as_slice()), (7, true, &b"hello hello hello"[..]));
         assert_eq!(names(&back[1].raw).unwrap(), vec!["a.x".to_string()]);
+    }
+
+    #[test]
+    fn menus_entries() {
+        let end = b"<b>\r\n\t\t<info>REPLAY_SAVED_TXT</info>\r\n\t\t<text>ARENA</text>\r\n</b>";
+        assert_eq!(menus_entry(END_MENU, end, 200).unwrap(), b"<b>\r\n\t\t<text>ARENA</text>\r\n</b>");
+        assert!(menus_entry(END_MENU, b"<b>\r\n</b>", 200).is_none());
+        let scene = br#"<physics start="0" type="RESET" positionX="-50" positionY="160" velocityX="35.4"/>"#;
+        let moved = br#"<physics start="0" type="RESET" positionX="150" positionY="160" velocityX="35.4"/>"#;
+        assert_eq!(menus_entry(ERROR_SCENES[0], scene, 200).unwrap(), moved);
+        assert!(menus_entry("data\\menus\\hero01_win.xml", scene, 200).is_none());
+        assert!(menus_entry(ERROR_SCENES[0], scene, 0).is_none());
+    }
+
+    /// The names above must match the shipped menus.pak, or the transform silently does nothing.
+    #[test]
+    fn menus_pak_has_the_patched_entries() {
+        let pak = crate::util::root().join("game/ResetGeneration/menus.pak");
+        let entries = read(&std::fs::read(pak).unwrap()).unwrap();
+        let names = names(&entries.last().unwrap().raw).unwrap();
+        let mut changed = Vec::new();
+        for (e, n) in entries.iter().zip(&names) {
+            let n = n.to_ascii_lowercase();
+            if let Some(raw) = menus_entry(&n, &e.raw, 200) {
+                let text: String = raw.iter().map(|&c| char::from(c)).collect();
+                assert!(!text.contains("REPLAY_SAVED_TXT"), "{n}");
+                if n == ERROR_SCENES[0] {
+                    // the speech bubble ends up centred on 640 (it slides in from x 240 to about 120)
+                    assert!(text.contains(r#"type="RESET" positionX="440""#), "{text}");
+                }
+                changed.push(n);
+            }
+        }
+        changed.sort();
+        assert_eq!(changed, [END_MENU, ERROR_SCENES[0], ERROR_SCENES[1]]);
     }
 }
 

@@ -18,6 +18,10 @@ int rg_tick(void);
 const uint32_t *rg_pixels(void);
 /* Java AWT key codes: 37..40 arrows, 10 Enter, 27 Escape, 17 Ctrl, 32 Space. */
 void rg_key(int down, int keycode);
+/* The character the key just pressed typed (call right after its rg_key(1, ...)), as AWT's keyTyped
+ * gave it to the Java host: the engine's text fields (the in-match message) read text only from
+ * it. Dropped when that press did not reach the engine (the host picker or the game list took it). */
+void rg_key_char(int ch);
 /* Pulls engine audio: 8 kHz mono signed 16-bit. len in bytes (even). */
 void rg_audio(uint8_t *buf, int len);
 void rg_set_volume(int volume);   /* 0..100 */
@@ -38,6 +42,8 @@ void rg_net_configure(const char *server_url, const char *nickname);
  * player-count picker drawn over the game (rg_pixels), then the engine's hero select. */
 void rg_host_configure(int players, int hero);  /* picker default 2..4; hero 0..9, -1 random, -2 choose (default) */
 void rg_host_request(void);
+int rg_host_can_start(void);        /* 1 = the main menu is up and nothing is hosted (F5, HOST button, host=auto) */
+int rg_host_user_stopped(void);     /* 1 = the player ended the last hosting before its match (Back/Esc) */
 int rg_host_state(void);            /* 0 idle, 1 picker, 2 hero select, 3 waiting for players, 4 match running */
 const char *rg_host_status(void);   /* one line for a title bar ("" before the first host) */
 int rg_host_players(void);          /* the player count last chosen (to remember it) */

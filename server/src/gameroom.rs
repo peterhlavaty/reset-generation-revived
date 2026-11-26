@@ -12,7 +12,9 @@
 //!   matched players to each other before CASINO_MATCHED_UP.
 //!
 //! Channel 0x16 (the match) goes to the room's game server (a host player's engine) tagged with
-//! the player's session id; frames on other channels are forwarded to the other players.
+//! the player's session id; frames on other channels are forwarded to the other players. A room
+//! that has had a game server never forwards the match between players: while its server is gone
+//! the clients would answer each other's packets endlessly (and leak engine objects with each).
 
 use crate::relay::{ClientId, Net};
 use crate::wire::*;
@@ -152,8 +154,8 @@ impl GameRoom {
         let msgs = mt_messages(&mut self.players[i].frag, bytes);
         let mut forward = Vec::new();
         for (ch, data) in msgs {
-            if ch == CH_GAME && self.server.is_some() {
-                self.to_server(net, i, &data);
+            if ch == CH_GAME && self.served {
+                self.to_server(net, i, &data); // dropped while the server is gone
             } else if ch == CH_TABLE {
                 self.table_message(net, i, &data);
             } else if ch == CH_SYSTEM && data.len() == 1 {

@@ -93,7 +93,7 @@ players.
    open the list again to move to another game.
 3. The host sees who sat down. When all seats are taken, Enter (OK) starts the match. Someone
    you do not know took a seat? Select the name and press Enter: the seat goes to the next
-   player. The host plays too.
+   player. Esc (Back) stops hosting. The host plays too.
 
 It works over the internet between all versions (Windows, Linux, macOS, Android and the
 browser). Older versions of the game have no list: Quick Match seats them in the newest game,

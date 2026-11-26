@@ -47,7 +47,7 @@ MULTIPLAYER (2-4 players over the internet, on a LAN or on one PC; nothing to se
      whose game they are in; Up/Down open the list again.
   3. The host sees who sat down. When all seats are taken, Enter starts the
      match. A stranger took a seat? Select the name, Enter: the seat goes to
-     the next player. The host plays too.
+     the next player. Esc stops hosting. The host plays too.
   After a match the host presses F5 again (the title bar says so) and the
   others choose Play Again.
 

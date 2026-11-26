@@ -191,6 +191,12 @@ const PATCHES: &[(u64, Patch)] = &[
     (0x100b85fa, Patch::Const(0x78, 0x78 + DIALOG_DX)), // ADD EBP,0x78: speech box centre x
     (0x100b875e, Patch::Const(0x4b, 0x4b + DIALOG_DX)), // ADD EBP,0x4b: text x
     (0x100b8808, Patch::AddReg(8, DIALOG_DX)),          // MOV EDX,[ESP+0x10]: portrait x (EDX += dx)
+    // Error / question dialog ("Connection lost", "Could not connect", ...): FUN_100cc530 (the Yes/No
+    // variant's draw 0x100d8380 jumps to it) lays its text out over the whole screen width (x 10,
+    // wraps at W-30, drawn W-20 wide), but its scene (menus.pak errorscreen_bg.xml, shifted by 200
+    // in pakpatch.rs) has a 230 px speech bubble. Lay the text out for 240 px, shifted with it.
+    (0x100cc565, Patch::SrcReg(0, 240)),              // MOV [ESP+0x2c],EAX (screen width): text box 240 wide
+    (0x100cc5f4, Patch::Const(0xa, 0xa + DIALOG_DX)), // MOV dword ptr [ECX],0xa: text x
     // Fight cut-in popup (found by the retired Java build's DllPatcher): the 420x378 frame is drawn
     // at (0,0) and the 240x320 fight surface at (90,29) inside it. Centre both horizontally.
     (0x10028ac5, Patch::Const(0x5a, 0x5a + POPUP_DX)), // MOV [ESP+0x10],0x5a: fight surface x

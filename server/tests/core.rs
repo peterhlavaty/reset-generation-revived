@@ -223,6 +223,7 @@ fn a_hosted_room_stays_while_served_so_its_last_player_can_come_back() {
     let rooms = lister.texts()[0]["rooms"].clone();
     assert!(rooms.as_array().unwrap().iter().any(|r| r["name"] == "HOST_Ann"), "{rooms}");
     t.send(&h, json!({"t": "unserve"}));
+    t.tick(16_000); // a started match waits HOST_BACK_MS for its host
     t.send(&lister, json!({"t": "rooms"}));
     let rooms = lister.texts()[0]["rooms"].clone();
     assert!(!rooms.as_array().unwrap().iter().any(|r| r["name"] == "HOST_Ann"), "{rooms}");

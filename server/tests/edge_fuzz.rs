@@ -7,7 +7,7 @@
 include!("harness/mod.rs");
 
 use rg_server::casino::HEROES;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const BASE: u32 = 900_000_000;
 const TEN_MIN: u64 = 600_000;
@@ -21,10 +21,6 @@ fn qm_as(t: &mut T, c: &C, hero: &str) {
     t.bin(c, &req);
 }
 
-fn seat_take(t: &mut T, c: &C) {
-    t.bin(c, &frame(CH_TABLE, &Writer::new().u8(REQUEST).u8(13).u32(7).done()));
-}
-
 /// The ids of the games in a `games` message.
 fn ids_of(g: &Value) -> Vec<u64> {
     g["games"].as_array().unwrap().iter().map(|e| e[0].as_u64().unwrap()).collect()
@@ -33,19 +29,6 @@ fn ids_of(g: &Value) -> Vec<u64> {
 /// The `games` entry of this game, if offered.
 fn entry_of(g: &Value, id: u64) -> Option<Value> {
     g["games"].as_array().unwrap().iter().find(|e| e[0] == id).cloned()
-}
-
-/// The MATCHED_UP room and its player count, if this player got one.
-fn matched(msgs: &[Msg]) -> Option<(String, u32)> {
-    msgs.iter().find(|m| m.1 == EVENT && m.2 == 31).map(|m| {
-        let mut r = Reader::new(&m.3);
-        r.str().unwrap();
-        let room = r.str().unwrap();
-        r.str().unwrap();
-        r.u8().unwrap();
-        r.u8().unwrap();
-        (room, r.u32().unwrap())
-    })
 }
 
 /// The names EVENT CASINO_ENTER introduced.
@@ -329,13 +312,9 @@ fn ten_minutes_after_a_kick_the_game_is_offered_again() {
     assert_eq!(last_games(&pia.texts()).unwrap()["seat"], 900000001);
 }
 
-/// BUG: the end of a kick's 10 minutes changes nothing by itself. `Casino::place` (the only
-/// place that drops old kicks) runs only when something happens in Quick Match, and
-/// `was_kicked` (casino.rs:337) does not look at the time: a kicked player who keeps waiting is
-/// never offered (older games: never seated in) that game again until another player or host
-/// does something.
+/// The end of a kick's 10 minutes is a change by itself: a kicked player who keeps waiting is
+/// offered (older games: seated in) that game again without anyone doing anything.
 #[test]
-#[ignore = "BUG: an expired kick needs another Quick Match event before the game is offered again"]
 fn an_expired_kick_offers_the_game_again_by_itself() {
     let mut t = T::new(Config::default());
     let ann = t.host_approving("Ann", 2, "82.0.0.1");
@@ -615,12 +594,9 @@ fn twenty_games_are_offered_home_first_then_newest() {
     assert!(ids[1..].windows(2).all(|w| w[0] > w[1]), "then newest first: {ids:?}");
 }
 
-/// BUG: a chooser seated in an older game loses it from the list once 20 newer games wait:
-/// `games_for` (casino.rs:528-533) sorts and cuts the list at 20 without keeping the player's
-/// own game, so `seat` names a game not in `games` and lobby.c draws no strip at all
-/// (`find(cur.seat) < 0`, lobby.c:182-183).
+/// A chooser seated in an older game keeps it on the list once 20 newer games wait (lobby.c finds
+/// its strip by `seat` among the games).
 #[test]
-#[ignore = "BUG: the player's own game falls out of a list of more than 20 games"]
 fn a_seated_player_always_sees_their_own_game() {
     let mut t = T::new(Config::default());
     let _ann = t.host_approving("Ann", 3, "82.0.0.1");
@@ -673,10 +649,12 @@ fn a_client_without_an_address_is_never_at_home() {
     assert_eq!(g["games"], json!([[900000001, "Ann", 1, 0, 2, 0, 1]]));
 }
 
-/// A player whose connection drops during "Game starting" is left out of MATCHED_UP: the others
-/// still get it, after the lock timeout, with the right number of players.
+/// A player whose connection drops during "Game starting" is still one of the match's players
+/// (the host's engine started with them and waits for them): the others get MATCHED_UP as soon as
+/// they have answered, announcing the whole group, and the dropped player's next Quick Match sends
+/// them into the match.
 #[test]
-fn a_player_who_drops_during_the_lock_is_left_out() {
+fn a_player_who_drops_during_the_lock_goes_back_into_the_match() {
     let mut t = T::new(Config::default());
     let ann = t.host_approving("Ann", 2, "82.0.0.1");
     let pia = t.chooser_at("Pia", "82.0.0.2");
@@ -691,11 +669,62 @@ fn a_player_who_drops_during_the_lock_is_left_out() {
     assert_eq!(intros(&m), ["Rex"]);
     assert!(got_lock(&rex.msgs()));
     t.disconnect(&rex);
-    t.lock_ok(&pia);
-    assert_eq!(matched(&pia.msgs()), None, "Rex never answers");
-    t.tick(LOCK_MS);
-    assert_eq!(matched(&pia.msgs()), Some(("HOST_Ann_1".into(), 1)));
     assert!(rex.take().is_empty());
+    t.lock_ok(&pia);
+    assert_eq!(matched(&pia.msgs()), Some(("HOST_Ann_1".into(), 2)), "Rex is not waited for");
+    let rex2 = t.chooser_at("Rex", "82.0.0.3");
+    t.quick_match(&rex2);
+    assert!(got_lock(&rex2.msgs()), "Rex goes back into the match");
+    t.lock_ok(&rex2);
+    assert_eq!(matched(&rex2.msgs()), Some(("HOST_Ann_1".into(), 1)));
+}
+
+/// A player who presses Back (or asks for Quick Match again) during "Game starting" came too late:
+/// the match is theirs (no MATCHED_UP now, the others go on), and their next Quick Match sends them
+/// into it. So does one who got MATCHED_UP but whose connection drops before reaching the room.
+#[test]
+fn a_player_who_backs_out_of_a_started_game_goes_back_into_it() {
+    for how in ["back", "quick match", "drop before the room"] {
+        let mut t = T::new(Config::default());
+        let ann = t.host_approving("Ann", 2, "82.0.0.1");
+        let pia = t.chooser_at("Pia", "82.0.0.2");
+        let rex = t.chooser_at("Rex", "82.0.0.3");
+        for c in [&pia, &rex] {
+            t.quick_match(c);
+            t.send(c, json!({"t": "pick", "id": 900000001}));
+        }
+        t.send(&ann, json!({"t": "start"}));
+        assert!(got_lock(&rex.msgs()));
+        let rex = match how {
+            "back" => {
+                t.cancel(&rex);
+                assert_eq!(matched(&rex.msgs()), None, "{how}");
+                t.quick_match(&rex);
+                rex
+            }
+            "quick match" => {
+                t.quick_match(&rex);
+                rex
+            }
+            _ => {
+                t.lock_ok(&rex);
+                t.lock_ok(&pia);
+                assert_eq!(matched(&rex.msgs()), Some(("HOST_Ann_1".into(), 2)), "{how}");
+                t.disconnect(&rex);
+                let rex2 = t.chooser_at("Rex", "82.0.0.3");
+                t.quick_match(&rex2);
+                rex2
+            }
+        };
+        assert!(got_lock(&rex.msgs()), "{how}: Rex is sent into the match");
+        t.lock_ok(&rex);
+        assert_eq!(matched(&rex.msgs()), Some(("HOST_Ann_1".into(), 1)), "{how}");
+        t.lock_ok(&pia);
+        let pm = pia.msgs();
+        assert!(how == "drop before the room" || matched(&pm) == Some(("HOST_Ann_1".into(), 2)), "{how}: {:?}", matched(&pm));
+        t.tick(LOCK_MS);
+        assert_eq!(t.relay.status()["hosted"], 0, "{how}: the game is not offered again");
+    }
 }
 
 /// A lock answer from someone who is not starting a game changes nothing.
@@ -812,13 +841,10 @@ fn hosting_again_ends_the_way_back_into_the_old_match() {
     assert_eq!(ids_of(last_games(&texts).unwrap()), [900000002], "Ann's new game is offered");
 }
 
-/// BUG: a host who stops (Esc, crash) during the lock window ("Game starting", up to 3 s) still
-/// gets its players sent into its room: `Casino::game_over` (casino.rs:361) forgets only waiting
-/// games, the pending `Match` stays in `matches`, and `matched_up` (casino.rs:632) sends
-/// MATCHED_UP whether or not the room is still served. The players wait in a room with no game
-/// server; the docs promise unserve means "no one is matched into a dead room".
+/// A host who stops (Esc, crash, its next game) during the lock window ("Game starting", up to
+/// 3 s) gets no one sent into its room: its players' connections are closed instead (their game
+/// says so) of leaving them in a room with no game server.
 #[test]
-#[ignore = "BUG: players are matched into the room of a host who left during the lock"]
 fn no_one_is_matched_into_the_room_of_a_host_who_left_during_the_lock() {
     for how in ["unserve", "disconnect", "host again"] {
         let mut t = T::new(Config::default());
@@ -835,17 +861,15 @@ fn no_one_is_matched_into_the_room_of_a_host_who_left_during_the_lock() {
         }
         t.lock_ok(&pia);
         t.tick(LOCK_MS);
+        assert_eq!(pia.closed(), Some(4003), "{how}");
         assert_eq!(matched(&pia.msgs()), None, "{how}: Pia is not sent into the dead room");
     }
 }
 
-/// BUG: a player is not seated in the game from their own network when its last seat frees up
-/// because its occupant moved to a game from *their* network in the same pass. `Casino::place`
-/// (casino.rs:431-456) walks a snapshot once: the players before the one who moved saw the game
-/// full, and the queue comes first. Pia (who chooses) then waits unseated in front of a free
-/// seat at home until something else happens.
+/// A player is seated in the game from their own network when its last seat frees up because its
+/// occupant moved to a game from *their* network in the same pass (`Casino::place` goes round
+/// again until nobody moves).
 #[test]
-#[ignore = "BUG: place() does not revisit players when a home seat frees up during the pass"]
 fn a_home_seat_freed_in_the_same_pass_still_seats_the_player() {
     let mut t = T::new(Config::default());
     let ann = t.host_approving("Ann", 1, "82.0.0.1"); // Pia's home
@@ -863,7 +887,6 @@ fn a_home_seat_freed_in_the_same_pass_still_seats_the_player() {
 /// The same for an older game's player seated elsewhere (in an older game hosted before the one
 /// at home).
 #[test]
-#[ignore = "BUG: place() does not revisit players when a home seat frees up during the pass"]
 fn a_home_seat_freed_in_the_same_pass_moves_an_older_player_home() {
     let mut t = T::new(Config::default());
     let _far = t.host_approving("Far", 2, "82.0.0.3");
@@ -878,13 +901,9 @@ fn a_home_seat_freed_in_the_same_pass_moves_an_older_player_home() {
     assert_eq!(seats(&ann.texts()), Some(vec!["Ola"]), "Ola moves home");
 }
 
-/// BUG (cosmetic): a connection the relay closes (idle, replaced) still gets messages after its
-/// Close: `Relay::close` (relay.rs:533) sends Close and then cleans up (`drop_client` ->
-/// casino `leave` -> `refresh`), while the client is still in `net.clients`, so a player who
-/// chose gets `{"t":"games","on":false}` behind the Close; the same happens during `disconnect`.
-/// The transport drops it, so nothing breaks.
+/// A connection the relay closes (idle, replaced) gets nothing after its Close (the casino tidies
+/// up its lists while it leaves), nor does one that is dropping.
 #[test]
-#[ignore = "BUG: a closed connection still gets games on:false after its Close"]
 fn nothing_is_sent_to_a_connection_after_its_close() {
     let mut t = T::new(Config::default());
     let ann = t.host_approving("Ann", 2, "82.0.0.1");
@@ -925,10 +944,20 @@ fn a_busy_relay_keeps_working_after_many_kicks_and_backs() {
     assert_eq!(t.relay.status()["queued"], 1);
 }
 
-/// A running hosted match whose host's link drops and comes back: the engine connects again and
-/// serves the same room (server.c `link_up`); the room is still there with its players.
-fn match_whose_host_reconnected(t: &mut T) -> (C, C, C) {
-    let ann = t.host_approving("Ann", 2, "82.0.0.1");
+/// A running hosted match with Pia and Rex in its room; the host's link drops.
+fn match_whose_host_dropped(t: &mut T) -> (C, C) {
+    match_whose_host_dropped_keyed(t, true)
+}
+
+fn match_whose_host_dropped_keyed(t: &mut T, keyed: bool) -> (C, C) {
+    let ann = t.conn_from(Some("82.0.0.1"));
+    t.send(&ann, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+    let mut serve = json!({"t": "serve", "room": "HOST_Ann_1", "players": 2, "name": "Ann", "hero": 7, "approve": true});
+    if keyed {
+        serve["key"] = json!("0123456789abcdef");
+    }
+    t.send(&ann, serve);
+    ann.take();
     let pia = t.chooser_at("Pia", "82.0.0.2");
     let rex = t.chooser_at("Rex", "82.0.0.3");
     for c in [&pia, &rex] {
@@ -946,42 +975,106 @@ fn match_whose_host_reconnected(t: &mut T) -> (C, C, C) {
     }
     assert_eq!(ann.texts().iter().filter(|m| m["t"] == "player_joined").count(), 2);
     t.disconnect(&ann);
-    let ann2 = t.conn_from(Some("82.0.0.1"));
-    t.send(&ann2, json!({"t": "hello", "v": 1, "name": "RGHost"}));
-    t.send(&ann2, json!({"t": "serve", "room": "HOST_Ann_1", "players": 2, "name": "Ann", "hero": 7, "approve": true}));
-    assert!(ann2.texts().contains(&json!({"t": "serving", "room": "HOST_Ann_1"})));
-    (ann2, pia, rex)
+    (pia, rex)
 }
 
-/// The host's link comes back mid-match: the match goes on through the new connection, and the
-/// running match is not offered in Quick Match.
+/// The engine connects again and serves the same room (server.c `link_up`).
+fn host_back(t: &mut T) -> C {
+    let ann2 = t.conn_from(Some("82.0.0.1"));
+    t.send(&ann2, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+    t.send(&ann2, json!({"t": "serve", "room": "HOST_Ann_1", "key": "0123456789abcdef", "running": true, "held": ["Pia", "Rex"]}));
+    assert!(ann2.texts().contains(&json!({"t": "serving", "room": "HOST_Ann_1"})));
+    ann2
+}
+
+/// An older host (no key) drops its players' sessions with its link: its match cannot go on, so
+/// its next link does not get the room back, and its players are sent away after HOST_BACK_MS
+/// (not back into a match whose host no longer knows them).
+#[test]
+fn an_older_host_whose_link_comes_back_mid_match_does_not_get_its_match_back() {
+    let mut t = T::new(Config::default());
+    let (pia, rex) = match_whose_host_dropped_keyed(&mut t, false);
+    let ann2 = t.conn_from(Some("82.0.0.1"));
+    t.send(&ann2, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+    t.send(&ann2, json!({"t": "serve", "room": "HOST_Ann_1", "players": 2, "name": "Ann", "hero": 7}));
+    assert!(ann2.texts().iter().any(|m| m["t"] == "error" && m["code"] == "taken"));
+    assert_eq!((pia.closed(), rex.closed()), (None, None));
+    t.tick(16_000);
+    assert_eq!((pia.closed(), rex.closed()), (Some(4003), Some(4003)));
+    let pia2 = t.chooser_at("Pia", "82.0.0.2");
+    t.quick_match(&pia2);
+    assert!(!got_lock(&pia2.msgs()), "not back into the old match");
+}
+
+/// The relay restarted (or the host came back too late): a running serve names the players whose
+/// seats the host holds, and they go back in with Quick Match; one already waiting is sent at once.
+#[test]
+fn a_running_serve_the_relay_does_not_know_takes_its_held_players_back() {
+    let mut t = T::new(Config::default());
+    let rex = t.chooser_at("Rex", "82.0.0.3");
+    t.quick_match(&rex);
+    let ann = t.conn_from(Some("82.0.0.1"));
+    t.send(&ann, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+    t.send(&ann, json!({"t": "serve", "room": "HOST_Ann_7", "key": "0123456789abcdef", "running": true, "held": ["Pia", "Rex"]}));
+    assert!(ann.texts().contains(&json!({"t": "serving", "room": "HOST_Ann_7"})));
+    assert!(got_lock(&rex.msgs()), "Rex waited in Quick Match: back in at once");
+    let pia = t.chooser_at("Pia", "82.0.0.2");
+    t.quick_match(&pia);
+    assert!(got_lock(&pia.msgs()), "Pia goes back in");
+    t.lock_ok(&pia);
+    assert_eq!(matched(&pia.msgs()).map(|m| m.0).as_deref(), Some("HOST_Ann_7"));
+    let sue = t.chooser_at("Sue", "82.0.0.4");
+    t.quick_match(&sue);
+    assert!(!got_lock(&sue.msgs()), "not a player of that match");
+    assert!(last_games(&sue.texts()).is_none_or(|g| ids_of(g).is_empty()), "the running match is not offered");
+}
+
+/// The host's link comes back mid-match: the match goes on through the new connection, which
+/// lost the players' sessions with the old one: the players are disconnected and go back in with
+/// Quick Match. The running match is never offered in Quick Match.
 #[test]
 fn a_host_whose_link_comes_back_mid_match_keeps_its_match() {
     let mut t = T::new(Config::default());
-    let (ann2, pia, _rex) = match_whose_host_reconnected(&mut t);
-    assert_eq!(t.relay.status()["hosted"], 0);
+    let (pia, rex) = match_whose_host_dropped(&mut t);
+    rex.take();
     t.bin(&pia, &frame(CH_GAME, &[0, 1, 2, 3]));
+    assert!(rex.take().is_empty(), "nothing between the players while the host is away");
+    let ann2 = host_back(&mut t);
+    assert_eq!((pia.closed(), rex.closed()), (Some(4004), Some(4004)));
+    assert_eq!(t.relay.status()["hosted"], 0);
+    let pia2 = t.chooser_at("Pia", "82.0.0.2");
+    t.quick_match(&pia2);
+    assert!(got_lock(&pia2.msgs()));
+    t.lock_ok(&pia2);
+    assert_eq!(matched(&pia2.msgs()), Some(("HOST_Ann_1".into(), 1)));
+    t.send(&pia2, json!({"t": "move", "room": "HOST_Ann_1"}));
+    seat_take(&mut t, &pia2);
+    assert!(ann2.texts().iter().any(|m| m["t"] == "player_joined" && m["name"] == "Pia"));
+    t.bin(&pia2, &frame(CH_GAME, &[0, 1, 2, 3]));
     assert!(!ann2.take().is_empty(), "Pia's data reaches the host again");
     let sue = t.chooser_at("Sue", "82.0.0.4");
     t.quick_match(&sue);
     assert!(ids_of(last_games(&sue.texts()).unwrap()).is_empty(), "not offered");
 }
 
-/// BUG: after the host's link came back mid-match, a player whose connection drops can no longer
-/// go back into the match. The host's disconnect runs `Casino::game_over` (relay.rs:416 ->
-/// casino.rs:361-363: `running` and `dropped` of the room are cleared), and the new `serve`
-/// attaches to the room still in use (relay.rs:389-391) without marking the match running
-/// again, so `dropped_out` (casino.rs:373) records nobody and Quick Match is an ordinary one.
+/// A player whose connection dropped while the host's link was away goes back into the match once
+/// the host is back (not while it is away: nobody serves the match then).
 #[test]
-#[ignore = "BUG: no way back into a match once its host's link reconnected"]
 fn a_dropped_player_goes_back_into_a_match_whose_host_reconnected() {
     let mut t = T::new(Config::default());
-    let (ann2, _pia, rex) = match_whose_host_reconnected(&mut t);
+    let (_pia, rex) = match_whose_host_dropped(&mut t);
     t.disconnect(&rex);
-    assert!(ann2.texts().iter().any(|m| m["t"] == "player_left" && m["lost"] == 1));
     let rex2 = t.chooser_at("Rex", "82.0.0.3");
     t.quick_match(&rex2);
+    assert!(!got_lock(&rex2.msgs()), "the host is away");
+    let ann2 = host_back(&mut t);
+    t.cancel(&rex2);
+    t.quick_match(&rex2);
     assert!(got_lock(&rex2.msgs()), "Rex goes back into the match");
+    t.lock_ok(&rex2);
+    t.send(&rex2, json!({"t": "move", "room": "HOST_Ann_1"}));
+    seat_take(&mut t, &rex2);
+    assert!(ann2.texts().iter().any(|m| m["t"] == "player_joined" && m["name"] == "Rex"));
 }
 
 // ============================================================================ the randomized run
@@ -1013,18 +1106,21 @@ impl Rng {
     }
 }
 
-/// Homes the clients connect from: four public IPv4 homes, a LAN (private and loopback
-/// addresses: one network), two IPv6 /64s, and no address at all.
+/// Homes the clients connect from: four public IPv4 homes, a LAN (private, loopback and
+/// Tailscale addresses: one network), two IPv6 /64s, and no address at all.
 const LAN: usize = 4;
 const NOWHERE: usize = 7;
+/// How long the relay holds a started match whose host left (relay.rs HOST_BACK_MS).
+const HOST_BACK: u64 = 15_000;
 
 fn addr_in(home: usize, k: usize) -> Option<String> {
     match home {
         0..=3 => Some(format!("82.0.0.{}", home + 1)),
-        LAN => Some(match k % 3 {
+        LAN => Some(match k % 4 {
             0 => "127.0.0.1".to_string(),
             1 => format!("192.168.0.{}", 10 + k % 200),
-            _ => format!("10.0.{}.{}", k % 7, 1 + k % 250),
+            2 => format!("10.0.{}.{}", k % 7, 1 + k % 250),
+            _ => format!("100.{}.{}.{}", 64 + k % 64, k % 7, 1 + k % 250),
         }),
         5 => Some(format!("2a02:1:2:3::{:x}", k + 1)),
         6 => Some(format!("2a02:1:2:4:{:x}::1", k + 1)),
@@ -1062,6 +1158,8 @@ enum Act {
     Unserve(usize),
     HostDrop(usize),
     HostSilent(usize),
+    /// The host's game comes back on a new link (its old one still there or gone).
+    HostRelink(usize),
     Tick(u64),
     /// Time passes in 20 s steps; the clients ping meanwhile.
     Wait(u64),
@@ -1094,6 +1192,8 @@ struct Pc {
     intros: Vec<String>,
     /// The game Quick Match must send it back into.
     rejoin: Option<usize>,
+    /// The started game it was sent into (MATCHED_UP) and has not entered yet.
+    arriving: Option<usize>,
     silent: bool,
     seen: u64,
 }
@@ -1120,6 +1220,10 @@ struct Host {
     addr: Option<String>,
     hc: Option<Hc>,
     served: usize,
+    /// Its hosting session's key (the games that start when the host says so send it).
+    key: String,
+    /// The game it served last.
+    last: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1149,6 +1253,26 @@ struct Game {
     phase: Phase,
     room_st: RoomSt,
     in_room: BTreeSet<u64>,
+    /// When its host stopped serving it after it started (the relay holds it HOST_BACK, then
+    /// sends its players away and the game is Over).
+    gone_at: Option<u64>,
+    /// Served with the host's key; its host's link was lost (not `unserve`); when the host's game
+    /// last came back on a new link (the players in the room are disconnected then).
+    keyed: bool,
+    lost: bool,
+    relinked_at: Option<u64>,
+}
+
+/// A host sent a player away: none of that host's games takes the name, nor the address (the
+/// player's home, unless it is the host's) for 10 minutes. Players from that home already seated
+/// in the game stay.
+struct KickRec {
+    host: String,
+    name: String,
+    home: Option<usize>,
+    at: u64,
+    game: usize,
+    exempt: Vec<String>,
 }
 
 /// A group locked into a game (LOCK_PLAYER_IN_GAME), waiting for MATCHED_UP.
@@ -1163,27 +1287,6 @@ struct Launch {
     fresh: bool,
     done: bool,
     matched: Vec<(u64, u32)>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Checks {
-    /// Everything that needs the model (off for protocol abuse: only safety).
-    model: bool,
-    /// Known bug: a player not seated at home although a seat there is free (place's snapshot).
-    home_first: bool,
-    /// Known bug: MATCHED_UP into the room of a host who left during the lock.
-    dead_room: bool,
-    /// Known bug past 20 games: the player's own game is listed.
-    own_game_listed: bool,
-    /// Known bug (cosmetic): nothing reaches a connection during or after its close.
-    after_close: bool,
-}
-
-impl Checks {
-    /// Everything except the known bugs (each has its own ignored test).
-    const PASSING: Checks = Checks { model: true, home_first: false, dead_room: false, own_game_listed: false, after_close: false };
-    const ALL: Checks = Checks { model: true, home_first: true, dead_room: true, own_game_listed: true, after_close: true };
-    const SAFETY: Checks = Checks { model: false, home_first: false, dead_room: false, own_game_listed: false, after_close: false };
 }
 
 /// How much of the relay a run went through (so that a run which never gets anywhere fails).
@@ -1201,6 +1304,11 @@ struct Stats {
     /// Steps at which a waiting player's kick from a waiting game was older than 10 minutes.
     expired_kicks: usize,
     closed_by_relay: usize,
+    /// Players disconnected because their match's host left (4003).
+    sent_away: usize,
+    /// Hosts' games back on a new link, and the players it disconnected from their room (4004).
+    relinks: usize,
+    taken_back: usize,
 }
 
 impl Stats {
@@ -1215,6 +1323,9 @@ impl Stats {
         self.kicks += o.kicks;
         self.expired_kicks += o.expired_kicks;
         self.closed_by_relay += o.closed_by_relay;
+        self.sent_away += o.sent_away;
+        self.relinks += o.relinks;
+        self.taken_back += o.taken_back;
     }
 }
 
@@ -1236,7 +1347,8 @@ struct Profile {
     long_pct: u64,
     kick_pct: usize,
     abuse: bool,
-    checks: Checks,
+    /// Everything that needs the model (off for protocol abuse: only safety).
+    model: bool,
 }
 
 impl Profile {
@@ -1256,7 +1368,7 @@ impl Profile {
             long_pct: 25,
             kick_pct: 12,
             abuse: false,
-            checks: Checks::PASSING,
+            model: true,
         }
     }
 }
@@ -1306,12 +1418,12 @@ struct World {
     hosts: Vec<Host>,
     games: Vec<Game>,
     launches: Vec<Launch>,
-    /// (lower-case name, game, when).
-    kicks: Vec<(String, usize, u64)>,
+    kicks: Vec<KickRec>,
     /// Older games' players who pressed Back while seated (the relay skips those games for them).
     backed: HashSet<String>,
-    /// Lower-case name -> the running game they dropped out of.
-    rejoin: HashMap<String, usize>,
+    /// (lower-case name, the started game they dropped out of) -> when: Quick Match sends them
+    /// back while its host serves it (into the one they dropped out of last).
+    rejoin: BTreeMap<(String, usize), u64>,
     dead: Vec<C>,
     started: Vec<usize>,
     expect_joined: Vec<(usize, String)>,
@@ -1331,7 +1443,7 @@ impl World {
         let hosts = (0..p.hosts)
             .map(|i| {
                 let home = p.homes[r.below(p.homes.len())];
-                Host { nick: format!("H{i}"), home, addr: addr_in(home, 100 + i), hc: None, served: 0 }
+                Host { nick: format!("H{i}"), home, addr: addr_in(home, 100 + i), hc: None, served: 0, key: format!("k{seed:x}h{i}"), last: None }
             })
             .collect();
         World {
@@ -1343,7 +1455,7 @@ impl World {
             launches: Vec::new(),
             kicks: Vec::new(),
             backed: HashSet::new(),
-            rejoin: HashMap::new(),
+            rejoin: BTreeMap::new(),
             dead: Vec::new(),
             started: Vec::new(),
             expect_joined: Vec::new(),
@@ -1361,14 +1473,40 @@ impl World {
         (i < self.games.len()).then_some(i)
     }
 
-    fn kicked_recently(&self, name: &str, g: usize) -> bool {
-        let n = name.to_lowercase();
-        self.kicks.iter().any(|(k, kg, at)| *k == n && *kg == g && self.now() - at < TEN_MIN)
+    /// The kicks of this game's host that keep this player away: by name, or by address (`home`).
+    fn kicks_of<'a>(&'a self, pl: &'a Player, g: usize) -> impl Iterator<Item = &'a KickRec> + 'a {
+        let (host, name) = (self.games[g].nick.to_lowercase(), pl.name.to_lowercase());
+        self.kicks.iter().filter(move |k| {
+            k.host == host && (k.name == name || k.home.is_some_and(|h| pl.addr.is_some() && same_home(h, pl.home)))
+        })
     }
 
-    fn kicked_ever(&self, name: &str, g: usize) -> bool {
-        let n = name.to_lowercase();
-        self.kicks.iter().any(|(k, kg, _)| *k == n && *kg == g)
+    /// Has this game's host sent the player away in the last 10 minutes?
+    fn kicked(&self, pl: &Player, g: usize) -> bool {
+        let now = self.now();
+        self.kicks_of(pl, g).any(|k| now < k.at + TEN_MIN)
+    }
+
+    /// Must the player not sit in this game? Kicked, unless only by address while already seated
+    /// in it.
+    fn kept_out(&self, pl: &Player, g: usize) -> bool {
+        let now = self.now();
+        let name = pl.name.to_lowercase();
+        self.kicks_of(pl, g).any(|k| now < k.at + TEN_MIN && (k.name == name || !(k.game == g && k.exempt.contains(&name))))
+    }
+
+    fn kicked_ever(&self, pl: &Player, g: usize) -> bool {
+        self.kicks_of(pl, g).next().is_some()
+    }
+
+    /// Started and not over: the relay's `running` (a player lost on the way may go back in).
+    fn running(&self, g: usize) -> bool {
+        matches!(self.games[g].phase, Phase::Starting | Phase::Running)
+    }
+
+    /// Started, and its host serves it: Quick Match sends dropped players back now.
+    fn served(&self, g: usize) -> bool {
+        self.running(g) && self.games[g].gone_at.is_none()
     }
 
     fn state(&self) -> String {
@@ -1381,7 +1519,8 @@ impl World {
             }
         }
         for (i, g) in self.games.iter().enumerate().filter(|(_, g)| g.phase != Phase::Over) {
-            s += &format!("  game {i} {} {} home {} seats {} approve {} {:?}\n", g.id, g.room, g.home, g.seats, g.approve, g.phase);
+            let (id, room, home, seats, approve, phase, gone) = (g.id, &g.room, g.home, g.seats, g.approve, g.phase, g.gone_at);
+            s += &format!("  game {i} {id} {room} home {home} seats {seats} approve {approve} {phase:?} host left {gone:?}\n");
         }
         s
     }
@@ -1463,8 +1602,17 @@ impl World {
 
     fn host_act(&self, h: usize, r: &mut Rng) -> Act {
         let host = &self.hosts[h];
-        let Some(hc) = &host.hc else { return self.serve_act(h, r) };
+        let Some(hc) = &host.hc else {
+            // a lost link: its game reconnects (server.c link_up) unless the host quit
+            if self.relink_game(h).is_some() && r.chance(60) {
+                return Act::HostRelink(h);
+            }
+            return self.serve_act(h, r);
+        };
         let x = r.below(100);
+        if x < 3 && self.relink_game(h).is_some() {
+            return Act::HostRelink(h); // a new link before the relay notices the old one is gone
+        }
         if hc.silent {
             return if x < 15 { Act::HostDrop(h) } else { Act::Tick(500) };
         }
@@ -1533,19 +1681,32 @@ impl World {
                     matched_at: 0,
                     intros: Vec::new(),
                     rejoin: None,
+                    arriving: None,
                     silent: false,
                     seen: now,
                 });
             }
             Act::QuickMatch(p) => {
                 let Some(pc) = self.live_pc(p, &[St::Lobby, St::Waiting, St::Matched]) else { return Ok(()) };
-                let c = pc.c.clone();
+                let (c, arriving) = (pc.c.clone(), pc.arriving);
                 let name = self.players[p].name.to_lowercase();
-                if let Some(g) = self.rejoin.remove(&name) {
-                    if self.games[g].phase == Phase::Running {
-                        self.players[p].pc.as_mut().unwrap().rejoin = Some(g);
-                    }
+                // asked again before getting into the game it was sent to: that is the way back
+                if let Some(g) = arriving.filter(|&g| self.running(g)) {
+                    self.rejoin.insert((name.clone(), g), now);
                 }
+                // kept while its host is away (it may come back); the one they dropped out of last
+                let back = self
+                    .rejoin
+                    .iter()
+                    .filter(|((n, g), _)| *n == name && self.served(*g))
+                    .max_by_key(|((_, g), t)| (**t, self.games[*g].room.to_lowercase()))
+                    .map(|(r, _)| r.clone());
+                if let Some(r) = &back {
+                    self.rejoin.remove(r);
+                }
+                let pc = self.players[p].pc.as_mut().unwrap();
+                pc.arriving = None;
+                pc.rejoin = back.map(|r| r.1);
                 qm_as(&mut self.t, &c, Self::qm_hero(p));
                 self.seen_p(p);
             }
@@ -1609,13 +1770,19 @@ impl World {
                 self.t.send(&c, json!({"t": "move", "room": room}));
                 seat_take(&mut self.t, &c);
                 self.stats.rooms += 1;
+                let name = self.players[p].name.to_lowercase();
+                self.rejoin.remove(&(name, g)); // there again
                 let game = &mut self.games[g];
                 game.room_st = RoomSt::Open;
                 game.in_room.insert(c.id);
-                if game.phase != Phase::Over && self.hosts[game.host].hc.is_some() {
+                // its host hears of the player while it serves the room
+                if game.phase != Phase::Over && game.gone_at.is_none() {
                     self.expect_joined.push((game.host, self.players[p].name.clone()));
                 }
                 let pc = self.players[p].pc.as_mut().unwrap();
+                if pc.arriving == Some(g) {
+                    pc.arriving = None;
+                }
                 pc.st = St::InRoom;
                 pc.list.clear();
                 self.seen_p(p);
@@ -1626,9 +1793,7 @@ impl World {
                 if st == St::InRoom {
                     let name = self.players[p].name.to_lowercase();
                     if let Some(g) = self.room_of(c.id) {
-                        if self.rejoin.get(&name) == Some(&g) {
-                            self.rejoin.remove(&name); // left the normal way
-                        }
+                        self.rejoin.remove(&(name, g)); // left the normal way
                         self.leave_room(g, c.id);
                     }
                 }
@@ -1644,7 +1809,7 @@ impl World {
                 self.player_gone(p, &pc);
                 self.t.disconnect(&pc.c);
                 let during = pc.c.take();
-                ensure!(!self.p.checks.after_close || during.is_empty(), "after-close", "{} got {during:?} while dropped", self.players[p].name);
+                ensure!(during.is_empty(), "after-close", "{} got {during:?} while dropped", self.players[p].name);
                 self.dead.push(pc.c);
             }
             Act::Silent(p) => {
@@ -1683,7 +1848,7 @@ impl World {
                 let Some(hc) = self.live_hc(h) else { return Ok(()) };
                 let (c, g) = (hc.c.clone(), hc.game);
                 if let Some(g) = g {
-                    self.end_game(g);
+                    self.end_game(g, false);
                 }
                 self.hosts[h].hc.as_mut().unwrap().game = None;
                 self.t.send(&c, json!({"t": "unserve"}));
@@ -1692,11 +1857,11 @@ impl World {
             Act::HostDrop(h) => {
                 let Some(hc) = self.hosts[h].hc.take() else { return Ok(()) };
                 if let Some(g) = hc.game {
-                    self.end_game(g);
+                    self.end_game(g, true);
                 }
                 self.t.disconnect(&hc.c);
                 let during = hc.c.take();
-                ensure!(!self.p.checks.after_close || during.is_empty(), "after-close", "host {h} got {during:?} while dropped");
+                ensure!(during.is_empty(), "after-close", "host {h} got {during:?} while dropped");
                 self.dead.push(hc.c);
             }
             Act::HostSilent(h) => {
@@ -1704,6 +1869,7 @@ impl World {
                     hc.silent = true;
                 }
             }
+            Act::HostRelink(h) => self.relink(h)?,
             Act::Tick(ms) => self.pass(ms, ms)?,
             Act::Wait(ms) => self.pass(ms, 20_000)?,
             Act::Garbage(p, k) => self.garbage(p, k),
@@ -1738,37 +1904,85 @@ impl World {
         self.games.iter().position(|g| g.in_room.contains(&conn))
     }
 
+    /// An empty room without its server is removed.
     fn leave_room(&mut self, g: usize, conn: u64) {
         let game = &mut self.games[g];
         game.in_room.remove(&conn);
-        if game.in_room.is_empty() && game.phase == Phase::Over && game.room_st == RoomSt::Open {
+        let unserved = game.phase == Phase::Over || game.gone_at.is_some();
+        if game.in_room.is_empty() && unserved && game.room_st == RoomSt::Open {
             game.room_st = RoomSt::Removed;
         }
     }
 
-    /// A player's connection is gone (dropped or closed by the relay).
+    /// A player's connection is gone (dropped or closed by the relay). A player of a started game
+    /// (in its room, locked into it, or sent there and not in it yet) may go back into it.
     fn player_gone(&mut self, p: usize, pc: &Pc) {
+        let mut of = match pc.st {
+            St::Locked => pc.launch.map(|l| self.launches[l].game),
+            _ => None,
+        };
         if pc.st == St::InRoom {
             if let Some(g) = self.room_of(pc.c.id) {
-                if self.games[g].phase == Phase::Running {
-                    self.rejoin.insert(self.players[p].name.to_lowercase(), g);
-                }
+                of = Some(g);
                 self.leave_room(g, pc.c.id);
+            }
+        }
+        // a locked player's match runs for the relay from its start (the model may not have seen
+        // the start yet: its host's stream comes after the players')
+        let locked = |g: usize| pc.st == St::Locked && self.games[g].phase == Phase::Waiting;
+        if let Some(g) = of.or(pc.arriving).filter(|&g| self.running(g) || locked(g)) {
+            self.rejoin.insert((self.players[p].name.to_lowercase(), g), self.t.now);
+        }
+    }
+
+    /// The host no longer serves this game: a waiting one is over, a started one waits HOST_BACK
+    /// for its host.
+    fn end_game(&mut self, g: usize, lost: bool) {
+        let now = self.now();
+        // a group locked into it in this observation started it (the start is settled after the
+        // hosts' streams)
+        let started = self.running(g) || self.launches.iter().any(|l| l.fresh && !l.rejoin && l.game == g);
+        let game = &mut self.games[g];
+        if game.phase == Phase::Over || game.gone_at.is_some() {
+            return;
+        }
+        if started {
+            game.gone_at = Some(now);
+            game.lost = lost;
+        } else {
+            game.phase = Phase::Over;
+        }
+        if game.in_room.is_empty() && game.room_st == RoomSt::Open {
+            game.room_st = RoomSt::Removed;
+        }
+    }
+
+    /// Started games whose host did not come back within HOST_BACK are over: their players are
+    /// sent away (the observation that follows checks it), the room is gone.
+    fn hosts_gone(&mut self) {
+        let now = self.now();
+        for g in 0..self.games.len() {
+            let game = &mut self.games[g];
+            if game.phase != Phase::Over && game.gone_at.is_some_and(|t| now >= t + HOST_BACK) {
+                game.phase = Phase::Over;
+                game.room_st = RoomSt::Removed;
+                self.rejoin.retain(|r, _| r.1 != g);
             }
         }
     }
 
-    /// The host no longer serves this game.
-    fn end_game(&mut self, g: usize) {
-        let game = &mut self.games[g];
-        if game.phase == Phase::Over {
-            return;
+    /// After an observation: no one is left in the room of a match whose host did not come back.
+    fn check_gone(&self) -> Result<(), Failure> {
+        if !self.p.model {
+            return Ok(()); // protocol abuse moves players the model does not follow
         }
-        game.phase = Phase::Over;
-        if game.in_room.is_empty() && game.room_st == RoomSt::Open {
-            game.room_st = RoomSt::Removed;
+        let now = self.now();
+        for game in &self.games {
+            if game.gone_at.is_some_and(|t| now >= t + HOST_BACK) {
+                ensure!(game.in_room.is_empty(), "gone-room-kept", "{} still has {:?}, its host left", game.room, game.in_room);
+            }
         }
-        self.rejoin.retain(|_, v| *v != g);
+        Ok(())
     }
 
     fn serve(&mut self, h: usize, kind: u8, seats: usize, hero: i64) -> Result<(), Failure> {
@@ -1781,13 +1995,14 @@ impl World {
         let Some(hc) = self.live_hc(h) else { return Ok(()) };
         let (c, old) = (hc.c.clone(), hc.game);
         if let Some(g) = old {
-            self.end_game(g);
+            self.end_game(g, false);
         }
         let host = &mut self.hosts[h];
         host.served += 1;
+        host.last = Some(self.games.len());
         let room = format!("HOST_{}_{}", host.nick, host.served);
         let msg = match kind {
-            0 => json!({"t": "serve", "room": room, "players": seats, "name": host.nick, "hero": hero, "approve": true}),
+            0 => json!({"t": "serve", "room": room, "players": seats, "name": host.nick, "hero": hero, "approve": true, "key": host.key}),
             1 => json!({"t": "serve", "room": room, "players": seats, "name": host.nick, "hero": hero}),
             _ => json!({"t": "serve", "room": room, "players": seats}),
         };
@@ -1804,10 +2019,76 @@ impl World {
             phase: Phase::Waiting,
             room_st: RoomSt::None,
             in_room: BTreeSet::new(),
+            gone_at: None,
+            keyed: kind == 0,
+            lost: false,
+            relinked_at: None,
         });
         host.hc.as_mut().unwrap().game = Some(self.games.len() - 1);
         self.t.send(&c, msg);
         self.seen_h(h);
+        Ok(())
+    }
+
+    /// Can the host's game come back on a new link now? With its key from a link the relay still
+    /// has (a waiting game or a started one), or within HOST_BACK of leaving its started game
+    /// (never an older host without a key: it dropped its players with its link).
+    fn relink_game(&self, h: usize) -> Option<usize> {
+        let g = self.hosts[h].last?;
+        let game = &self.games[g];
+        match &self.hosts[h].hc {
+            Some(hc) => (hc.game == Some(g) && game.keyed && game.phase != Phase::Over).then_some(g),
+            None => game.gone_at.is_some_and(|t| self.now() < t + HOST_BACK && game.keyed).then_some(g),
+        }
+    }
+
+    /// The host's game comes back on a new link (a phone that changed networks reconnects): it
+    /// serves its room again (`running` once the match started). The old link is closed as
+    /// replaced; the players in the room lost their sessions with it, so they are disconnected
+    /// (4004) and go back in with Quick Match.
+    fn relink(&mut self, h: usize) -> Result<(), Failure> {
+        let Some(g) = self.relink_game(h) else { return Ok(()) };
+        let now = self.now();
+        let old = self.hosts[h].hc.take();
+        let c = self.t.conn_from(self.hosts[h].addr.as_deref());
+        self.t.send(&c, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+        let (game, host) = (&self.games[g], &self.hosts[h]);
+        let running = game.phase != Phase::Waiting;
+        let msg = if game.keyed {
+            json!({"t": "serve", "room": game.room, "players": game.seats, "name": game.nick, "hero": game.hero, "approve": true, "key": host.key, "running": running})
+        } else {
+            json!({"t": "serve", "room": game.room, "players": game.seats})
+        };
+        self.t.send(&c, msg);
+        if let Some(old) = old {
+            let during = old.c.take();
+            ensure!(matches!(during.as_slice(), [Out::Close(4002, _)]), "relink-old", "host {h}'s old link got {during:?}");
+            self.dead.push(old.c);
+        }
+        let game = &mut self.games[g];
+        game.gone_at = None;
+        game.relinked_at = Some(now);
+        self.hosts[h].hc = Some(Hc { c, seats: None, game: Some(g), silent: false, seen: now });
+        self.stats.relinks += 1;
+        // players who came back while the host was away and wait in Quick Match go back in now
+        // (casino.rs send_back): the match they dropped out of last, among the served ones
+        for p in 0..self.players.len() {
+            let name = self.players[p].name.to_lowercase();
+            let waits = self.players[p].pc.as_ref().is_some_and(|pc| pc.st == St::Waiting);
+            if !waits || !self.rejoin.contains_key(&(name.clone(), g)) {
+                continue;
+            }
+            let back = self
+                .rejoin
+                .iter()
+                .filter(|((n, x), _)| *n == name && self.served(*x))
+                .max_by_key(|((_, x), t)| (**t, self.games[*x].room.to_lowercase()))
+                .map(|(r, _)| r.clone());
+            if let Some(r) = back {
+                self.rejoin.remove(&r);
+                self.players[p].pc.as_mut().unwrap().rejoin = Some(r.1);
+            }
+        }
         Ok(())
     }
 
@@ -1816,12 +2097,13 @@ impl World {
         let c = hc.c.clone();
         if let Some(g) = hc.game.filter(|&g| self.games[g].phase == Phase::Waiting) {
             let id = self.games[g].id;
-            let seated = self.players.iter().any(|pl| {
-                pl.name.eq_ignore_ascii_case(name)
-                    && pl.pc.as_ref().is_some_and(|pc| pc.st == St::Waiting && belief(&pc.list).0 == Some(id))
-            });
-            if seated {
-                self.kicks.push((name.to_lowercase(), g, self.now()));
+            let sits = |pl: &Player| pl.pc.as_ref().is_some_and(|pc| pc.st == St::Waiting && belief(&pc.list).0 == Some(id));
+            if let Some(pl) = self.players.iter().find(|pl| pl.name.eq_ignore_ascii_case(name) && sits(pl)) {
+                let game = &self.games[g];
+                let home = Some(pl.home).filter(|&h| pl.addr.is_some() && !same_home(game.home, h));
+                let exempt = self.players.iter().filter(|o| sits(o)).map(|o| o.name.to_lowercase()).collect();
+                let kick = KickRec { host: game.nick.to_lowercase(), name: pl.name.to_lowercase(), home, at: self.now(), game: g, exempt };
+                self.kicks.push(kick);
                 self.stats.kicks += 1;
             }
         }
@@ -1851,8 +2133,10 @@ impl World {
             }
             self.t.tick(d);
             left -= d;
+            self.hosts_gone();
             self.observe()?;
             self.check_timeouts()?;
+            self.check_gone()?;
         }
         Ok(())
     }
@@ -1907,7 +2191,7 @@ impl World {
             if closed {
                 self.stats.closed_by_relay += 1;
                 if let Some(g) = hc.game {
-                    self.end_game(g);
+                    self.end_game(g, true);
                 }
                 self.dead.push(hc.c);
             } else {
@@ -1922,18 +2206,34 @@ impl World {
     }
 
     fn player_stream(&mut self, p: usize, pc: &mut Pc, outs: Vec<Out>) -> Result<bool, Failure> {
-        let strict = self.p.checks.model;
+        let strict = self.p.model;
         let name = self.players[p].name.clone();
         let picks = self.players[p].picks;
         let mut closed = false;
+        let now = self.now();
         for o in outs {
             if closed {
-                ensure!(!self.p.checks.after_close, "after-close", "{name} got {o:?} after its Close");
-                continue;
+                return fail("after-close", format!("{name} got {o:?} after its Close"));
             }
             match o {
                 Out::Close(code, why) => {
-                    ensure!(!strict || code == 4001 || (code == 4002 && pc.silent), "close", "{name} closed: {code} {why}");
+                    // 4003: its match's host is gone (when it would be sent in, or HOST_BACK after
+                    // the host left while it is in the room)
+                    let gone = match pc.st {
+                        St::Locked => pc.launch.is_some_and(|l| self.games[self.launches[l].game].gone_at.is_some()),
+                        St::InRoom => self.room_of(pc.c.id).is_some_and(|g| self.games[g].gone_at.is_some_and(|t| now >= t + HOST_BACK)),
+                        _ => false,
+                    };
+                    // 4004: in the room of a host's game that just came back on a new link
+                    let back = pc.st == St::InRoom && self.room_of(pc.c.id).is_some_and(|g| self.games[g].relinked_at == Some(now));
+                    ensure!(
+                        !strict || code == 4001 || (code == 4002 && pc.silent) || (code == 4003 && gone) || (code == 4004 && back),
+                        "close",
+                        "{name} ({:?}) closed: {code} {why}",
+                        pc.st
+                    );
+                    self.stats.sent_away += (code == 4003) as usize;
+                    self.stats.taken_back += (code == 4004) as usize;
                     closed = true;
                 }
                 Out::Text(s) => {
@@ -1963,7 +2263,7 @@ impl World {
     }
 
     fn casino_msg(&mut self, name: &str, pc: &mut Pc, ch: u8, t: u8, action: u8, rest: &[u8]) -> Result<(), Failure> {
-        let strict = self.p.checks.model;
+        let strict = self.p.model;
         let now = self.now();
         let mut r = Reader::new(rest);
         let short = |what: &str| Failure { kind: "short", msg: format!("{name}: truncated {what}") };
@@ -2008,9 +2308,11 @@ impl World {
             (REQUEST, 29) if ch == CH_CASINO => {
                 ensure!(!strict || pc.st == St::Waiting, "lock-state", "{name} ({:?}) locked into a game", pc.st);
                 let (b, _) = belief(&pc.list);
+                // a way back goes first: also for a player seated in another game when their match's
+                // host came back (casino.rs send_back)
                 let (game, rejoin) = match b.and_then(|id| self.game_by_id(id as u64)) {
+                    _ if pc.rejoin.is_some() => (pc.rejoin.take(), true),
                     Some(g) => (Some(g), false),
-                    None if b.is_none() => (pc.rejoin.take(), true),
                     None => (None, false),
                 };
                 pc.st = St::Locked;
@@ -2055,12 +2357,9 @@ impl World {
                 if let Some(l) = pc.launch {
                     let g = self.launches[l].game;
                     ensure!(!strict || room == self.games[g].room, "matched-room", "{name} sent to {room}, not {}", self.games[g].room);
-                    ensure!(
-                        !self.p.checks.dead_room || self.games[g].phase != Phase::Over,
-                        "dead-room",
-                        "{name} sent into {room}, whose host is gone"
-                    );
+                    ensure!(!strict || self.served(g), "dead-room", "{name} sent into {room}, whose host is gone");
                     self.launches[l].matched.push((pc.c.id, count));
+                    pc.arriving = Some(g);
                 }
                 pc.st = St::Matched;
                 pc.room = Some(room);
@@ -2075,12 +2374,11 @@ impl World {
     }
 
     fn host_stream(&mut self, h: usize, hc: &mut Hc, outs: Vec<Out>) -> Result<bool, Failure> {
-        let strict = self.p.checks.model;
+        let strict = self.p.model;
         let mut closed = false;
         for o in outs {
             if closed {
-                ensure!(!self.p.checks.after_close, "after-close", "host {h} got {o:?} after its Close");
-                continue;
+                return fail("after-close", format!("host {h} got {o:?} after its Close"));
             }
             match o {
                 Out::Close(code, why) => {
@@ -2120,7 +2418,7 @@ impl World {
 
     /// Checks the groups locked in this observation and the MATCHED_UPs that went out.
     fn settle(&mut self) -> Result<(), Failure> {
-        let strict = self.p.checks.model;
+        let strict = self.p.model;
         for l in 0..self.launches.len() {
             if !self.launches[l].fresh {
                 continue;
@@ -2136,7 +2434,7 @@ impl World {
                 continue;
             }
             if launch.rejoin {
-                ensure!(game.phase == Phase::Running, "rejoin-phase", "{:?} sent back into {} ({:?})", launch.names, game.room, game.phase);
+                ensure!(self.served(g), "rejoin-phase", "{:?} sent back into {} ({:?}, host left at {:?})", launch.names, game.room, game.phase, game.gone_at);
                 ensure!(launch.intros[0].is_empty(), "rejoin-intros", "{:?} introduced on rejoin", launch.intros);
                 self.stats.rejoins += 1;
                 continue;
@@ -2180,16 +2478,24 @@ impl World {
                 .collect();
             if strict {
                 ensure!(left.is_empty(), "matched-some", "{}: MATCHED_UP left out {left:?}", self.games[launch.game].room);
-                let n = launch.matched.len() as u32;
+                // the host's engine waits for everyone the match started with
+                let n = launch.members.len() as u32;
                 ensure!(launch.matched.iter().all(|m| m.1 == n), "matched-count", "{:?} of {}, counts {:?}", launch.names, n, launch.matched);
             }
             self.finish(l);
         }
+        // once every player still locked in has answered, the others are not waited for
         for launch in self.launches.iter().filter(|l| !l.done) {
-            let all = launch.members.iter().all(|m| launch.answered.contains(m));
+            let live: Vec<u64> = launch.members.iter().copied().filter(|&m| self.locked_pc(m)).collect();
+            let all = !live.is_empty() && live.iter().all(|m| launch.answered.contains(m));
             ensure!(!strict || !all, "lock-answered", "{:?} all answered, no MATCHED_UP for {}", launch.names, self.games[launch.game].room);
         }
         Ok(())
+    }
+
+    /// Is this connection a player's, locked into a game (waiting for MATCHED_UP)?
+    fn locked_pc(&self, conn: u64) -> bool {
+        self.players.iter().any(|pl| pl.pc.as_ref().is_some_and(|pc| pc.c.id == conn && pc.st == St::Locked))
     }
 
     fn finish(&mut self, l: usize) {
@@ -2214,7 +2520,7 @@ impl World {
                 .members
                 .iter()
                 .any(|&m| self.players.iter().any(|pl| pl.pc.as_ref().is_some_and(|pc| pc.c.id == m && pc.st == St::Locked)));
-            ensure!(!self.p.checks.model || !live, "lock-timeout", "{:?} still wait for MATCHED_UP into {}", launch.names, self.games[launch.game].room);
+            ensure!(!self.p.model || !live, "lock-timeout", "{:?} still wait for MATCHED_UP into {}", launch.names, self.games[launch.game].room);
             self.finish(l);
         }
         Ok(())
@@ -2224,7 +2530,7 @@ impl World {
 
     fn check_end(&mut self) -> Result<(), Failure> {
         let now = self.now();
-        if !self.p.checks.model {
+        if !self.p.model {
             return self.check_safety();
         }
         for pl in &self.players {
@@ -2264,7 +2570,8 @@ impl World {
             ensure!(game.phase == Phase::Waiting, "seated-gone", "{bs:?} still sit in {} ({:?})", game.room, game.phase);
             ensure!(bs.len() <= game.seats, "over-seats", "{bs:?} sit in {} with {} seats", game.room, game.seats);
             for b in bs {
-                ensure!(!self.kicked_recently(b, g), "kicked-seated", "{b} sits in {}, whose host sent them away", game.room);
+                let pl = self.players.iter().find(|pl| pl.name == *b).unwrap();
+                ensure!(!self.kept_out(pl, g), "kicked-seated", "{b} sits in {}, whose host sent them away", game.room);
             }
         }
         let seated = |g: usize| believers.get(&g).map_or(0, Vec::len);
@@ -2335,7 +2642,13 @@ impl World {
                 let want = json!([id, game.nick, game.hero, seated(gi), game.seats, same_home(game.home, pl.home) as u8, game.approve as u8]);
                 ensure!(*e == want, "offered-entry", "{} is offered {e}, should be {want}", pl.name);
                 ensure!(seated(gi) < game.seats || id == seat, "offered-full", "{} is offered the full {}", pl.name, game.room);
-                ensure!(!self.kicked_recently(&pl.name, gi), "offered-kicked", "{} is offered {}, whose host sent them away", pl.name, game.room);
+                ensure!(
+                    id == seat || !self.kicked(pl, gi),
+                    "offered-kicked",
+                    "{} is offered {}, whose host sent them away",
+                    pl.name,
+                    game.room
+                );
                 let home = e[5].as_u64().unwrap();
                 if let Some((ph, pid)) = prev {
                     ensure!(ph > home || (ph == home && pid > id), "order", "{}: games out of order: {g}", pl.name);
@@ -2343,21 +2656,20 @@ impl World {
                 prev = Some((home, id));
             }
             let listed = ids_of(g);
-            if seat != 0 && self.p.checks.own_game_listed {
+            if seat != 0 {
                 ensure!(listed.contains(&seat), "own-game-unlisted", "{}: seat {seat} not among {listed:?}", pl.name);
             }
-            // games of an expired kick may lag (an_expired_kick_offers_the_game_again_by_itself)
-            let lag = |gi: usize| self.kicked_ever(&pl.name, gi) && !self.kicked_recently(&pl.name, gi);
-            let lagging = live.iter().any(|&gi| lag(gi));
-            expired += lagging as usize;
-            if live.len() > 20 && !lagging {
+            // a kick that ran out offers its games again by itself (the relay's own timer)
+            expired += live.iter().any(|&gi| self.kicked_ever(pl, gi) && !self.kicked(pl, gi)) as usize;
+            let eligible_game = |gi: usize| {
+                let id = self.games[gi].id as u64;
+                id == seat || (seated(gi) < self.games[gi].seats && !self.kicked(pl, gi))
+            };
+            if live.len() > 20 {
                 // the first 20 games in that order (one may give way to the player's own)
                 let mut eligible: Vec<(u8, u64)> = live
                     .iter()
-                    .filter(|&&gi| {
-                        let id = self.games[gi].id as u64;
-                        id == seat || (seated(gi) < self.games[gi].seats && !self.kicked_ever(&pl.name, gi))
-                    })
+                    .filter(|&&gi| eligible_game(gi))
                     .map(|&gi| (same_home(self.games[gi].home, pl.home) as u8, self.games[gi].id as u64))
                     .collect();
                 eligible.sort_by(|a, b| b.cmp(a));
@@ -2372,16 +2684,8 @@ impl World {
             }
             if live.len() <= 20 {
                 // every game with a free seat is offered
-                let want: BTreeSet<u64> = live
-                    .iter()
-                    .filter(|&&gi| !lag(gi))
-                    .filter(|&&gi| {
-                        let id = self.games[gi].id as u64;
-                        id == seat || (seated(gi) < self.games[gi].seats && !self.kicked_ever(&pl.name, gi))
-                    })
-                    .map(|&gi| self.games[gi].id as u64)
-                    .collect();
-                let got: BTreeSet<u64> = listed.iter().copied().filter(|&id| !lag(self.game_by_id(id).unwrap())).collect();
+                let want: BTreeSet<u64> = live.iter().filter(|&&gi| eligible_game(gi)).map(|&gi| self.games[gi].id as u64).collect();
+                let got: BTreeSet<u64> = listed.iter().copied().collect();
                 ensure!(got == want, "offered-missing", "{} is offered {got:?}, should be {want:?}", pl.name);
             }
         }
@@ -2391,14 +2695,14 @@ impl World {
             let (b, _) = belief(&pc.list);
             let free = |gi: usize| {
                 let game = &self.games[gi];
-                game.phase == Phase::Waiting && seated(gi) < game.seats && !self.kicked_ever(&pl.name, gi)
+                game.phase == Phase::Waiting && seated(gi) < game.seats && !self.kicked(pl, gi)
             };
             if !pl.picks && b.is_none() {
                 let f: Vec<&str> = live.iter().filter(|&&gi| free(gi)).map(|&gi| self.games[gi].room.as_str()).collect();
                 ensure!(f.is_empty(), "older-waits", "{} waits while {f:?} have a free seat", pl.name);
             }
             let exempt = (pl.picks && b.is_some()) || (!pl.picks && self.backed.contains(&pl.name.to_lowercase()));
-            if self.p.checks.home_first && !exempt {
+            if !exempt {
                 let home_free = live.iter().any(|&gi| free(gi) && same_home(self.games[gi].home, pl.home));
                 let at_home = b.and_then(|id| self.game_by_id(id as u64)).is_some_and(|gi| same_home(self.games[gi].home, pl.home));
                 ensure!(!home_free || at_home, "home-first", "{} (home {}) is not seated at home:\n{}", pl.name, pl.home, self.state());
@@ -2427,7 +2731,7 @@ impl World {
                 let (id, seated, seats) = (e[0].as_u64().unwrap(), e[3].as_u64().unwrap(), e[4].as_u64().unwrap());
                 ensure!(seated < seats || (id == seat && seated <= seats), "offered-full", "{}: {g}", pl.name);
             }
-            if seat != 0 && self.p.checks.own_game_listed && entries.len() < 20 {
+            if seat != 0 {
                 ensure!(ids_of(g).contains(&seat), "own-game-unlisted", "{}: {g}", pl.name);
             }
         }
@@ -2498,11 +2802,17 @@ fn minimize(p: &Profile, seed: u64, acts: Vec<Act>, kind: &str) -> Vec<Act> {
     acts
 }
 
-/// Runs `steps` random steps for each seed; panics with the seed, the step and the minimized
-/// steps on the first failure. What the runs went through, summed.
-fn fuzz(p: &Profile, seeds: std::ops::Range<u64>, steps: usize) -> Stats {
+/// Runs random steps for each seed from `first`; panics with the seed, the step and the minimized
+/// steps on the first failure. What the runs went through, summed. The default size keeps `cargo
+/// test` quick; a long run sets RG_FUZZ_STEPS (steps per seed) and RG_FUZZ_SEEDS (seeds per run),
+/// e.g. `RG_FUZZ_STEPS=3000 RG_FUZZ_SEEDS=24 cargo test --release -p rg-server --test edge_fuzz`;
+/// RG_FUZZ_BASE shifts the seeds (other runs than the usual ones).
+fn fuzz(p: &Profile, first: u64) -> Stats {
+    let size = |var: &str, default: u64| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    let (seeds, steps) = (size("RG_FUZZ_SEEDS", 6), size("RG_FUZZ_STEPS", 600) as usize);
+    let first = first + size("RG_FUZZ_BASE", 0);
     let mut total = Stats::default();
-    for seed in seeds {
+    for seed in first..first + seeds {
         let mut r = Rng::new(seed);
         let mut w = World::new(p.clone(), seed);
         let mut acts = Vec::with_capacity(steps);
@@ -2538,91 +2848,55 @@ fn many_games() -> Profile {
 
 #[test]
 fn fuzz_players_who_choose_and_older_games_mixed() {
-    let s = fuzz(&Profile::mixed(), 0..24, 3_000);
+    let s = fuzz(&Profile::mixed(), 0);
     assert!(s.picks > 0 && s.starts > 0 && s.matched > 0 && s.rooms > 0 && s.rejoins > 0 && s.kicks > 0, "{s:?}");
+    assert!(s.sent_away > 0 && s.relinks > 0, "hosts who left, hosts back: {s:?}");
 }
 
 #[test]
 fn fuzz_only_players_who_choose_and_hosts_who_start() {
     let p = Profile { name: "choosers", chooser_pct: 100, approve_pct: 100, ..Profile::mixed() };
-    let s = fuzz(&p, 100..124, 3_000);
+    let s = fuzz(&p, 100);
     assert!(s.picks > 0 && s.starts > 0 && s.matched > 0 && s.kicks > 0, "{s:?}");
 }
 
 #[test]
 fn fuzz_only_older_games_and_older_hosts() {
     let p = Profile { name: "older", chooser_pct: 0, approve_pct: 0, named_pct: 50, ..Profile::mixed() };
-    let s = fuzz(&p, 200..224, 3_000);
+    let s = fuzz(&p, 200);
     assert!(s.starts > 0 && s.matched > 0 && s.rejoins > 0, "{s:?}");
 }
 
 #[test]
 fn fuzz_a_lan_relay() {
     let p = Profile { name: "lan", homes: vec![LAN], ..Profile::mixed() };
-    let s = fuzz(&p, 300..324, 3_000);
+    let s = fuzz(&p, 300);
     assert!(s.starts > 0 && s.matched > 0, "{s:?}");
 }
 
 #[test]
 fn fuzz_a_crowded_relay_with_two_homes() {
     let p = Profile { name: "crowded", players: 14, hosts: 8, homes: vec![0, 1], tick_pct: 8, ..Profile::mixed() };
-    let s = fuzz(&p, 400..416, 3_000);
+    let s = fuzz(&p, 400);
     assert!(s.starts > 0 && s.matched > 0, "{s:?}");
 }
 
 #[test]
 fn fuzz_more_than_twenty_games_waiting() {
-    let s = fuzz(&many_games(), 700..712, 3_000);
+    let s = fuzz(&many_games(), 700);
     assert!(s.crowded > 0 && s.picks > 0, "{s:?}");
 }
 
 #[test]
 fn fuzz_kicks_and_long_waits() {
     let p = Profile { name: "kicks", kick_pct: 30, wait_pct: 8, long_pct: 60, max_seats: 2, ..Profile::mixed() };
-    let s = fuzz(&p, 500..520, 3_000);
+    let s = fuzz(&p, 500);
     assert!(s.kicks > 0 && s.expired_kicks > 0 && s.closed_by_relay > 0, "{s:?}");
 }
 
 #[test]
 fn fuzz_protocol_abuse_never_breaks_the_relay() {
-    let p = Profile { name: "abuse", abuse: true, checks: Checks::SAFETY, ..Profile::mixed() };
-    fuzz(&p, 600..624, 3_000);
+    let p = Profile { name: "abuse", abuse: true, model: false, ..Profile::mixed() };
+    fuzz(&p, 600);
 }
 
-// The known bugs, each found by the randomized run once its check is on (the ignored tests
-// above show each one by itself).
-
-#[test]
-#[ignore = "BUG: players are matched into the room of a host who left during the lock"]
-fn fuzz_finds_matches_into_a_dead_room() {
-    let p = Profile { name: "dead-room", checks: Checks { dead_room: true, ..Checks::PASSING }, ..Profile::mixed() };
-    fuzz(&p, 0..24, 3_000);
-}
-
-#[test]
-#[ignore = "BUG: place() does not revisit players when a home seat frees up during the pass"]
-fn fuzz_finds_players_not_seated_at_home() {
-    let p = Profile { name: "home-first", checks: Checks { home_first: true, ..Checks::PASSING }, ..Profile::mixed() };
-    fuzz(&p, 0..24, 3_000);
-}
-
-#[test]
-#[ignore = "BUG: the player's own game falls out of a list of more than 20 games"]
-fn fuzz_finds_the_own_game_unlisted() {
-    let p = Profile { checks: Checks { own_game_listed: true, ..Checks::PASSING }, ..many_games() };
-    fuzz(&p, 700..712, 3_000);
-}
-
-#[test]
-#[ignore = "BUG: a closed connection still gets games on:false after its Close"]
-fn fuzz_finds_messages_after_a_close() {
-    let p = Profile { name: "after-close", checks: Checks { after_close: true, ..Checks::PASSING }, ..Profile::mixed() };
-    fuzz(&p, 0..24, 3_000);
-}
-
-#[test]
-#[ignore = "BUG: all the known bugs above"]
-fn fuzz_with_every_check() {
-    let p = Profile { name: "all", checks: Checks::ALL, ..Profile::mixed() };
-    fuzz(&p, 0..24, 3_000);
-}

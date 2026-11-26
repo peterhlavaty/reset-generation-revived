@@ -5,10 +5,12 @@
 
 mod lan;
 
-use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
+use minifb::{InputCallback, Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, CString};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 const W: usize = 640;
@@ -21,9 +23,13 @@ extern "C" {
     fn rg_tick() -> c_int;
     fn rg_pixels() -> *const u32;
     fn rg_key(down: c_int, keycode: c_int);
+    fn rg_key_char(ch: c_int);
     fn rg_audio(buf: *mut u8, len: c_int);
     fn rg_host_configure(players: c_int, hero: c_int);
     fn rg_host_start(players: c_int, hero: c_int) -> c_int;
+    fn rg_host_state() -> c_int;
+    fn rg_host_can_start() -> c_int;
+    fn rg_host_user_stopped() -> c_int;
     fn rg_host_status() -> *const c_char;
     fn rg_host_players() -> c_int;
     fn rg_set_relay_starter(f: extern "C" fn(*const c_char) -> *const c_char);
@@ -43,8 +49,9 @@ struct Config {
     /// hosting (F5): player count, hero (a name or id, RANDOM, or empty: choose in the game)
     host_players: i32,
     host_hero: String,
-    /// test aids: host=auto hosts by itself, keys=T:KEY,... presses keys T ms after the start,
-    /// window_x/window_y place the window, log= writes the log there
+    /// test aids: host=auto hosts by itself (and again after each match, see AutoHost),
+    /// keys=T:KEY,... presses keys T ms after the start, window_x/window_y place the window, log=
+    /// writes the log there
     host: String,
     keys: String,
     window_pos: (Option<isize>, Option<isize>),
@@ -212,6 +219,121 @@ fn parse_keys(spec: &str) -> Vec<(u128, c_int)> {
     out
 }
 
+/// What the keys typed, for the engine's text fields (the in-match message): the engine takes text
+/// from the character of a key press (AWT's keyTyped, rg_key_char), never from its key code.
+/// minifb reports characters apart from key presses, and on Windows reports a press one frame
+/// after its window message, so the presses and their characters wait here for a few frames until
+/// the main loop hands the press to the engine.
+#[derive(Default)]
+struct Typed {
+    frame: u64,
+    /// key presses (auto-repeats too) in the order they came: frame, key, the character it typed
+    presses: VecDeque<(u64, Key, Option<u32>)>,
+}
+
+impl Typed {
+    fn next_frame(&mut self) {
+        self.frame += 1;
+        let f = self.frame;
+        // a press not handed out by now never will be (a repeat, or a tap minifb did not report)
+        self.presses.retain(|p| f - p.0 <= 3);
+    }
+
+    /// Where the press of `k` came among the waiting ones.
+    fn order(&self, k: Key) -> Option<usize> {
+        self.presses.iter().position(|p| p.1 == k)
+    }
+
+    /// The press of `k` is handed to the engine: the character it typed, if the engine can show
+    /// it (printable ASCII, the engine's font).
+    fn take(&mut self, k: Key) -> Option<u32> {
+        let i = self.order(k)?;
+        self.presses.remove(i)?.2.filter(|c| (0x20..0x7f).contains(c))
+    }
+}
+
+/// minifb's input callback; it runs inside the window's update, on the main loop's thread.
+struct Typing(Rc<RefCell<Typed>>);
+
+impl InputCallback for Typing {
+    fn set_key_state(&mut self, key: Key, down: bool) {
+        if down {
+            let mut t = self.0.borrow_mut();
+            let f = t.frame;
+            t.presses.push_back((f, key, None));
+        }
+    }
+
+    /// A character comes after its key's down in the same batch of window messages, but keys posted
+    /// together (rgtool keys, fast typing) can bring all their downs first: so the n-th character
+    /// of a batch goes with the n-th press of a key that types.
+    fn add_char(&mut self, ch: u32) {
+        // Enter, Esc, Backspace, Tab and Ctrl+letter type control characters: no text, and not
+        // from a key that types
+        if ch < 0x20 || ch == 0x7f {
+            return;
+        }
+        let mut t = self.0.borrow_mut();
+        let f = t.frame;
+        if let Some(p) = t.presses.iter_mut().find(|p| p.0 == f && p.2.is_none() && types(p.1)) {
+            p.2 = Some(ch);
+        }
+    }
+}
+
+/// Keys that type a character and reach the engine: letters, digits, Space.
+fn types(k: Key) -> bool {
+    awt(k).is_some_and(|c| c == 32 || (48..=57).contains(&c) || (65..=90).contains(&c))
+}
+
+/// host=auto (a test aid): hosts by itself once the main menu is up, and again after each match it
+/// hosted, so the players' "Play Again" finds the next game (docs/MULTIPLAYER.md), or that ended
+/// otherwise (the relay link, the engine). A hosting the player left before its match (Back/Esc
+/// in the picker, the hero select, the host screen or the start panel) is not started again: the
+/// player stopped it.
+struct AutoHost {
+    /// hosts at the next chance, not before `next` (ms since the start)
+    armed: bool,
+    next: u128,
+    /// a hosting is in progress
+    hosting: bool,
+    /// since when the main menu has been up with nothing hosted
+    ready_since: Option<u128>,
+}
+
+impl AutoHost {
+    fn new() -> AutoHost {
+        // the first game not before 15 s, as before: test scripts (--keys, lan-test) work the
+        // menus until then
+        AutoHost { armed: true, next: 15000, hosting: false, ready_since: None }
+    }
+
+    fn step(&mut self, t: u128, players: c_int, hero: c_int) {
+        let state = unsafe { rg_host_state() };
+        if state != 0 {
+            self.hosting = true;
+            self.armed = false;
+            self.ready_since = None;
+            return;
+        }
+        if std::mem::take(&mut self.hosting) {
+            self.armed = unsafe { rg_host_user_stopped() } == 0;
+        }
+        // only from the main menu: after a match the end screens and Battle Stats come first
+        if !self.armed || t < self.next || unsafe { rg_host_can_start() } == 0 {
+            self.ready_since = None;
+            return;
+        }
+        // and once it has been up for a second: it may still be coming in when it first counts
+        if t - *self.ready_since.get_or_insert(t) >= 1000 {
+            unsafe { rg_host_start(players, hero) };
+            // if it did not start, the state stays idle and it is tried again
+            self.next = t + 2000;
+            self.ready_since = None;
+        }
+    }
+}
+
 /// The engine's sound (8 kHz mono) waits here for the audio thread, which resamples it.
 type Ring = Arc<Mutex<VecDeque<i16>>>;
 
@@ -334,6 +456,8 @@ fn main() {
         win.set_position(x, y);
     }
     platform::icon(win.get_window_handle());
+    let typed = Rc::new(RefCell::new(Typed::default()));
+    win.set_input_callback(Box::new(Typing(typed.clone())));
     let mut saved = None;
     let mut full = cfg.fullscreen;
     if full {
@@ -347,9 +471,11 @@ fn main() {
     unsafe { rg_host_configure(cfg.host_players, cfg.hero()) };
     let mut keys = parse_keys(&cfg.keys);
     let start = std::time::Instant::now();
-    let (mut title, mut players, mut next_auto) = (String::new(), cfg.host_players, 15000u128);
+    let (mut title, mut players) = (String::new(), cfg.host_players);
+    let mut auto = (cfg.host == "auto").then(AutoHost::new);
     while win.is_open() {
         let t = start.elapsed().as_millis();
+        typed.borrow_mut().next_frame();
         while keys.first().is_some_and(|k| k.0 <= t) {
             let (_, code) = keys.remove(0);
             unsafe {
@@ -357,8 +483,8 @@ fn main() {
                 rg_key(0, code);
             }
         }
-        if cfg.host == "auto" && t >= next_auto {
-            next_auto = if unsafe { rg_host_start(cfg.host_players, cfg.hero()) } != 0 { u128::MAX } else { t + 2000 };
+        if let Some(a) = auto.as_mut() {
+            a.step(t, cfg.host_players, cfg.hero());
         }
         let status = unsafe { std::ffi::CStr::from_ptr(rg_host_status()) }.to_string_lossy().into_owned();
         if status != title {
@@ -371,13 +497,21 @@ fn main() {
             Config::save(&exe_dir, "host_players", &p.to_string());
         }
         let alt = win.is_key_down(Key::LeftAlt) || win.is_key_down(Key::RightAlt);
-        for k in win.get_keys_pressed(KeyRepeat::No) {
+        let mut pressed = win.get_keys_pressed(KeyRepeat::No);
+        // in the order they came: two letters typed fast can share a frame
+        pressed.sort_by_key(|k| typed.borrow().order(*k));
+        for k in pressed {
             if k == Key::F11 || (alt && matches!(k, Key::Enter | Key::NumPadEnter)) {
                 full = !full;
                 platform::fullscreen(win.get_window_handle(), &mut saved, full);
                 Config::save(&exe_dir, "fullscreen", if full { "true" } else { "false" });
             } else if let Some(c) = awt(k) {
                 unsafe { rg_key(1, c) };
+                // its character right after it: the engine joins the two by their time
+                let ch = typed.borrow_mut().take(k);
+                if let Some(ch) = ch {
+                    unsafe { rg_key_char(ch as c_int) };
+                }
             }
         }
         for k in win.get_keys_released() {

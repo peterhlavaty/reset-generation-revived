@@ -1,7 +1,8 @@
 /* Android host for the recompiled Reset Generation engine (NativeActivity, no Java code).
  *
- * - Game data ships as APK assets and is copied to internal storage on first run (the engine
- *   does ordinary file I/O and writes its saves next to the data).
+ * - Game data ships as APK assets and is copied to internal storage on the first run of each
+ *   APK build (the engine does ordinary file I/O and writes its saves next to the data).
+ * - One engine per process, driven by one activity at a time (Android may run two at once).
  * - The engine draws 640x360 (data pre-patched for that size at build time). The window buffer
  *   is 2x that height at the screen's aspect ratio; the game is scaled 2x into the middle and
  *   the touch controls live in the side bars, so they never cover the playfield.
@@ -17,12 +18,14 @@
 #include <android/window.h>
 #include <android_native_app_glue.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -70,43 +73,196 @@ static void set_paused(int p) {
     paused = p;
 }
 
+/* ------------------------------------------------------------------ engine ownership */
+/* NativeActivity runs one android_main thread per activity instance, and Android can start a
+ * second instance while the first one's thread still runs (seen on the first launch after an
+ * APK update: two threads installed the data and booted the engine at the same time, rg_init
+ * crashed and the data files were left corrupted). The engine, the runtime and the host state
+ * in this file exist once per process, so one activity at a time owns them. Every thread keeps
+ * servicing its own looper (Android's UI thread waits for it on lifecycle calls) and holds the
+ * engine lock while it handles events or runs a frame, but only the owner's events and frames
+ * touch the engine and the host state. The engine boots once, by the first owner that has a
+ * window; another activity takes it over when it gains focus (it is the one the user sees),
+ * when it gets a window while the owner has none, or when the owner is destroyed. */
+typedef struct activity {
+    struct android_app *app;
+    int focused;                        /* this activity's own focus */
+    struct activity *next;
+} activity;
+
+/* The engine lock is a ticket lock (first come, first served): the owner's thread takes it
+ * again right after each frame (which sleeps in the engine's frame limiter while holding it),
+ * and a plain mutex would let it starve another activity's thread waiting to handle the events
+ * the UI thread waits for. */
+static pthread_mutex_t ticket_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ticket_cv = PTHREAD_COND_INITIALIZER;
+static unsigned ticket_next, ticket_now;
+
+static void engine_lock(void) {
+    pthread_mutex_lock(&ticket_mu);
+    unsigned t = ticket_next++;
+    while (t != ticket_now) pthread_cond_wait(&ticket_cv, &ticket_mu);
+    pthread_mutex_unlock(&ticket_mu);
+}
+
+static void engine_unlock(void) {
+    pthread_mutex_lock(&ticket_mu);
+    ticket_now++;
+    pthread_cond_broadcast(&ticket_cv);
+    pthread_mutex_unlock(&ticket_mu);
+}
+
+static activity *acts;                  /* running activities, newest first */
+static activity *owner;                 /* the one the engine draws to and takes input from */
+static int focused;                     /* the owner has focus */
+static int booted;                      /* rg_init done: nothing calls into the engine before */
+static int booting;                     /* an owner is installing the data and booting */
+static int quitting;                    /* the engine asked to quit (rg_tick returned 0) */
+
 /* ------------------------------------------------------------------ assets -> internal storage */
-/* Copies the APK's assets/game/ files once per APK build (stamp file). Existing saves
- * (settings.cfg, achievements.dat, *.save) are never overwritten. */
-static int install_data(AAssetManager *am, const char *dir, const char *stamp_want) {
-    char path[512], have[64] = "";
-    mkdir(dir, 0755);
+/* Copies the APK's assets/game/ files to internal storage once per APK build. Existing saves
+ * (settings.cfg, achievements.dat, *.save) are never overwritten.
+ *
+ * An interrupted install (the app killed or crashed, or two installs at once) must not leave
+ * damaged files that pass for installed ones: every file is written under a temporary name,
+ * checked against the asset's length, synced and renamed into place, and the stamp is removed
+ * first and written last. The stamp names the data format and the APK build and lists every
+ * installed file with its size; each start checks those sizes, so a damaged install is redone.
+ * Format 1 (a bare build stamp) was written by installs that could run twice at once and
+ * corrupt the files they shared, so its installs are redone once. */
+#define DATA_FORMAT "rgdata 2"
+
+static int is_save(const char *name) {
+    return !strcmp(name, "settings.cfg") || !strcmp(name, "achievements.dat") || strstr(name, ".save") != NULL;
+}
+
+/* 1 if dir holds a complete install: the stamp starts with head (format and build), ends with
+ * "end", and every file it lists still has the size it was installed with (quiet: the second
+ * check, under the install lock, does not log the reason again) */
+static int data_installed(const char *dir, const char *head, int quiet) {
+    char path[1024], line[512], name[300];
     snprintf(path, sizeof path, "%s/.installed", dir);
     FILE *f = fopen(path, "r");
-    if (f) { if (!fgets(have, sizeof have, f)) have[0] = 0; fclose(f); }
-    if (!strcmp(have, stamp_want)) return 1;
-    AAssetDir *ad = AAssetManager_openDir(am, "game");
-    const char *name;
-    int n = 0;
-    static char buf[65536];
-    while ((name = AAssetDir_getNextFileName(ad))) {
-        char asset[256];
+    if (!f) return 0;
+    int ok = fgets(line, sizeof line, f) && !strcmp(line, head), files = 0, end = 0;
+    while (ok && fgets(line, sizeof line, f)) {
+        long long size;
         struct stat st;
-        snprintf(asset, sizeof asset, "game/%s", name);
+        if (!strcmp(line, "end\n")) { end = 1; break; }
+        if (sscanf(line, "%lld %299s", &size, name) != 2) { ok = 0; break; }
         snprintf(path, sizeof path, "%s/%s", dir, name);
-        int is_save = !strcmp(name, "settings.cfg") || !strcmp(name, "achievements.dat") || strstr(name, ".save");
-        if (is_save && stat(path, &st) == 0) continue;
-        AAsset *a = AAssetManager_open(am, asset, AASSET_MODE_STREAMING);
-        if (!a) continue;
-        FILE *o = fopen(path, "wb");
-        if (!o) { AAsset_close(a); continue; }
-        int k;
-        while ((k = AAsset_read(a, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)k, o);
-        fclose(o);
-        AAsset_close(a);
+        if (stat(path, &st) != 0 || (long long)st.st_size != size) {
+            if (!quiet) host_log("data: %s is missing or damaged, installing the game data again", name);
+            ok = 0;
+        }
+        files++;
+    }
+    fclose(f);
+    return ok && end && files > 0;
+}
+
+static int write_all(int fd, const char *p, size_t n) {
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return 0;
+        p += w;
+        n -= (size_t)w;
+    }
+    return 1;
+}
+
+/* makes the renames in dir durable (before the stamp that vouches for them) */
+static void sync_dir(const char *dir) {
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0) { fsync(fd); close(fd); }
+}
+
+/* Copies asset game/<name> to dir/<name> through a temporary file. Returns its size, -1 on
+ * failure (the old file, if any, is left as it was). */
+static long long copy_asset(AAssetManager *am, const char *dir, const char *name) {
+    char asset[300], path[1024], tmp[1024];
+    char buf[65536];                     /* per call: a shared buffer corrupted concurrent copies */
+    snprintf(asset, sizeof asset, "game/%s", name);
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    snprintf(tmp, sizeof tmp, "%s/.%s.part", dir, name);   /* no ".pak" suffix: the engine lists *.pak */
+    AAsset *a = AAssetManager_open(am, asset, AASSET_MODE_STREAMING);
+    if (!a) { host_log("data: asset %s missing", asset); return -1; }
+    long long want = (long long)AAsset_getLength64(a), done = 0;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644), ok = fd >= 0, k = 0;
+    while (ok && (k = AAsset_read(a, buf, sizeof buf)) > 0) {
+        ok = write_all(fd, buf, (size_t)k);
+        done += k;
+    }
+    AAsset_close(a);
+    if (k < 0) ok = 0;
+    if (fd >= 0) {
+        if (fsync(fd) != 0) ok = 0;
+        if (close(fd) != 0) ok = 0;
+    }
+    struct stat st;
+    if (ok && (done != want || stat(tmp, &st) != 0 || (long long)st.st_size != want)) ok = 0;
+    if (ok && rename(tmp, path) != 0) ok = 0;
+    if (!ok) {
+        host_log("data: could not install %s (%lld of %lld bytes, errno %d)", name, done, want, errno);
+        unlink(tmp);
+        return -1;
+    }
+    return want;
+}
+
+static int install_files(AAssetManager *am, const char *dir, const char *head) {
+    char stamp[1024], tmp[1024], path[1024];
+    snprintf(stamp, sizeof stamp, "%s/.installed", dir);
+    snprintf(tmp, sizeof tmp, "%s/.installed.part", dir);
+    unlink(stamp);                       /* no stamp until every file is in place */
+    host_log("data: installing %.*s", (int)strcspn(head, "\n"), head);
+    AAssetDir *ad = AAssetManager_openDir(am, "game");
+    FILE *list = ad ? fopen(tmp, "w") : NULL;
+    if (!list) { if (ad) AAssetDir_close(ad); return 0; }
+    fputs(head, list);
+    const char *name;
+    int n = 0, ok = 1;
+    while (ok && (name = AAssetDir_getNextFileName(ad))) {
+        struct stat st;
+        snprintf(path, sizeof path, "%s/%s", dir, name);
+        if (is_save(name)) {             /* the player's own once it exists; not listed (the engine rewrites it) */
+            if (stat(path, &st) != 0 && copy_asset(am, dir, name) < 0) ok = 0;
+            continue;
+        }
+        long long size = copy_asset(am, dir, name);
+        if (size < 0) { ok = 0; break; }
+        fprintf(list, "%lld %s\n", size, name);
         n++;
     }
     AAssetDir_close(ad);
-    host_log("installed %d data files into %s", n, dir);
-    snprintf(path, sizeof path, "%s/.installed", dir);
-    f = fopen(path, "w");
-    if (f) { fputs(stamp_want, f); fclose(f); }
-    return n > 0;
+    fputs("end\n", list);
+    if (fflush(list) != 0 || fsync(fileno(list)) != 0) ok = 0;
+    if (fclose(list) != 0) ok = 0;
+    if (ok && n > 0) {
+        sync_dir(dir);
+        if (rename(tmp, stamp) == 0) {
+            sync_dir(dir);
+            host_log("installed %d data files into %s", n, dir);
+            return 1;
+        }
+    }
+    unlink(tmp);
+    return 0;
+}
+
+static int install_data(AAssetManager *am, const char *dir, const char *build) {
+    char head[160], path[1024];
+    snprintf(head, sizeof head, "%s %s\n", DATA_FORMAT, build);
+    mkdir(dir, 0755);
+    if (data_installed(dir, head, 0)) return 1;
+    /* exclusive also against another process of the app (an old one still shutting down) */
+    snprintf(path, sizeof path, "%s/.install.lock", dir);
+    int lock = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock >= 0) while (flock(lock, LOCK_EX) != 0 && errno == EINTR) {}
+    int ok = data_installed(dir, head, 1) || install_files(am, dir, head);
+    if (lock >= 0) { flock(lock, LOCK_UN); close(lock); }
+    return ok;
 }
 
 /* ------------------------------------------------------------------ audio */
@@ -137,6 +293,7 @@ static aaudio_data_callback_result_t audio_cb(AAudioStream *s, void *user, void 
 
 static void audio_start(void) {
     AAudioStreamBuilder *b;
+    if (stream) return;                 /* already playing (focus and a takeover both start it) */
     if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return;
     AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setChannelCount(b, 1);
@@ -164,14 +321,21 @@ static void audio_pump(void) {
 }
 
 /* ------------------------------------------------------------------ touch controls */
-typedef struct { int key; float cx, cy, r; const char *label; int down; } button;
+typedef struct { int key; float cx, cy, r; const char *label; int down, sent; } button;   /* sent: the engine got the press */
 static button buttons[] = {
     {K_UP, 0, 0, 0, "up", 0}, {K_DOWN, 0, 0, 0, "down", 0}, {K_LEFT, 0, 0, 0, "left", 0}, {K_RIGHT, 0, 0, 0, "right", 0},
     {K_CTRL, 0, 0, 0, "action", 0}, {K_ENTER, 0, 0, 0, "select", 0}, {K_ESC, 0, 0, 0, "back", 0},
     {K_CTRL, 0, 0, 0, "drop", 0}, {0, 0, 0, 0, "host", 0},
 };
 #define B_DROP 7
-#define B_HOST 8               /* host a game (main menu; hidden while hosting) */
+#define B_HOST 8               /* host a game: shown only where F5 works (host_button_on) */
+
+int rg_host_can_start(void);   /* server.c: 1 = the main menu is up and nothing is being hosted */
+
+/* shown and active only where hosting can start (like F5): elsewhere the request is refused,
+ * and the button would only cover the screen */
+static int host_button_on(void) { return booted && rg_host_can_start(); }
+
 /* The game drops a piece when Action is held for 500 ms. The Drop button is a tap that holds
  * Ctrl for DROP_MS by itself, so no finger has to stay down. */
 #define DROP_MS 700
@@ -193,8 +357,8 @@ static struct {
     unsigned events, hovers, cancels;
     int tool, act, last_btn;                 /* last pointer 0 event */
     float x, y;
-    uint64_t down_at[8];
-    unsigned taps[8], hold_last[8], hold_max[8];
+    uint64_t down_at[NB];                    /* per button (8 overflowed on the HOST button) */
+    unsigned taps[NB], hold_last[NB], hold_max[NB];
     unsigned ticks_s, frames_s, tick_max_s;  /* last full second */
     unsigned ticks, frames, tick_max;        /* current second */
     uint64_t sec_at;
@@ -236,8 +400,9 @@ static void press(int b, int down) {
         dg.down_at[b] = 0;
     }
 #endif
+    if (!booted) return;                   /* a touch before the engine is up only lights the button */
     if (b == B_HOST) {
-        if (down && rg_host_state() == 0) rg_host_request();
+        if (down && host_button_on()) rg_host_request();
         return;
     }
     if (b == B_DROP) {                     /* released by the main loop after DROP_MS */
@@ -248,14 +413,17 @@ static void press(int b, int down) {
         }
         return;
     }
+    if (!down && !buttons[b].sent) return;  /* pressed before the engine was up: no release either */
+    buttons[b].sent = down;
     rg_key(down, buttons[b].key);
 }
 
 static int hit(float x, float y) {
     int best = -1;
     float bestd = 1e9f;
+    int host_on = host_button_on();
     for (int i = 0; i < NB; i++) {
-        if (i == B_HOST && rg_host_state() != 0) continue;
+        if (i == B_HOST && !host_on) continue;
         float dx = x - buttons[i].cx, dy = y - buttons[i].cy, dd = dx * dx + dy * dy;
         float reach = buttons[i].r * 1.35f;
         if (dd < reach * reach && dd < bestd) { best = i; bestd = dd; }
@@ -329,8 +497,9 @@ static void mask_text(float cx, int y, int sc, const char *s, int alpha) {
 
 static void build_mask(void) {
     unsigned key = (unsigned)controls_visible | (unsigned)bw << 1;
+    int host_on = host_button_on();
     for (int i = 0; i < NB; i++) key = key * 31 + (unsigned)buttons[i].down;
-    key = key * 31 + (unsigned)(rg_host_state() == 0);
+    key = key * 31 + (unsigned)host_on;
     if (key == mask_key && mask) return;
     mask_key = key;
     dirty = 1;
@@ -339,7 +508,7 @@ static void build_mask(void) {
     for (int y = 0; y < BH; y++) { mask_y0[y] = bw; mask_y1[y] = -1; }
     if (!controls_visible) return;
     for (int i = 0; i < NB; i++) {
-        if (i == B_HOST && rg_host_state() != 0) continue;
+        if (i == B_HOST && !host_on) continue;
         button *b = &buttons[i];
         mask_circle(b->cx, b->cy, b->r, b->down ? 150 : 70, 0);
         mask_circle(b->cx, b->cy, b->r, 140, 1);
@@ -505,15 +674,17 @@ static int map_key(int32_t code) {
     }
 }
 
+/* engine lock held (see android_main) */
 static int32_t on_input(struct android_app *app, AInputEvent *ev) {
-    (void)app;
+    if ((activity *)app->userData != owner) return 0;   /* another activity drives the engine */
     int type = AInputEvent_getType(ev);
     if (type == AINPUT_EVENT_TYPE_KEY) {
         int k = map_key(AKeyEvent_getKeyCode(ev));
         if (!k) return 0;
         int action = AKeyEvent_getAction(ev);
         if (AKeyEvent_getRepeatCount(ev) > 0) return 1;
-        if (action == AKEY_EVENT_ACTION_DOWN || action == AKEY_EVENT_ACTION_UP) rg_key(action == AKEY_EVENT_ACTION_DOWN, k);
+        if (booted && (action == AKEY_EVENT_ACTION_DOWN || action == AKEY_EVENT_ACTION_UP))
+            rg_key(action == AKEY_EVENT_ACTION_DOWN, k);
         if (AKeyEvent_getKeyCode(ev) != AKEYCODE_BACK) { controls_visible = 0; last_pad_input = mono_ms(); }
         return 1;
     }
@@ -581,10 +752,57 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
 }
 
 /* ------------------------------------------------------------------ lifecycle */
-static int focused, booted;
+/* (which activity drives the engine: see "engine ownership" above) */
 static char data_dir[512];
 
+/* engine lock held: the owner stops driving the engine; what it holds down is released */
+static void let_go(void) {
+    focused = 0;
+    set_paused(1);
+    audio_stop();
+    for (int i = 0; i < NB; i++) if (buttons[i].down) press(i, 0);
+    drop_release();
+    for (int i = 0; i < 16; i++) pointer_button[i] = -1;
+    window = NULL;
+}
+
+/* engine lock held: the engine moves to activity a (its window, focus and input) */
+static void adopt(activity *a) {
+    if (owner == a) return;
+    if (owner) {
+        host_log("engine: moves from activity %p to %p", (void *)owner->app->activity, (void *)a->app->activity);
+        let_go();
+    }
+    owner = a;
+    window = a->app->window;
+    focused = a->focused;
+    if (window) setup_window();
+    if (booted && focused) { audio_start(); set_paused(0); }
+    ALooper_wake(a->app->looper);        /* its thread may be waiting for events, not running frames */
+}
+
+/* engine lock held: activity a is being destroyed (its android_main returns after this) */
+static void leave(activity *a) {
+    for (activity **p = &acts; *p; p = &(*p)->next)
+        if (*p == a) { *p = a->next; break; }
+    if (owner != a) return;
+    if (!acts || quitting) {
+        /* The engine and runtime keep their state in process-wide globals and cannot be
+         * re-initialised, so a process that outlives its last activity would relaunch into the
+         * dead engine. Take the process down with the activity (exit flushes saves). */
+        audio_stop();
+        exit(0);
+    }
+    adopt(acts);                         /* the newest activity still running */
+}
+
+/* engine lock held (see android_main) */
 static void on_cmd(struct android_app *app, int32_t cmd) {
+    activity *a = (activity *)app->userData;
+    if (cmd == APP_CMD_GAINED_FOCUS) a->focused = 1;
+    if (cmd == APP_CMD_LOST_FOCUS || cmd == APP_CMD_PAUSE) a->focused = 0;
+    if (a != owner && (cmd == APP_CMD_GAINED_FOCUS || (cmd == APP_CMD_INIT_WINDOW && !window))) adopt(a);
+    if (a != owner) return;              /* the engine is another activity's */
     switch (cmd) {
     case APP_CMD_INIT_WINDOW:
         window = app->window;
@@ -644,43 +862,75 @@ static void read_config(void) {
     host_log("online: %s as %s", server, nick);
 }
 
+/* Installs the data and boots the engine. Runs on the owner's thread without the engine lock,
+ * since it takes a while and the other activities' threads must keep answering the UI thread
+ * meanwhile; `booting` keeps it the only boot in the process, and nothing calls into the engine
+ * until `booted` is set. */
+static void boot(struct android_app *app) {
+    if (!install_data(app->activity->assetManager, data_dir, RG_DATA_STAMP))
+        host_fatal("could not install the game data (APK assets missing, or no storage space)");
+    read_config();
+    char dll[600];
+    snprintf(dll, sizeof dll, "%s/ResetGeneration-Win32-Web.dll", data_dir);
+    if (!rg_init(dll, data_dir, GW, GH, "en")) host_fatal("engine failed to start");
+}
+
+/* engine lock held: a's thread runs frames (or the boot) instead of waiting for events */
+static int wants_frames(activity *a) {
+    return owner == a && window && (booted ? focused : !booting);
+}
+
 void android_main(struct android_app *app) {
-    ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
+    activity self = {app, 0, NULL};
+    app->userData = &self;
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
-    for (int i = 0; i < 16; i++) pointer_button[i] = -1;
-    paused_at = mono_ms();               /* clock starts paused until the window has focus */
-    snprintf(data_dir, sizeof data_dir, "%s/game", app->activity->internalDataPath);
+    ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
+    engine_lock();
+    self.next = acts;
+    acts = &self;
+    if (!owner) {                        /* the process's first activity */
+        for (int i = 0; i < 16; i++) pointer_button[i] = -1;
+        paused_at = mono_ms();           /* clock starts paused until the window has focus */
+        snprintf(data_dir, sizeof data_dir, "%s/game", app->activity->internalDataPath);
+        owner = &self;
+    } else {
+        host_log("engine: activity %p started while %p drives the engine (%s)", (void *)app->activity,
+                 (void *)owner->app->activity, booted ? "running" : booting ? "booting" : "not booted");
+    }
+    engine_unlock();
 
+    int busy = 0;
     for (;;) {
         int events;
         struct android_poll_source *src;
-        int timeout = (booted && focused && window) ? 0 : -1;
-        if (!booted && window) timeout = 0;
-        while (ALooper_pollOnce(timeout, NULL, &events, (void **)&src) >= 0) {
+        while (ALooper_pollOnce(busy ? 0 : -1, NULL, &events, (void **)&src) >= 0) {
+            engine_lock();
             if (src) src->process(app, src);
             if (app->destroyRequested) {
-                /* The engine and runtime keep their state in process-wide globals and cannot be
-                 * re-initialised, so a process that outlives its activity would relaunch into the
-                 * dead engine. Take the process down with the activity (exit flushes saves). */
-                audio_stop();
-                exit(0);
+                leave(&self);            /* exits the process if this was its last activity */
+                engine_unlock();
+                return;
             }
-            timeout = (booted && focused && window) ? 0 : (!booted && window) ? 0 : -1;
+            busy = wants_frames(&self);
+            engine_unlock();
         }
-        if (!booted && window) {
-            if (!install_data(app->activity->assetManager, data_dir, RG_DATA_STAMP)) host_fatal("game data missing from APK");
-            read_config();
-            char dll[600];
-            snprintf(dll, sizeof dll, "%s/ResetGeneration-Win32-Web.dll", data_dir);
-            if (!rg_init(dll, data_dir, GW, GH, "en")) host_fatal("engine failed to start");
+        engine_lock();
+        if (owner == &self && !booted && !booting && window) {
+            booting = 1;
+            engine_unlock();
+            boot(app);
+            engine_lock();
+            booting = 0;
             booted = 1;
+            /* the engine may have moved to another activity meanwhile: start it there */
             if (focused) { audio_start(); set_paused(0); }
+            if (owner != &self) ALooper_wake(owner->app->looper);
         }
-        if (booted && focused && window) {
+        if (owner == &self && booted && focused && window) {
             uint64_t t0 = mono_ms();
             if (drop_pending && t0 >= drop_release_at) drop_release();
-            if (!rg_tick()) { ANativeActivity_finish(app->activity); }
+            if (!rg_tick()) { quitting = 1; ANativeActivity_finish(app->activity); }
             if (rg_host_players() != cfg_players) { cfg_players = rg_host_players(); save_config(); }
             uint64_t t1 = mono_ms();
 #ifdef RG_DIAG
@@ -701,5 +951,7 @@ void android_main(struct android_app *app) {
                 tick_ms = present_ms = 0;
             }
         }
+        busy = wants_frames(&self);
+        engine_unlock();
     }
 }

@@ -18,7 +18,7 @@ minifb = { version = "0.29", default-features = false, features = ["x11"] }
 tinyaudio = "2"
 # the relay for LAN games, run in-process by a hosting game (server=auto without internet, or lan)
 rg-server = { path = "../../server" }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "net"] }
 
 [target.'cfg(windows)'.dependencies]
 # borderless fullscreen (F11, Alt+Enter), the window icon

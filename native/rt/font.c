@@ -32,24 +32,38 @@ const uint8_t *rt_glyph(char c) {
     return p ? font5x7[p - chars] : NULL;
 }
 
-int rt_text_width(const char *s, int scale) { return s[0] ? (int)strlen(s) * 6 * scale - scale : 0; }
+int rt_text_width(const char *s, int scale) { return s && s[0] ? (int)strlen(s) * 6 * scale - scale : 0; }
+
+int rt_text_fit(char *s, int scale, int max_w) {
+    if (!s) return 0;
+    if (scale < 1) scale = 1;
+    int width = rt_text_width(s, scale);
+    if (width <= max_w) return width;
+    /* k letters and ".." take (k + 2) glyphs less the gap after the last one */
+    int cells = max_w + scale < 0 ? 0 : (max_w + scale) / (6 * scale), k = cells - 2;
+    if (k < 0) {                                  /* not even "..": the letter that fits, or none */
+        s[cells] = 0;                             /* cells <= 1 < strlen(s): the text did not fit */
+        return rt_text_width(s, scale);
+    }
+    while (k > 0 && s[k - 1] == ' ') k--;         /* "AB.." reads better than "AB .." */
+    memcpy(s + k, "..", 3);                       /* k + 2 < strlen(s), as the text did not fit */
+    return rt_text_width(s, scale);
+}
 
 void rt_draw_text(uint32_t *px, int w, int h, int x, int y, int scale, const char *s, uint32_t color) {
-    for (; *s; s++, x += 6 * scale) {
+    if (!px || !s || w <= 0 || h <= 0 || scale < 1 || y >= h || y + 7 * scale <= 0) return;
+    for (; *s && x < w; s++, x += 6 * scale) {    /* the glyphs right of the frame are not drawn */
         const uint8_t *g = rt_glyph(*s);
-        if (!g) continue;
+        if (!g || x + 5 * scale <= 0) continue;
         for (int r = 0; r < 7; r++)
             for (int c = 0; c < 5; c++)
                 if (g[r] >> (4 - c) & 1)
-                    for (int dy = 0; dy < scale; dy++)
-                        for (int dx = 0; dx < scale; dx++) {
-                            int xx = x + c * scale + dx, yy = y + r * scale + dy;
-                            if (xx >= 0 && xx < w && yy >= 0 && yy < h) px[(size_t)yy * w + xx] = color;
-                        }
+                    rt_fill_rect(px, w, h, x + c * scale, y + r * scale, x + (c + 1) * scale, y + (r + 1) * scale, color);
     }
 }
 
 void rt_fill_rect(uint32_t *px, int w, int h, int x0, int y0, int x1, int y1, uint32_t c) {
+    if (!px) return;
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > w) x1 = w;
@@ -59,6 +73,9 @@ void rt_fill_rect(uint32_t *px, int w, int h, int x0, int y0, int x1, int y1, ui
 }
 
 void rt_shade_rect(uint32_t *px, int w, int h, int x0, int y0, int x1, int y1, int keep) {
+    if (!px) return;
+    if (keep < 0) keep = 0;
+    if (keep > 256) keep = 256;                   /* more would carry into the next colour */
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > w) x1 = w;

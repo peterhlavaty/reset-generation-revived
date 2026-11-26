@@ -27,6 +27,7 @@ extern "C" {
     fn rg_tick() -> c_int;
     fn rg_pixels() -> *const u32;
     fn rg_key(down: c_int, keycode: c_int);
+    fn rg_key_char(ch: c_int);
     fn rg_audio(buf: *mut u8, len: c_int);
     fn rg_use_virtual_clock(on: c_int);
     fn rg_advance_ms(ms: u32);
@@ -253,22 +254,24 @@ fn awt(code: &str) -> Option<c_int> {
     })
 }
 
-fn key(down: bool, code: c_int) {
+/// Sends a key to the game; false when it was not sent (already held / not held).
+fn key(down: bool, code: c_int) -> bool {
     GAME_STATE.with(|g| {
         let mut g = g.borrow_mut();
-        let Some(g) = g.as_mut() else { return };
+        let Some(g) = g.as_mut() else { return false };
         if down {
             unlock_audio(g);
             if g.held.contains(&code) {
-                return;
+                return false;
             }
             g.held.push(code);
         } else {
-            let Some(i) = g.held.iter().position(|&k| k == code) else { return };
+            let Some(i) = g.held.iter().position(|&k| k == code) else { return false };
             g.held.remove(i);
         }
         unsafe { rg_key(down as c_int, code) };
-    });
+        true
+    })
 }
 
 fn release_all() {
@@ -287,8 +290,12 @@ fn input(doc: &web_sys::Document) -> Result<(), JsValue> {
             }
             if let Some(code) = awt(&e.code()) {
                 e.prevent_default();
-                if !e.repeat() {
-                    key(down, code);
+                if !e.repeat() && key(down, code) && down {
+                    // the typed character, for the engine's text fields (the in-match message)
+                    let k = e.key();
+                    if let [c @ 0x20..=0x7e] = k.as_bytes() {
+                        unsafe { rg_key_char(*c as c_int) };
+                    }
                 }
             }
         });
@@ -314,10 +321,14 @@ fn input(doc: &web_sys::Document) -> Result<(), JsValue> {
             let f = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
                 e.prevent_default();
                 match hold {
-                    None => key(down, code),
+                    None => {
+                        key(down, code);
+                    }
                     Some(ms) if down => {
                         key(true, code);
-                        let up = Closure::once_into_js(move || key(false, code));
+                        let up = Closure::once_into_js(move || {
+                            key(false, code);
+                        });
                         let _ = window().set_timeout_with_callback_and_timeout_and_arguments_0(up.unchecked_ref(), ms);
                     }
                     Some(_) => {}

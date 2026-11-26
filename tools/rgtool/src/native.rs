@@ -243,6 +243,28 @@ pub fn patched_data(dest: &Path) -> R<()> {
     crate::pakpatch::patch_dir(dest, 640, 360)
 }
 
+/// Names the transform the data in a `patched_data` folder was made with.
+const DATA_STAMP: &str = "rgdata.stamp";
+
+fn data_stamp() -> String {
+    // FNV-1a of the transform's source: test data is made again when it changes
+    let h = include_str!("pakpatch.rs").bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    format!("pakpatch {h:016x}\n")
+}
+
+/// `patched_data` for a test folder kept between runs: made again when it is missing or the
+/// transform changed.
+pub fn test_data(dest: &Path) -> R<()> {
+    let fresh = dest.join("ResetGeneration-Win32-Web.dll").exists()
+        && std::fs::read_to_string(dest.join(DATA_STAMP)).is_ok_and(|s| s == data_stamp());
+    if fresh {
+        return Ok(());
+    }
+    patched_data(dest)?;
+    std::fs::write(dest.join(DATA_STAMP), data_stamp())?;
+    Ok(())
+}
+
 /// `cargo x native-test [FRAMES] [rgtest options…]`: runs build/native/rgtest headless on a
 /// virtual clock against patched data in build/native/data (screenshots, frame hashes in
 /// build/native/test).
@@ -253,9 +275,7 @@ pub fn run_test(args: &[String]) -> R<()> {
         return Err("build first: cargo x build-native-test".into());
     }
     let data = r.join("build/native/data");
-    if !data.join("ResetGeneration-Win32-Web.dll").exists() {
-        patched_data(&data)?;
-    }
+    test_data(&data)?;
     let out = r.join("build/native/test");
     std::fs::create_dir_all(&out)?;
     let (frames, rest) = match args.first().and_then(|a| a.parse::<u32>().ok()) {

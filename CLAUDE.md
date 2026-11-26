@@ -52,7 +52,9 @@ Languages: Rust and C (and C++ if ever needed); Java only for the Ghidra scripts
   first, else the newest). Matches run on the hosting player's engine
   (`native/rt/server.c`). The desktop game runs the relay in-process for LAN games (the
   `rg-server` library; clients find it by UDP broadcast on 8787, `server=auto`). A dropped
-  player's seat is held for as long as the match runs (`rejoin_ms: None`). Games reach the public
+  player's seat is held for as long as the match runs (`rejoin_ms: None`); a host whose link is
+  gone for 15 s ends the match (the relay closes its players), a `serve` with the same `key` takes
+  the room back. Games reach the public
   relay by `wss://` (BearSSL in `native/rt/link.c`, Let's Encrypt roots built in), falling back
   to `ws://` on port 80; LAN relays are plain `ws://`.
 * Windows child processes inherit our std handles unless `util::no_inherit()` ran: piped rgtool

@@ -10,7 +10,7 @@
 //! screenshot of the first different frame from each side lands in build/oracle/{orig,reco}/.
 //! Windows only (the original is a Win32 DLL).
 
-use crate::native::{generate_into, link_driver, patched_data, ppm_to_png, WIN_LIBS};
+use crate::native::{generate_into, link_driver, ppm_to_png, test_data, WIN_LIBS};
 use crate::util::{root, R};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,9 +36,7 @@ pub fn oracle(args: &[String]) -> R<()> {
     link_driver(&bin.join("x86_64-w64-mingw32-clang.exe"), &["RT_PURE", "RT_COMPACT_MAP"], Some(&gen), &[rgtest], &dir.join("obj-pure"), &exes[1], WIN_LIBS)?;
 
     let data = dir.join("data");
-    if !data.join("ResetGeneration-Win32-Web.dll").exists() {
-        patched_data(&data)?;
-    }
+    test_data(&data)?;
     let (frames, rest) = match args.first().and_then(|a| a.parse::<u32>().ok()) {
         Some(n) => (n, &args[1..]),
         None => (400, args),

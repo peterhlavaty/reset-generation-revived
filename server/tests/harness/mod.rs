@@ -73,7 +73,7 @@ impl C {
 
 impl T {
     fn new(cfg: Config) -> Self {
-        T { relay: Relay::new(cfg, Box::new(|_| {})), now: 1_000_000 }
+        T { relay: Relay::new(cfg, Box::new(|s| if std::env::var_os("RG_TEST_LOG").is_some() { eprintln!("{s}") })), now: 1_000_000 }
     }
     fn conn(&mut self) -> C {
         self.conn_from(None)
@@ -226,4 +226,24 @@ fn names(list: &[(String, String, String)]) -> Vec<&str> {
 
 fn got_lock(msgs: &[(u8, u8, u8, Vec<u8>)]) -> bool {
     msgs.iter().any(|m| m.0 == CH_CASINO && m.1 == REQUEST && m.2 == 29)
+}
+
+/// The MATCHED_UP room and its player count, if this player got one.
+#[allow(dead_code)] // not every test file looks at the count
+fn matched(msgs: &[Msg]) -> Option<(String, u32)> {
+    msgs.iter().find(|m| m.1 == EVENT && m.2 == 31).map(|m| {
+        let mut r = Reader::new(&m.3);
+        r.str().unwrap();
+        let room = r.str().unwrap();
+        r.str().unwrap();
+        r.u8().unwrap();
+        r.u8().unwrap();
+        (room, r.u32().unwrap())
+    })
+}
+
+/// SEAT_TAKE in the game room: the player's session starts there (the host hears of it).
+#[allow(dead_code)] // not every test file goes into game rooms
+fn seat_take(t: &mut T, c: &C) {
+    t.bin(c, &frame(CH_TABLE, &Writer::new().u8(REQUEST).u8(13).u32(7).done()));
 }

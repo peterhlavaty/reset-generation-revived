@@ -13,7 +13,12 @@
 static int W, H;
 static uint32_t env, engine_obj, listener_obj, sound_obj, snap_obj, snap_listener_obj;
 static uint32_t fb, sndbuf, sndbuf_h, netbuf, netbuf_h;
-static uint32_t x_tick, x_key_down, x_key_up, x_sound, x_wait, x_volume;
+static uint32_t x_tick, x_key_down, x_key_up, x_key_typed, x_sound, x_wait, x_volume;
+static uint32_t typed_ms;      /* when the last press reached the engine; 0: it did not */
+static int typed_key;          /* that press's key code */
+static uint32_t press_ms;      /* the last press the engine got, and whether it has no character */
+static int press_bare;
+static uint16_t key_chr[256];  /* the character each held key typed: its release carries it, as AWT's did */
 #define SNDBUF_SIZE 4096
 #define NETBUF_SIZE 2048
 
@@ -130,6 +135,7 @@ int rg_init(const char *dll_path, const char *game_dir, int width, int height, c
     x_tick = rt_export("NativeGameEngine_tick");
     x_key_down = rt_export("NativeInputEventListener_onKeyPressed@");
     x_key_up = rt_export("NativeInputEventListener_onKeyReleased@");
+    x_key_typed = rt_export("NativeInputEventListener_onKeyTyped@");
     x_sound = rt_export("NativeSoundOutputDevice_onSoundBufferEmpty");
     x_wait = rt_export("NativeGameEngine_isInWaitScreen");
     x_volume = rt_export("NativeGameEngine_setVolume");
@@ -163,12 +169,39 @@ const uint32_t *rg_pixels(void) { return rg_lobby_compose(rg_server_compose((con
  * other keys STANDARD (1); the key char is the character for Enter/Esc, CHAR_UNDEFINED otherwise. */
 void rg_key(int down, int keycode) {
     if (!rg_server_key(down, keycode) && !rg_lobby_key(down, keycode)) rg_engine_key(down, keycode);
+    else if (down) typed_ms = 0;
 }
 
 void rg_engine_key(int down, int keycode) {
+    uint32_t t = rt_now_ms();
     uint32_t chr = (keycode == 10 || keycode == 27 || keycode == 32) ? (uint32_t)keycode : 0xffffu;
     uint32_t loc = keycode == 17 ? 2 : 1;
-    call(down ? x_key_down : x_key_up, 6, env, listener_obj, rt_now_ms(), (uint32_t)keycode, chr, loc);
+    if (keycode >= 0 && keycode < 256) {
+        if (down) {
+            /* the engine would join this press's character to an earlier press of the same
+             * millisecond that has none: this one types nothing then */
+            int clash = press_bare && press_ms == t;
+            key_chr[keycode] = 0;
+            typed_ms = clash ? 0 : t;
+            typed_key = keycode;
+            press_ms = t;
+            press_bare = 1;
+        }
+        else if (key_chr[keycode]) { chr = key_chr[keycode]; key_chr[keycode] = 0; }
+    }
+    call(down ? x_key_down : x_key_up, 6, env, listener_obj, t, (uint32_t)keycode, chr, loc);
+}
+
+/* The engine's text fields (the in-match message) read text only from AWT's keyTyped. Its
+ * listener (0x10001c60) joins a typed character to the queued press with the same timestamp and
+ * drops it if there is none, so it carries that press's time. rgtest never calls it, so the
+ * oracle's key events stay as they were. */
+void rg_key_char(int ch) {
+    if (!typed_ms || ch <= 0 || ch > 0xff) return;
+    if (typed_key >= 0 && typed_key < 256) key_chr[typed_key] = (uint16_t)ch;
+    call(x_key_typed, 4, env, listener_obj, typed_ms, (uint32_t)ch);
+    press_bare = 0;
+    typed_ms = 0;                        /* one character per press */
 }
 
 void rg_audio(uint8_t *buf, int len) {

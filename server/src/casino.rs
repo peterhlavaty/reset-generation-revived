@@ -23,9 +23,24 @@
 //! players wait and are seated when one is hosted. With `match_size` > 0 (tests) players without a
 //! hosted game also form `QM_n` rooms of that many, which need a separate game server.
 //!
-//! A player whose connection drops in a running hosted match is remembered; their next Quick
-//! Match request sends them straight back into it, for as long as the host serves that match
-//! (no time limit by default, `rejoin_ms` sets one).
+//! A host sends a player away (`kick`) for 10 minutes: none of that host's games (by the host's
+//! name, so also their next one) is offered to the player's name, nor to their address unless it
+//! is the host's own network (a stranger who comes back under another name stays away). The lists
+//! change by themselves when the 10 minutes are over.
+//!
+//! Once a hosted game starts (its host says so, or an older host's game fills), the players it
+//! started with are that match's players: the host's engine waits for all of them, so MATCHED_UP
+//! announces them all. One who does not get there (Back or Quick Match during the lock, the
+//! connection gone before entering the room) is remembered like a player whose connection dropped
+//! in the match. A player whose connection drops in a running hosted match is remembered; their
+//! next Quick Match request sends them straight back into it, for as long as the host serves that
+//! match (no time limit by default, `rejoin_ms` sets one). While the host's link is coming back
+//! (crate::relay::HOST_BACK_MS) the way back is kept but not taken, so the player waits for a
+//! game as usual meanwhile; going back later frees the seat they took. Of two ways back (they
+//! dropped out of another match meanwhile) the one they dropped out of last goes first, the other
+//! one stays (that host's engine still holds their seat). A host that does not come back ends the
+//! match and its ways back (the relay disconnects its players). Players matched into a hosted room
+//! whose host is gone (it left during the lock) are disconnected instead: no one would start it.
 
 use crate::relay::{ClientId, Net};
 use crate::wire::*;
@@ -101,9 +116,21 @@ pub struct Offer<'a> {
 struct Match {
     group: Vec<Waiting>,
     room: String,
+    /// The players it started with: MATCHED_UP's count (a host's engine waits for all of them).
+    size: usize,
+    /// A game hosted by a player (also a way back into one): its host's engine must still serve
+    /// the room when the players are sent there (`QM_n` rooms are not served).
+    hosted: bool,
     locked: HashSet<ClientId>,
     deadline: u64,
-    done: bool,
+}
+
+/// A host sent a player away: their name, their address (unless it is the host's own network),
+/// when.
+struct Kick {
+    name: String,
+    addr: Option<IpAddr>,
+    at: u64,
 }
 
 /// A game being announced on a waiting list: (profile id, profile).
@@ -117,14 +144,19 @@ pub struct Casino {
     matches: Vec<Match>,
     /// Waiting hosted games, oldest first.
     hosted: Vec<Hosted>,
-    /// Hosted matches being played: room key -> room name.
+    /// Hosted matches started (from the start on, so a player lost before entering the room can
+    /// come back) or being played: room key -> room name.
     running: HashMap<String, String>,
     /// Room key -> (lower-case) names that lost the connection in it -> when.
     dropped: HashMap<String, HashMap<String, u64>>,
+    /// Players sent into a hosted room (MATCHED_UP) who have not entered it yet: client -> room key.
+    arriving: HashMap<ClientId, String>,
     /// Lower-case name -> the hosted games (room keys) they left with Back, and when they last did.
     declined: HashMap<String, (Vec<String>, u64)>,
-    /// Lower-case name -> the hosted games whose host sent them away, and when.
-    kicked: HashMap<String, Vec<(String, u64)>>,
+    /// Lower-case host name -> the players that host sent away.
+    kicked: HashMap<String, Vec<Kick>>,
+    /// When the next kick or Back runs out: the lists change by themselves then.
+    next_expiry: Option<u64>,
     /// The game list each choosing player was last sent.
     games_shown: HashMap<ClientId, String>,
     /// The profile ids each waiting player's "Players in Match" list shows.
@@ -155,8 +187,12 @@ fn same_network(a: Option<IpAddr>, b: Option<IpAddr>) -> bool {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,
     };
+    // 100.64.0.0/10 (carrier-grade NAT) is where Tailscale puts a friend reaching a LAN relay
     let local = |ip: IpAddr| match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || (o[0] == 100 && o[1] & 0xc0 == 64)
+        }
         IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[0] & 0xfe00 == 0xfc00 || v6.segments()[0] & 0xffc0 == 0xfe80,
     };
     match (a.map(plain), b.map(plain)) {
@@ -172,6 +208,12 @@ fn same_network(a: Option<IpAddr>, b: Option<IpAddr>) -> bool {
 fn host_from_room(room: &str) -> String {
     let inner = room.strip_prefix("HOST_").and_then(|r| r.rsplit_once('_')).map(|(name, _)| name);
     inner.filter(|n| !n.is_empty()).unwrap_or(room).to_string()
+}
+
+/// Kicks are the host's (by their name, so they hold for the host's next game too); a host
+/// without a usable name has them for this game only.
+fn kick_key(h: &Hosted) -> String {
+    if h.host.is_empty() { h.key.clone() } else { h.host.to_lowercase() }
 }
 
 impl Casino {
@@ -232,11 +274,108 @@ impl Casino {
     }
 
     pub fn leave(&mut self, net: &mut Net, c: ClientId) {
+        self.left_launch(net, c);
         let waited = self.withdraw(c).is_some();
         self.players.remove(&c);
         if waited {
             self.matchmake(net);
         }
+    }
+
+    /// A player of a started hosted game who will not get into its room from here (Back or Quick
+    /// Match during the lock, gone from the casino before entering the room): the host's engine
+    /// keeps their place, so they are remembered like a player whose connection dropped in the
+    /// match and are not sent there now. The others go on without waiting for their lock answer.
+    fn left_launch(&mut self, net: &mut Net, c: ClientId) -> bool {
+        let name = net.name(c).to_string();
+        if let Some(i) = self.matches.iter().position(|m| m.hosted && m.group.iter().any(|q| q.client == c)) {
+            let m = &mut self.matches[i];
+            m.group.retain(|q| q.client != c);
+            m.locked.remove(&c);
+            let key = m.room.to_lowercase();
+            self.dropped_out(net, &key, &name);
+            let m = &self.matches[i];
+            if m.group.is_empty() {
+                self.matches.remove(i);
+            } else if m.group.iter().all(|q| m.locked.contains(&q.client)) {
+                self.matched_up(net, i);
+            }
+            return true;
+        }
+        if let Some(key) = self.arriving.remove(&c) {
+            self.dropped_out(net, &key, &name);
+            return true;
+        }
+        false
+    }
+
+    /// A player is on their way into this room (it takes them from the casino): no longer arriving.
+    pub fn entering(&mut self, net: &Net, c: ClientId, key: &str) {
+        if self.arriving.get(&c).is_some_and(|k| k == key) {
+            self.arriving.remove(&c);
+        }
+        if let Some(m) = self.dropped.get_mut(key) {
+            m.remove(&net.name(c).to_lowercase());
+        }
+    }
+
+    /// Is this player in a started hosted game they have not reached yet?
+    pub fn launched(&self, c: ClientId) -> bool {
+        self.arriving.contains_key(&c) || self.matches.iter().any(|m| m.hosted && m.group.iter().any(|q| q.client == c))
+    }
+
+    /// Has a match been started in this room (and its host not finished it)?
+    pub fn is_running(&self, key: &str) -> bool {
+        self.running.contains_key(key)
+    }
+
+    /// The host's game came back on a new link (`serve` with its key): that link owns the game
+    /// now and hears its seats again.
+    pub fn host_back(&mut self, net: &mut Net, key: &str, owner: ClientId) {
+        if let Some(h) = self.hosted.iter_mut().find(|h| h.key == key) {
+            h.owner = Some(owner);
+            h.told = None;
+        }
+        self.send_back(net, key);
+        self.refresh(net);
+    }
+
+    /// A running match the relay did not know (it restarted, or its host came back after its
+    /// players were sent away): the players whose seats its host holds go back in with Quick Match.
+    pub fn adopt(&mut self, net: &mut Net, key: &str, room: &str, held: &[&str]) {
+        net.log(&format!("casino: {room} is a running match (held: {})", held.join(", ")));
+        self.running.insert(key.to_string(), room.to_string());
+        let d = self.dropped.entry(key.to_string()).or_default();
+        for n in held {
+            d.insert(n.to_lowercase(), net.now);
+        }
+        self.send_back(net, key);
+        self.refresh(net);
+    }
+
+    /// Players who may go back into this match and wait in Quick Match (they came back while its
+    /// host was away; their game asks only once): into the match now.
+    fn send_back(&mut self, net: &mut Net, key: &str) {
+        let Some(names) = self.dropped.get(key) else { return };
+        let back: Vec<Waiting> = self
+            .queue
+            .iter()
+            .chain(self.hosted.iter().flat_map(|h| h.seated.iter()))
+            .filter(|q| names.contains_key(&net.name(q.client).to_lowercase()))
+            .copied()
+            .collect();
+        if back.is_empty() {
+            return;
+        }
+        for q in back {
+            self.withdraw(q.client);
+            let name = net.name(q.client).to_string();
+            if let Some(room) = self.rejoin_room(net, &name) {
+                net.log(&format!("casino: {name} rejoins {room}"));
+                self.start_match(net, vec![q], room, true);
+            }
+        }
+        self.matchmake(net);
     }
 
     /// Takes a player out of Quick Match; returns the hosted game (room key) they were seated in,
@@ -276,8 +415,12 @@ impl Casino {
         self.matchmake(net);
     }
 
-    /// A choosing player picks a waiting game (by its list id).
+    /// A choosing player picks a waiting game (by its list id). Only games that choose may: they
+    /// were offered the games (and others could make every chooser's list change at will).
     pub fn choose(&mut self, net: &mut Net, c: ClientId, id: u32) {
+        if !net.picks(c) {
+            return;
+        }
         let Some(j) = self.hosted.iter().position(|h| h.list_id == id) else {
             return self.resend_games(net, c); // gone meanwhile
         };
@@ -285,7 +428,7 @@ impl Casino {
         if h.seated.iter().any(|q| q.client == c) {
             return;
         }
-        if h.seated.len() >= h.players || self.was_kicked(net, c, &h.key) {
+        if h.seated.len() >= h.players || self.was_kicked(net, c, h) {
             return self.resend_games(net, c);
         }
         let q = if let Some(i) = self.queue.iter().position(|q| q.client == c) {
@@ -318,8 +461,9 @@ impl Casino {
         self.refresh(net);
     }
 
-    /// The host sends a seated player away (`kick`): that game is not offered to them again for
-    /// a while.
+    /// The host sends a seated player away (`kick`): none of this host's games is offered to them
+    /// for DECLINE_MS. The player's address counts too (a stranger comes back under another name
+    /// at will), unless it is the host's own network (a LAN relay, the host's family).
     pub fn host_kick(&mut self, net: &mut Net, owner: ClientId, name: &str) {
         let Some(h) = self.hosted.iter_mut().find(|h| h.owner == Some(owner)) else { return };
         let Some(i) = h.seated.iter().position(|q| net.name(q.client).eq_ignore_ascii_case(name)) else {
@@ -327,25 +471,36 @@ impl Casino {
             return self.refresh(net);
         };
         let q = h.seated.remove(i);
-        let key = h.key.clone();
         net.log(&format!("casino: the host of {} sends {} away", h.room, net.name(q.client)));
-        self.kicked.entry(net.name(q.client).to_lowercase()).or_default().push((key, net.now));
+        let addr = net.addr(q.client).filter(|&a| !same_network(h.addr, Some(a)));
+        let kick = Kick { name: net.name(q.client).to_lowercase(), addr, at: net.now };
+        self.kicked.entry(kick_key(h)).or_default().push(kick);
         self.queue.insert(0, q);
         self.matchmake(net);
     }
 
-    fn was_kicked(&self, net: &Net, c: ClientId, key: &str) -> bool {
-        self.kicked.get(&net.name(c).to_lowercase()).is_some_and(|k| k.iter().any(|(k, _)| k == key))
+    /// Has this game's host sent the player away in the last DECLINE_MS?
+    fn was_kicked(&self, net: &Net, c: ClientId, h: &Hosted) -> bool {
+        let (name, addr) = (net.name(c), net.addr(c));
+        self.kicked.get(&kick_key(h)).is_some_and(|ks| {
+            ks.iter().any(|k| {
+                net.now < k.at + DECLINE_MS && (k.name.eq_ignore_ascii_case(name) || (k.addr.is_some() && same_network(k.addr, addr)))
+            })
+        })
     }
 
-    /// Starts a hosted game with the players seated in it.
+    /// Starts a hosted game with the players seated in it. It counts as running from now on: a
+    /// player lost before entering its room may come back into it.
     fn launch(&mut self, net: &mut Net, i: usize) {
         let h = self.hosted.remove(i);
         for q in &h.seated {
             self.shown.remove(&q.client);
             self.declined.remove(&net.name(q.client).to_lowercase());
         }
-        self.start_match(net, h.seated, h.room);
+        if net.is_served(&h.room) {
+            self.running.insert(h.key.clone(), h.room.clone());
+        }
+        self.start_match(net, h.seated, h.room, true);
     }
 
     /// The game is no longer waiting: its seated players wait again (at the front).
@@ -361,6 +516,7 @@ impl Casino {
     pub fn game_over(&mut self, net: &mut Net, key: &str) {
         self.running.remove(key);
         self.dropped.remove(key);
+        self.arriving.retain(|_, k| k != key);
         if self.hosted.iter().any(|h| h.key == key) {
             self.remove_hosted(key);
             self.matchmake(net);
@@ -382,22 +538,34 @@ impl Casino {
         }
     }
 
-    /// The running hosted match this player dropped out of, if they may still go back.
-    fn rejoin_room(&mut self, now: u64, name: &str) -> Option<String> {
+    /// The running hosted match this player dropped out of, if they may still go back. While its
+    /// host's link is coming back (the room unserved for a few seconds) the way back is kept, so
+    /// a player may have two (they played another match meanwhile): the one they dropped out of
+    /// last.
+    fn rejoin_room(&mut self, net: &Net, name: &str) -> Option<String> {
         let name = name.to_lowercase();
+        let mut last: Option<(u64, String)> = None;
         for (key, names) in self.dropped.iter_mut() {
-            let Some(t) = names.remove(&name) else { continue };
-            let in_time = self.rejoin_ms.is_none_or(|ms| now.saturating_sub(t) <= ms);
-            if let (true, Some(room)) = (in_time, self.running.get(key)) {
-                return Some(room.clone());
+            let Some(&t) = names.get(&name) else { continue };
+            let over = !self.running.contains_key(key);
+            if over || self.rejoin_ms.is_some_and(|ms| net.now.saturating_sub(t) > ms) {
+                names.remove(&name);
+                continue;
+            }
+            if net.is_served(&self.running[key]) && last.as_ref().is_none_or(|(lt, lk)| (t, key) > (*lt, lk)) {
+                last = Some((t, key.clone()));
             }
         }
-        None
+        let (_, key) = last?;
+        self.dropped.get_mut(&key)?.remove(&name);
+        self.running.get(&key).cloned()
     }
 
     /// Has the player left this hosted game with Back (lately)?
     fn declined(&self, net: &Net, c: ClientId, key: &str) -> bool {
-        self.declined.get(&net.name(c).to_lowercase()).is_some_and(|(keys, _)| keys.iter().any(|k| k == key))
+        self.declined
+            .get(&net.name(c).to_lowercase())
+            .is_some_and(|(keys, t)| net.now < t + DECLINE_MS && keys.iter().any(|k| k == key))
     }
 
     /// The hosted game a waiting player gets: their own network's, else the newest; not one they
@@ -407,7 +575,7 @@ impl Casino {
         if free.is_empty() {
             return None;
         }
-        let free: Vec<usize> = free.into_iter().filter(|&i| !self.was_kicked(net, c, &self.hosted[i].key)).collect();
+        let free: Vec<usize> = free.into_iter().filter(|&i| !self.was_kicked(net, c, &self.hosted[i])).collect();
         let mut open: Vec<usize> = free.iter().copied().filter(|&i| !self.declined(net, c, &self.hosted[i].key)).collect();
         if open.is_empty() {
             // seen them all: round again
@@ -423,35 +591,44 @@ impl Casino {
     /// games' players in the game `pick` gives them. Players who choose pick a game themselves.
     fn place(&mut self, net: &Net) {
         let now = net.now;
-        self.declined.retain(|_, (_, t)| now.saturating_sub(*t) < DECLINE_MS);
+        self.declined.retain(|_, (_, t)| now < *t + DECLINE_MS);
         for k in self.kicked.values_mut() {
-            k.retain(|(_, t)| now.saturating_sub(*t) < DECLINE_MS);
+            k.retain(|k| now < k.at + DECLINE_MS);
         }
         self.kicked.retain(|_, k| !k.is_empty());
-        let waiting: Vec<(Waiting, Option<usize>)> = self
-            .queue
-            .iter()
-            .map(|&q| (q, None))
-            .chain(self.hosted.iter().enumerate().flat_map(|(i, h)| h.seated.iter().map(move |&q| (q, Some(i)))))
-            .collect();
-        for (q, at) in waiting {
-            let addr = net.addr(q.client);
-            if at.is_some_and(|i| same_network(self.hosted[i].addr, addr)) || (at.is_some() && net.picks(q.client)) {
-                continue;
-            }
-            let home = (0..self.hosted.len()).rev().find(|&i| {
-                let h = &self.hosted[i];
-                h.seated.len() < h.players
-                    && same_network(h.addr, addr)
-                    && !self.declined(net, q.client, &h.key)
-                    && !self.was_kicked(net, q.client, &h.key)
-            });
-            if let Some(j) = home {
-                match at {
-                    Some(i) => self.hosted[i].seated.retain(|o| o.client != q.client),
-                    None => self.queue.retain(|o| o.client != q.client),
+        let kicks = self.kicked.values().flatten().map(|k| k.at);
+        self.next_expiry = kicks.chain(self.declined.values().map(|(_, t)| *t)).min().map(|t| t + DECLINE_MS);
+        // until nothing moves: a player going home frees a seat that may be someone else's home
+        // (each player moves home at most once)
+        let mut moved = true;
+        while moved {
+            moved = false;
+            let waiting: Vec<(Waiting, Option<usize>)> = self
+                .queue
+                .iter()
+                .map(|&q| (q, None))
+                .chain(self.hosted.iter().enumerate().flat_map(|(i, h)| h.seated.iter().map(move |&q| (q, Some(i)))))
+                .collect();
+            for (q, at) in waiting {
+                let addr = net.addr(q.client);
+                if at.is_some_and(|i| same_network(self.hosted[i].addr, addr)) || (at.is_some() && net.picks(q.client)) {
+                    continue;
                 }
-                self.hosted[j].seated.push(q);
+                let home = (0..self.hosted.len()).rev().find(|&i| {
+                    let h = &self.hosted[i];
+                    h.seated.len() < h.players
+                        && same_network(h.addr, addr)
+                        && !self.declined(net, q.client, &h.key)
+                        && !self.was_kicked(net, q.client, h)
+                });
+                if let Some(j) = home {
+                    match at {
+                        Some(i) => self.hosted[i].seated.retain(|o| o.client != q.client),
+                        None => self.queue.retain(|o| o.client != q.client),
+                    }
+                    self.hosted[j].seated.push(q);
+                    moved = true;
+                }
             }
         }
         let mut i = 0;
@@ -487,7 +664,7 @@ impl Casino {
                 }
                 let room = format!("QM_{}", self.next_table);
                 self.next_table += 1;
-                self.start_match(net, group, room);
+                self.start_match(net, group, room, false);
             }
         }
         self.refresh(net);
@@ -516,8 +693,9 @@ impl Casino {
     }
 
     /// The games a choosing player is offered: `[list id, host, hero index or -1, seated,
-    /// seats, same network (0/1), the host starts it (0/1)]`, their own network's first, then the newest; and the list id
-    /// of the game they sit in (0: none).
+    /// seats, same network (0/1), the host starts it (0/1)]`, their own network's first, then the
+    /// newest, and always the one they sit in (the client finds its seat among these); and the list
+    /// id of the game they sit in (0: none).
     fn games_for(&self, net: &Net, c: ClientId) -> (Vec<Value>, u32) {
         let addr = net.addr(c);
         let seat = self.hosted.iter().find(|h| h.seated.iter().any(|q| q.client == c)).map_or(0, |h| h.list_id);
@@ -525,9 +703,14 @@ impl Casino {
             .hosted
             .iter()
             .rev()
-            .filter(|h| h.list_id == seat || (h.seated.len() < h.players && !self.was_kicked(net, c, &h.key)))
+            .filter(|h| h.list_id == seat || (h.seated.len() < h.players && !self.was_kicked(net, c, h)))
             .collect();
         games.sort_by_key(|h| !same_network(h.addr, addr)); // stable: newest first within
+        if let Some(p) = games.iter().position(|h| h.list_id == seat).filter(|&p| p >= GAMES_MAX) {
+            let own = games.remove(p);
+            games.truncate(GAMES_MAX - 1);
+            games.push(own); // it sorts after all the others shown
+        }
         let games = games
             .into_iter()
             .take(GAMES_MAX)
@@ -591,7 +774,9 @@ impl Casino {
     /// 2. REQUEST LOCK_PLAYER_IN_GAME (casino-system channel) -> "Game starting"; the client
     ///    answers with a RESPONSE;
     /// 3. once all have answered (or after a timeout), EVENT CASINO_MATCHED_UP with the room.
-    fn start_match(&mut self, net: &Net, group: Vec<Waiting>, room: String) {
+    ///
+    /// `hosted`: a hosted game's room (its host's engine serves it).
+    fn start_match(&mut self, net: &Net, group: Vec<Waiting>, room: String, hosted: bool) {
         let names: Vec<&str> = group.iter().map(|q| net.name(q.client)).collect();
         net.log(&format!("casino: matched {} -> {room}", names.join(", ")));
         for q in &group {
@@ -607,18 +792,13 @@ impl Casino {
                 w.u32(0);
             });
         }
-        self.matches.push(Match {
-            group,
-            room,
-            locked: HashSet::new(),
-            deadline: net.now + LOCK_TIMEOUT_MS,
-            done: false,
-        });
+        let size = group.len();
+        self.matches.push(Match { group, room, size, hosted, locked: HashSet::new(), deadline: net.now + LOCK_TIMEOUT_MS });
     }
 
     /// A player acknowledged LOCK_PLAYER_IN_GAME.
     fn locked(&mut self, net: &mut Net, c: ClientId) {
-        let Some(i) = self.matches.iter().rposition(|m| !m.done && m.group.iter().any(|q| q.client == c)) else {
+        let Some(i) = self.matches.iter().rposition(|m| m.group.iter().any(|q| q.client == c)) else {
             return;
         };
         let m = &mut self.matches[i];
@@ -628,21 +808,36 @@ impl Casino {
         }
     }
 
-    /// Tells each player of a locked group the game room to move to.
+    /// Tells each player of a locked group the game room to move to. A hosted room whose host
+    /// left meanwhile would never start: its players are disconnected instead (their game then
+    /// says so), and remembered in case the host's link comes back.
     fn matched_up(&mut self, net: &mut Net, i: usize) {
         let m = self.matches.remove(i);
         let group: Vec<Waiting> = m.group.into_iter().filter(|q| self.players.contains_key(&q.client)).collect();
         let room = m.room;
-        net.expect_room(&room, group.len());
+        let key = room.to_lowercase();
+        if m.hosted && !net.is_served(&room) {
+            net.log(&format!("casino: the host of {room} is gone: its players are sent away"));
+            for q in &group {
+                let name = net.name(q.client).to_string();
+                self.dropped_out(net, &key, &name);
+                net.close_later(q.client, 4003, "host gone");
+            }
+            return;
+        }
+        net.expect_room(&room, m.size);
         if net.is_served(&room) {
-            self.running.insert(room.to_lowercase(), room.clone());
+            self.running.insert(key.clone(), room.clone());
         }
         for (i, q) in group.iter().enumerate() {
+            if m.hosted {
+                self.arriving.insert(q.client, key.clone());
+            }
             let b = format!("naf://rg.com:80/{room}?hosted={}", if i == 0 { "yes" } else { "no" });
             reply(net, q.client, EVENT, 31, q.ch, |w| {
                 // casino name, table: [string room][string address][u8][u8][u32 players][settings]
                 // settings: [u8 kind=0][u8][string address][u8]
-                w.str(MATCHMAKER_NAME).str(&room).str(&b).u8(0).u8(1).u32(group.len() as u32);
+                w.str(MATCHMAKER_NAME).str(&room).str(&b).u8(0).u8(1).u32(m.size as u32);
                 w.u8(0).u8(0).str(&b).u8(0);
             });
         }
@@ -651,6 +846,9 @@ impl Casino {
     pub fn tick(&mut self, net: &mut Net) {
         while let Some(i) = self.matches.iter().position(|m| net.now >= m.deadline) {
             self.matched_up(net, i);
+        }
+        if self.next_expiry.is_some_and(|t| net.now >= t) {
+            self.matchmake(net); // a kick or Back ran out: that game is offered (seated) again
         }
         if let Some(t) = self.next_keepalive {
             if net.now >= t {
@@ -752,14 +950,17 @@ impl Casino {
                     p.random = Some(flag);
                 }
                 self.withdraw(c);
+                self.left_launch(net, c); // asked again before getting there: the way back below
                 let name = net.name(c).to_string();
-                if let Some(back) = self.rejoin_room(net.now, &name) {
+                if let Some(back) = self.rejoin_room(net, &name) {
                     respond(net, c, 9, 0, ch, |w| {
                         w.u8(0);
                     });
                     net.log(&format!("casino: {name} rejoins {back}"));
-                    self.start_match(net, vec![Waiting { client: c, ch }], back);
-                    self.refresh(net);
+                    self.start_match(net, vec![Waiting { client: c, ch }], back, true);
+                    // the seat they leave (they waited there while their match's host was away)
+                    // may be someone else's
+                    self.matchmake(net);
                     return Ok(());
                 }
                 // seated first, so the answer lists the game they are in (the screen it opens
@@ -778,7 +979,9 @@ impl Casino {
             }
             10 => {
                 // CASINO_CANCEL_MATCHMAKING (Back on the "Players in Match" screen): next time
-                // the player gets another game, if there is one
+                // the player gets another game, if there is one. Back that crosses the host's
+                // start comes too late: that match is theirs (not sent there now, a way back).
+                self.left_launch(net, c);
                 if let Some(key) = self.withdraw(c).filter(|k| !k.is_empty() && !net.picks(c)) {
                     let d = self.declined.entry(net.name(c).to_lowercase()).or_default();
                     if !d.0.contains(&key) {
@@ -826,6 +1029,11 @@ mod tests {
         assert!(same_network(ip("127.0.0.1"), ip("192.168.0.59")));
         assert!(same_network(ip("10.0.0.2"), ip("fe80::1")));
         assert!(!same_network(ip("127.0.0.1"), ip("81.2.3.4")));
+        // Tailscale (100.64.0.0/10) on a LAN relay
+        assert!(same_network(ip("127.0.0.1"), ip("100.101.102.103")));
+        assert!(same_network(ip("100.64.0.1"), ip("100.127.255.254")));
+        assert!(!same_network(ip("127.0.0.1"), ip("100.128.0.1")));
+        assert!(!same_network(ip("127.0.0.1"), ip("100.63.255.255")));
     }
 
     #[test]

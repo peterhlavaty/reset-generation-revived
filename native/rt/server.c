@@ -12,14 +12,21 @@
  * The host's engine is the game server and player 0, like the original LAN mode.
  *
  * F5 (rg_key) or rg_host_request() opens a player-count picker drawn over the game
- * (rg_server_compose), then the engine's own hero select, then the LAN host screen. The relay
- * seats the players who pick this game; a panel shows who sat down and the host starts the game
- * (or removes a player) there: "seats", "start" and "kick" (server/src/casino.rs). Everything
- * engine-facing runs on the game thread (rg_server_pump before each tick, and the stubs and hooks
- * the engine calls); the relay socket has a thread that only queues events (in the browser build
- * the same work is polled from rg_server_pump).
+ * (rg_server_compose), then the engine's own hero select, then the LAN host screen; only from the
+ * main menu (rg_host_can_start). The relay seats the players who pick this game; a panel shows
+ * who sat down and the host starts the game (or removes a player) there: "seats", "start" and
+ * "kick" (server/src/casino.rs). Back/Esc stops hosting until the match runs (stop_hosting).
+ * Everything engine-facing runs on the game thread (rg_server_pump before each tick, and the stubs
+ * and hooks the engine calls); the relay socket has a thread that only queues events (in the
+ * browser build the same work is polled from rg_server_pump).
+ *
+ * Each hosted game is HOST_<nick>_<random n> with a random key: a room name that is taken gets a
+ * new n, and the key lets this host (and only it) take its room back after its link came back.
  *
  * Test mode (rgtest --server URL ROOM): hosts by itself once the menu is up. */
+#ifdef _WIN32
+#define _CRT_RAND_S                      /* rand_s (stdlib.h): see host_random */
+#endif
 #include "server.h"
 #include "engine.h"
 #include "host.h"
@@ -39,11 +46,16 @@
 #define HOST_AFTER_FRAMES 300      /* test mode: the intro is skipped by then (keys) */
 #define HOLD_MS 0                  /* how long a dropped player's seat is held, ms (0: until the match ends) */
 #define AWT_F5 116
+#define AWT_ESCAPE 27
+#define AWT_BACK_SPACE 8                 /* Android's Back arrives as Escape */
+#define MAIN_MENU_VT 0x10181698u         /* the main menu's vtable (constructor 0x1008f500) */
+#define SCREENS_VT 0x1017ad24u           /* the screen stack's (one object, built at start-up) */
 
 static int test_mode, test_players = 2;
 static uint32_t menu_base;               /* the main menu flow object (constructor 0x1008f500) */
 static char url[256], room[72], test_room[72];
-static int remote_players, games;
+static char host_key[17];                /* 16 hex digits, new for each hosted game */
+static int remote_players;
 static int hosting;                      /* hosted at least once: the relay link stays up */
 static volatile int serving;             /* until the engine closes our listener (l_close) */
 static int picking;                      /* the host's hero select is up */
@@ -51,6 +63,53 @@ static int picker, picker_default = 2, hero_default = -2, swallow_key, match_sta
 static uint32_t host_hero = 0xffffffffu; /* 0..9 = that hero, anything else = random */
 static uint32_t host_name;               /* guest string: the host's nickname */
 static char status[160];
+static int serve_sent, served;           /* serve sent on this link / the relay answered "serving" */
+static uint32_t reserve_at;              /* when to send serve again (a refused room), 0 = not */
+static int stopping;                     /* Back/Esc stopped this hosted game (the host screen is to leave) */
+static int user_stopped;                 /* the player ended the last hosting before its match (Back/Esc) */
+static uint32_t stop_since, host_acc;    /* host_acc: the LAN host screen's acceptor (0 = none) */
+
+/* ------------------------------------------------------------------ randomness */
+/* Room numbers, the hosting key and a random host hero come from the host, never from the
+ * engine's RNG (which must stay as it is for the oracle). They must differ between games,
+ * processes and devices: a room name that comes again is refused ("taken"), and the key is what
+ * lets only this host take its room back. rand_s / /dev/urandom where there are, mixed with the
+ * clocks and an address (ASLR), so even the browser build's numbers differ. */
+static uint64_t mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+static uint64_t host_random(void) {
+    static uint64_t state;
+    uint64_t e = (uint64_t)time(NULL) << 20 ^ host_time_ms() ^ (uint64_t)(uintptr_t)&e << 7;
+#ifdef _WIN32
+    unsigned int r0 = 0, r1 = 0;
+    rand_s(&r0);
+    rand_s(&r1);
+    e ^= (uint64_t)r0 << 32 ^ r1;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) e ^= (uint64_t)ts.tv_sec << 30 ^ (uint64_t)ts.tv_nsec;
+    static uint64_t urandom;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) { if (fread(&urandom, sizeof urandom, 1, f) != 1) urandom = 0; fclose(f); }
+    }
+    e ^= urandom;
+#endif
+    state = mix64(state + 0x9e3779b97f4a7c15ull + mix64(e));
+    return state;
+}
+
+/* HOST_<nick>_<n>: a random n (1..999999), so that a host who restarts, a second host with the
+ * same nickname or a stranger who guesses do not get the same name (the relay refuses a name it
+ * serves) */
+static void pick_room_name(void) {
+    snprintf(room, sizeof room, "HOST_%s_%u", net_nickname(), 1u + (unsigned)(host_random() % 999999u));
+}
 
 static uint32_t eng_new(uint32_t n) {
     uint32_t a[1] = {n}, p = rt_guest_call(0x1014f476, 1, a);   /* the engine's operator new */
@@ -64,7 +123,7 @@ static uint32_t tcall(uint32_t fn, uint32_t self, int n, uint32_t a0, uint32_t a
 
 /* ------------------------------------------------------------------ relay link (WebSocket) */
 typedef struct ev { struct ev *next; int kind, pid, len; uint8_t data[]; } ev;
-enum { EV_JOIN, EV_LEAVE, EV_LOST, EV_DATA, EV_CLOSED, EV_SEATS };
+enum { EV_JOIN, EV_LEAVE, EV_LOST, EV_DATA, EV_CLOSED, EV_SEATS, EV_UP, EV_SERVING, EV_TAKEN };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER, send_lock = PTHREAD_MUTEX_INITIALIZER;
 static ev *ev_head, *ev_tail;
@@ -118,14 +177,28 @@ static int json_int(const char *j, const char *key, int dflt) {
     return p ? atoi(p + strlen(pat)) : dflt;
 }
 
+/* Game thread. key: this hosted game's (the relay gives a room back to a new link with the same
+ * key). A running match is served again without "players": that is what lists a game as waiting
+ * (on relays of every version); "running" tells a newer relay that its players were in a match. */
+static int held_names(char *out, size_t n);
 static void send_serve(void) {
-    /* name and hero: the joiners' lists show whose game it is; approve: the host starts it (not
-     * in test mode: rgtest hosts start by themselves) */
-    char json[256];
-    snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"players\":%d,\"name\":\"%s\",\"hero\":%d,\"approve\":%s}",
-             room, remote_players, net_nickname(), host_hero <= 9 ? (int)host_hero : -1, test_mode ? "false" : "true");
-    ws_send(1, json, strlen(json));
-    host_log("host: offering room %s on %s for %d remote player(s)", room, url, remote_players);
+    char json[384];
+    if (match_started) {
+        /* held: whose seats we keep (a relay that restarted knows nothing of them, and can send
+         * them back here when they come by Quick Match) */
+        char names[160];
+        held_names(names, sizeof names);
+        snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"key\":\"%s\",\"running\":true,\"held\":[%s]}", room, host_key, names);
+        host_log("host: serving room %s on %s again (match running; held: %s)", room, url, names[0] ? names : "none");
+    } else {
+        /* name and hero: the joiners' lists show whose game it is; approve: the host starts it
+         * (not in test mode: rgtest hosts start by themselves) */
+        snprintf(json, sizeof json, "{\"t\":\"serve\",\"room\":\"%s\",\"key\":\"%s\",\"players\":%d,\"name\":\"%s\",\"hero\":%d,\"approve\":%s}",
+                 room, host_key, remote_players, net_nickname(), host_hero <= 9 ? (int)host_hero : -1, test_mode ? "false" : "true");
+        host_log("host: offering room %s on %s for %d remote player(s)", room, url, remote_players);
+    }
+    serve_sent = ws_send(1, json, strlen(json));
+    served = 0;
 }
 
 /* a frame from the relay (op 1 text, 2 binary; msg NUL-terminated) */
@@ -141,23 +214,35 @@ static void on_relay_frame(int op, const uint8_t *msg, size_t len) {
             push_ev(json_int((const char *)msg, "lost", 0) ? EV_LOST : EV_LEAVE, json_int((const char *)msg, "pid", -1), NULL, 0);
         } else if (!strcmp(t, "seats")) {
             push_ev(EV_SEATS, 0, msg, (int)len + 1);
-        } else if (!strcmp(t, "error")) host_log("host: relay error %s", (const char *)msg);
-        else if (getenv("RT_NET_DEBUG")) host_log("host: relay %s", (const char *)msg);
+        } else if (!strcmp(t, "serving")) {
+            char r[72];
+            json_str((const char *)msg, "room", r, sizeof r);
+            push_ev(EV_SERVING, 0, r, (int)strlen(r) + 1);
+        } else if (!strcmp(t, "error")) {
+            char op[16], code[24], r[72];
+            host_log("host: relay error %s", (const char *)msg);
+            json_str((const char *)msg, "op", op, sizeof op);
+            json_str((const char *)msg, "code", code, sizeof code);
+            json_str((const char *)msg, "room", r, sizeof r);
+            if (!strcmp(op, "serve") && !strcmp(code, "taken")) push_ev(EV_TAKEN, 0, r, (int)strlen(r) + 1);
+        } else if (getenv("RT_NET_DEBUG")) host_log("host: relay %s", (const char *)msg);
     } else if (len >= 2) {
         push_ev(EV_DATA, msg[0] | msg[1] << 8, msg + 2, (int)len - 2);
     }
 }
 
-/* the link is open: it becomes `ws` (with a reference of its own) and we introduce ourselves */
+/* the link is open: we introduce ourselves before anything else can go out on it, then it becomes
+ * `ws` (with a reference of its own); the game thread serves the room again (EV_UP) */
 static void link_up(rt_link *l) {
+    static const char hello[] = "{\"t\":\"hello\",\"v\":1,\"name\":\"RGHost\"}";
+    link_send(l, 1, hello, sizeof hello - 1);
     link_ref(l);
     pthread_mutex_lock(&send_lock);
     ws = l;
     ws_up = 1;
     pthread_mutex_unlock(&send_lock);
     connecting = 0;
-    ws_send(1, "{\"t\":\"hello\",\"v\":1,\"name\":\"RGHost\"}", 35);
-    if (serving) send_serve();
+    push_ev(EV_UP, 0, NULL, 0);
 }
 
 /* the link ended: the reader's reference goes, and the game thread closes `ws` (EV_CLOSED) */
@@ -247,9 +332,13 @@ static uint32_t srv_ctrl;                /* the engine's server controller (pend
 static int force_key, drop_join_key, rejoin_off;
 
 static sess_t *by_pid(int pid) {
-    sess_t *r = NULL;                    /* the newest session with this pid */
-    for (int i = 0; i < nsess; i++) if (sess[i].used && sess[i].pid == pid) r = &sess[i];
-    return r;
+    sess_t *r = NULL, *live = NULL;      /* the newest session with this pid; the newest one in the game */
+    for (int i = 0; i < nsess; i++) {
+        if (!sess[i].used || sess[i].pid != pid) continue;
+        r = &sess[i];
+        if (!sess[i].closed && !sess[i].away) live = r;
+    }
+    return live ? live : r;
 }
 static sess_t *sess_of(uint32_t obj) { uint32_t i = LD32(obj + 4); return i < (uint32_t)nsess ? &sess[i] : NULL; }
 
@@ -284,6 +373,8 @@ static void take_over(sess_t *s) {
     s->heir_of = 0;
     host_log("host: player %d (%s) is back in the match (was player %d)", s->pid, s->name, old->pid);
     free_queue(old);
+    for (int i = 0; i < nsess; i++)      /* an older game's session with that relay pid is not it */
+        if (&sess[i] != old && &sess[i] != s && sess[i].pid == s->pid) sess[i].pid = -1;
     old->pid = s->pid;
     old->away = 0;
     old->in_head = s->in_head;           /* anything the new connection sent after its handshake */
@@ -309,7 +400,7 @@ static void track_seats(void) {
             s->checked = 1;
             for (int j = 0; j < nsess; j++) {
                 sess_t *o = &sess[j];
-                if (o != s && o->used && o->away && o->key > 0 && o->slot > 0 && !strcasecmp(o->name, s->name)) {
+                if (o != s && o->used && !o->closed && o->away && o->key > 0 && o->slot > 0 && !strcasecmp(o->name, s->name)) {
                     o->away_since = now;         /* do not give the seat up during the handshake */
                     s->heir_of = j + 1;
                     ST32(ent + 0x10, (uint32_t)o->slot);
@@ -338,6 +429,21 @@ static int match_live(void) {
     for (int i = 0; i < nsess; i++) if (sess[i].used && sess[i].accepted && !sess[i].closed) return 1;
     return 0;
 }
+/* "A","B": the players of this match whose seats are held (send_serve); returns how many */
+static int held_names(char *out, size_t n) {
+    int k = 0;
+    size_t len = 0;
+    out[0] = 0;
+    for (int i = 0; i < nsess; i++) {
+        sess_t *s = &sess[i];
+        if (!s->used || s->closed || !s->away || s->key <= 0 || !s->name[0] || strchr(s->name, '"') || strchr(s->name, '\\')) continue;
+        int w = snprintf(out + len, n - len, "%s\"%s\"", k ? "," : "", s->name);
+        if (w < 0 || (size_t)w >= n - len) { out[len] = 0; break; }   /* the ones that fit */
+        len += (size_t)w;
+        k++;
+    }
+    return k;
+}
 
 /* ------------------------------------------------------------------ guest objects (MT transport) */
 static uint32_t listener_obj, conn_vt, addr_vt, hs_vt, hs_str;
@@ -346,14 +452,17 @@ static uint32_t listener_obj, conn_vt, addr_vt, hs_vt, hs_str;
 #define MAX_SEATS 3
 static char seat_name[MAX_SEATS][32];    /* the players seated in our waiting game (relay "seats") */
 static int nseated, start_sel, starting;
-static uint32_t starting_since;
-static uint8_t held[256];                /* keys whose press the panel took: their release too */
+static uint8_t held[256];                /* keys whose press the panel or the picker took: their release too */
 
 static void seats_clear(void) { nseated = 0; start_sel = 0; starting = 0; }
 
-/* {"t":"seats","room":"..","names":["Pia","Quinn"],"of":2} */
+/* {"t":"seats","room":"..","names":["Pia","Quinn"],"of":2}. The selection stays on the player it
+ * was on (when they leave, on START): OK must never remove someone the host did not choose. A
+ * "seats" after START means the relay lists the game again (the start did not happen). */
 static void seats_update(const char *j) {
     const char *p = strstr(j, "\"names\":[");
+    char chosen[32] = "";
+    if (start_sel > 0 && start_sel <= nseated) snprintf(chosen, sizeof chosen, "%s", seat_name[start_sel - 1]);
     nseated = 0;
     starting = 0;
     if (p) {
@@ -369,30 +478,32 @@ static void seats_update(const char *j) {
             if (*p == ',') p++;
         }
     }
-    if (start_sel > nseated) start_sel = nseated;
+    start_sel = 0;
+    for (int i = 0; chosen[0] && i < nseated; i++)
+        if (!strcmp(seat_name[i], chosen)) start_sel = i + 1;
     host_log("host: %d of %d player(s) seated", nseated, remote_players);
 }
 
-static int start_panel(void) { return serving && !match_started && nseated > 0; }
+/* the panel: while players sit down, and after START until the match runs (STARTING) */
+static int start_panel(void) { return serving && !match_started && (nseated > 0 || starting); }
 
-/* Up/Down choose, OK starts the game (all seats taken) or removes that player */
+/* Up/Down choose, OK starts the game (all seats taken) or removes that player. After START the
+ * relay no longer lists the game and ignores both, so the panel offers neither until the match
+ * runs or the relay lists the game again ("seats"); Back/Esc stops hosting (rg_server_key). */
 static int start_panel_key(int k) {
     if (k != 38 && k != 40 && k != 10 && k != 32 && k != 17) return 0;
-    if (starting) return 1;
+    if (starting || stopping) return 1;  /* stopping: the host screen leaves in a moment */
     if (k == 38 && start_sel > 0) start_sel--;
     else if (k == 40 && start_sel < nseated) start_sel++;
     else if (k != 38 && k != 40 && start_sel == 0) {
-        if (nseated >= remote_players) {
-            ws_send(1, "{\"t\":\"start\"}", 13);
+        if (nseated >= remote_players && ws_send(1, "{\"t\":\"start\"}", 13)) {
             starting = 1;
-            starting_since = host_time_ms();
             host_log("host: starting the game");
         }
     } else if (k != 38 && k != 40) {
         char json[96];
         snprintf(json, sizeof json, "{\"t\":\"kick\",\"name\":\"%s\"}", seat_name[start_sel - 1]);
-        ws_send(1, json, strlen(json));
-        host_log("host: removing %s from the game", seat_name[start_sel - 1]);
+        if (ws_send(1, json, strlen(json))) host_log("host: removing %s from the game", seat_name[start_sel - 1]);
         start_sel = 0;
     }
     return 1;
@@ -411,14 +522,19 @@ static uint32_t make_vtable(const char *name, int slots) {
     return vt;
 }
 
-/* acceptor (0x100df500): setController(controller) -> our listener instead of tcp://:12345 */
+/* acceptor (0x100df500): setController(controller) -> our listener instead of tcp://:12345.
+ * +0x18 is "listening": the LAN host screen's update (0x100ca8d0) leaves for the main menu once it
+ * is 0, and its exit deletes the acceptor, which closes the listener (l_close). That is how
+ * Back/Esc stops hosting (the screen itself ignores every key): stop_hosting, or here when the key
+ * came before the screen was up. */
 static void acc_set_controller(int arg) {
     (void)arg;
     uint32_t acc = cpu.r[ECX], ctrl = rt_arg(0);
     ST32(acc + 4, ctrl);
     ST32(acc + 8, listener_obj);
-    ST8(acc + 0x18, 1);
+    ST8(acc + 0x18, stopping ? 0 : 1);
     srv_ctrl = ctrl;
+    host_acc = acc;
     host_log("host: controller %08x attached to the acceptor %08x", ctrl, acc);
     rt_ret(1, 1);
 }
@@ -427,7 +543,7 @@ static void l_accept(int arg) {
     (void)arg;
     for (int i = 0; i < nsess; i++) {
         sess_t *s = &sess[i];
-        if (s->used && !s->accepted) {
+        if (s->used && !s->accepted && !s->closed) {     /* not one who already left again */
             s->accepted = 1;
             s->obj = rt_heap_alloc(0x400);
             memset(M + s->obj, 0, 0x400);
@@ -440,15 +556,29 @@ static void l_accept(int arg) {
     }
     rt_ret(0, 0);
 }
-/* The engine's game server is gone (match over, or the host left the host screen): the relay must
- * stop sending Quick Match players to this room. */
+/* A game's players are out of it: none of them is held for a rejoin any more. */
+static void close_sessions(void) {
+    for (int i = 0; i < nsess; i++) {
+        if (!sess[i].used) continue;
+        sess[i].closed = 1;
+        sess[i].away = 0;
+        sess[i].heir_of = 0;
+    }
+}
+/* The hosted game is over: the relay must stop sending Quick Match players to this room. */
+static void end_serving(void) {
+    serving = 0;
+    host_acc = 0;
+    reserve_at = 0;
+    seats_clear();
+    close_sessions();                    /* that game's players */
+    ws_send(1, "{\"t\":\"unserve\"}", 15);
+}
+/* The engine's game server is gone (match over, or the host left the host screen). */
 static void l_close(int arg) {
     (void)arg;
     host_log("host: listener closed");
-    serving = 0;
-    seats_clear();
-    for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;   /* that game's players */
-    ws_send(1, "{\"t\":\"unserve\"}", 15);
+    end_serving();
     rt_ret(0, 0);
 }
 
@@ -604,9 +734,12 @@ static int hook_member_clear(void) {
 }
 
 /* ------------------------------------------------------------------ the host's hero and name */
-/* LAN host entry (0x100ca920): at 0x100ca9d9 (mov ebp,edx) EDX is the host's random hero */
+/* LAN host entry (0x100ca920): at 0x100ca9d9 (mov ebp,edx) EDX is the host's random hero, rolled
+ * with a generator seeded from the clock that came out the same game after game: a random hero
+ * is the host's own roll (test mode keeps the engine's, its runs stay repeatable) */
 static int hook_host_hero(void) {
     if (host_hero <= 9) cpu.r[EDX] = host_hero;
+    else if (serving && !test_mode) cpu.r[EDX] = (uint32_t)(host_random() % 10);
     return 0;
 }
 /* at 0x100caa30 EDI is the host's player setup (+0 name string): give it the nickname */
@@ -620,7 +753,44 @@ static int hook_host_name(void) {
 }
 
 /* ------------------------------------------------------------------ hosting */
+/* The screen on top (the screen stack: +4 current, +8 next). The stack is taken from a main menu
+ * that is still alive (its vtable; menu_base is the newest one, an older one may be deleted), and
+ * kept: it is built once at start-up. */
+static uint32_t screens;
+static int screens_unknown;              /* an engine whose screen stack differs: not checked */
+static uint32_t current_screen(void) {
+    if (menu_base && LD32(menu_base) == MAIN_MENU_VT) {
+        uint32_t s = LD32(menu_base + 0x10);
+        if (s && LD32(s) == SCREENS_VT) screens = s;
+        else if (!screens && !screens_unknown) {
+            screens_unknown = 1;
+            host_log("host: the engine's screen stack differs; hosting is not limited to the main menu");
+        }
+    }
+    return screens ? LD32(screens + 4) : 0;
+}
+/* Hosting starts only here: elsewhere the hero select and the host screen would be queued on a
+ * main menu that is not running (and come up much later, or never), and the picker would take the
+ * keys of whatever is on screen. Not while logged in online either (the Online menus). */
+static int menu_current(void) {
+    if (!menu_base || LD32(menu_base) != MAIN_MENU_VT) return 0;
+    uint32_t cur = current_screen();
+    return screens ? cur == menu_base : screens_unknown;
+}
+static int can_host_here(void) { return menu_current() && !net_is_logged_in(); }
+
 static void set_screen(uint32_t screen) { tcall(LD32(LD32(menu_base) + 0x14), menu_base, 1, screen, 0, 0); }
+
+/* Back/Esc while the game waits for its players (host screen, panel, STARTING): see
+ * acc_set_controller. The engine then closes the listener and l_close unserves the room. */
+static void stop_hosting(void) {
+    if (stopping) return;
+    host_log("host: hosting stopped (Back/Esc)");
+    stopping = 1;
+    user_stopped = 1;                        /* if the host screen is not up yet, it leaves at once */
+    stop_since = host_time_ms();
+    if (host_acc) ST8(host_acc + 0x18, 0);
+}
 
 /* What the menus would do for "host a LAN game": build the LAN host screen (a hero list whose
  * length selects the mission and the player count). */
@@ -638,11 +808,16 @@ static uint32_t build_host_screen(int players) {
 }
 
 static void start_serving(void) {
-    for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;    /* a previous game's players */
+    close_sessions();                    /* a previous game's players */
     serving = 1;
     match_started = 0;
+    stopping = 0;
+    host_acc = 0;
+    reserve_at = 0;
+    serve_sent = served = 0;
     seats_clear();
-    if (hosting && ws_up) send_serve();   /* hosting again on the open relay connection */
+    snprintf(host_key, sizeof host_key, "%016llx", (unsigned long long)host_random());
+    if (ws_up) send_serve();              /* hosting again on the open relay connection (else EV_UP) */
     hosting = 1;
 }
 
@@ -650,6 +825,7 @@ static void start_serving(void) {
  * (ctx, std::string *out, bool popOnSelect), 0xb8 bytes) with a private copy of its 13-slot vtable
  * (0x101888e0): onSelect (slot 11, 0x100dc7e0) and onBack (slot 12, 0x100dbfc0) run here. */
 static int hs_done, pick_players;
+static uint32_t hs_obj, hs_seen;          /* the hero select, and when it was last on top */
 static void hs_on_select(int arg) {
     (void)arg;
     uint32_t self = cpu.r[ECX];
@@ -671,6 +847,7 @@ static void hs_on_back(int arg) {
     if (!hs_done) {
         hs_done = 1;
         picking = 0;
+        user_stopped = 1;
         host_log("host: hosting cancelled");
         tcall(0x100dbfc0, self, 0, 0, 0, 0);                       /* back to the menu */
     }
@@ -686,19 +863,23 @@ static void show_hero_select(int players) {
     hs_done = 0;
     pick_players = players;
     picking = 1;
+    hs_obj = hs;
+    hs_seen = host_time_ms();
     set_screen(hs);
     host_log("host: hero select %08x", hs);
 }
 
-/* hero: 0..9 = that hero, -1 = random, -2 = the host chooses in the hero select */
+/* hero: 0..9 = that hero, -1 = random, -2 = the host chooses in the hero select. Test mode hosts
+ * as before, once the main menu exists (rgtest's keys may still be working the menus). */
 static int host_start(int players, int hero, const char *room_name) {
-    if (!menu_base || match_live() || picking || serving) {
-        host_log("host: cannot host now (not in the main menu yet, or already hosting)");
+    if (!menu_base || match_live() || picking || serving || (!test_mode && !can_host_here())) {
+        host_log("host: cannot host now (only from the main menu, and not while hosting)");
         return 0;
     }
+    user_stopped = 0;
     const char *nick = net_nickname();
     if (room_name) snprintf(room, sizeof room, "%s", room_name);
-    else snprintf(room, sizeof room, "HOST_%s_%d", nick, ++games);
+    else pick_room_name();
     host_name = rt_strdup_guest(nick);
     players = players < 2 ? 2 : players > 4 ? 4 : players;
     remote_players = players - 1;
@@ -734,9 +915,14 @@ void rg_host_configure(int players, int hero) {
     hero_default = hero < -2 || hero > 9 ? -2 : hero;
 }
 
+/* 1 = the main menu is up and nothing is being hosted: F5 and the Android HOST button work */
+int rg_host_can_start(void) {
+    return !picker && !picking && !serving && !match_live() && can_host_here();
+}
+
 void rg_host_request(void) {
     if (picker || picking || serving || match_live()) { host_log("host: already hosting"); return; }
-    if (!menu_base) { host_log("host: the main menu is not up yet"); return; }
+    if (!rg_host_can_start()) { host_log("host: hosting starts from the main menu"); return; }
     picker = picker_default;
     host_log("host: choosing the number of players");
 }
@@ -750,50 +936,68 @@ int rg_host_state(void) {
 
 int rg_host_players(void) { return picker_default; }
 
+int rg_host_user_stopped(void) { return user_stopped; }
+
 int rg_host_start(int players, int hero) { return !picker && host_start(players, hero, NULL); }
 
 const char *rg_host_status(void) {
     int wanted = remote_players, n = remote_connected();
+    const char *stop = test_mode ? "" : " - Back/Esc: stop";
     switch (rg_host_state()) {
     case 1: return "Host a game: number of players";
     case 2: return "Hosting: choose your hero (Back = cancel)";
     case 3:
-        if (!ws_up && no_relay) snprintf(status, sizeof status, "Cannot host: no server (no internet, and this device cannot run a LAN relay)");
-        else if (!ws_up) snprintf(status, sizeof status, "Hosting: connecting to the server...");
-        else if (starting) snprintf(status, sizeof status, "Hosting: starting the game...");
+        if (!ws_up && no_relay) snprintf(status, sizeof status, "Cannot host: no server (no internet, and this device cannot run a LAN relay)%s", stop);
+        else if (!ws_up) snprintf(status, sizeof status, "Hosting: connecting to the server...%s", stop);
+        else if (starting) snprintf(status, sizeof status, "Hosting: starting the game, %d/%d players are in%s", n + 1, wanted + 1, stop);
+        else if (!served && !nseated) snprintf(status, sizeof status, "Hosting: offering the game...%s", stop);
+        else if (nseated && start_sel > 0 && start_sel <= nseated) snprintf(status, sizeof status, "Hosting: OK/Enter removes %s from your game", seat_name[start_sel - 1]);
         else if (nseated >= wanted) snprintf(status, sizeof status, "Hosting: all players are in, OK/Enter starts the game");
         else if (nseated) snprintf(status, sizeof status, "Hosting: %d/%d players are in (others: Quick Match)", nseated + 1, wanted + 1);
-        else snprintf(status, sizeof status, "Hosting, waiting for players %d/%d (others: Quick Match)", n + 1, wanted + 1);
+        else snprintf(status, sizeof status, "Hosting, waiting for players %d/%d (others: Quick Match)%s", n + 1, wanted + 1, stop);
         return status;
     case 4:
         if (n < wanted) snprintf(status, sizeof status, "Hosting: match running, %d/%d players still connected", n + 1, wanted + 1);
         else snprintf(status, sizeof status, "Hosting: match running");
         return status;
     }
-    return hosting ? "F5 = host a new game" : status;
+    return hosting && rg_host_can_start() ? "F5 = host a new game" : "";   /* F5 works only there */
 }
 
-/* key filter in front of the engine (rg_key): F5 and the picker's keys */
+/* Key filter in front of the engine (rg_key): F5, the picker's keys, the start panel's, and
+ * Back/Esc while a hosted game waits. A key taken here is taken down and up (held[], swallow_key);
+ * a release whose press went elsewhere goes on (the engine or the lobby saw it go down). */
 int rg_server_key(int down, int k) {
     if (swallow_key && k == swallow_key) { if (!down) swallow_key = 0; return 1; }
     if (k >= 0 && k < 256 && !down && held[k]) { held[k] = 0; return 1; }
-    if (down && start_panel() && start_panel_key(k)) { if (k >= 0 && k < 256) held[k] = 1; return 1; }
     if (k == AWT_F5) { if (down && !test_mode) rg_host_request(); return 1; }
+    /* Back/Esc stops a game that waits for its players (the engine's host screen ignores it, but
+     * kept it: it opened the in-match menu when the match began). Test mode hosts as before. */
+    if (down && (k == AWT_ESCAPE || k == AWT_BACK_SPACE) && rg_host_state() == 3 && !test_mode) {
+        swallow_key = k;
+        stop_hosting();
+        return 1;
+    }
+    if (down && start_panel() && start_panel_key(k)) { if (k >= 0 && k < 256) held[k] = 1; return 1; }
     if (!picker) return 0;
-    if (!down) return 1;
+    if (!down) return 0;
+    if (k >= 0 && k < 256) held[k] = 1;
     int n = picker;
     switch (k) {
     case 37: case 40: n--; break;                                   /* left, down */
     case 39: case 38: n++; break;                                   /* right, up */
     case '2': case '3': case '4': n = k - '0'; break;
     case 10: case 32: case 17:                                      /* enter, space, ctrl: continue */
+        held[k] = 0;                                                /* swallow_key (repeats too) */
         picker_default = picker;
         picker = 0;
         swallow_key = k;
         host_start(picker_default, hero_default, NULL);
         return 1;
-    case 27: case 8:                                                /* escape, backspace: cancel */
+    case AWT_ESCAPE: case AWT_BACK_SPACE:                           /* cancel */
+        held[k] = 0;
         picker = 0;
+        user_stopped = 1;
         swallow_key = k;
         host_log("host: cancelled");
         return 1;
@@ -804,22 +1008,36 @@ int rg_server_key(int down, int k) {
 }
 
 /* ------------------------------------------------------------------ drawing */
-static void triangle(uint32_t *px, int w, int cx, int cy, int dir, int r, uint32_t c) {
-    for (int dx = 0; dx <= r; dx++)                                 /* tip at cx + dir*r */
-        for (int dy = -(r - dx); dy <= r - dx; dy++) px[(size_t)(cy + dy) * w + cx + dir * dx] = c;
+/* tip at cx + dir*r; clipped (the frame may be any size) */
+static void triangle(uint32_t *px, int w, int h, int cx, int cy, int dir, int r, uint32_t c) {
+    for (int dx = 0; dx <= r; dx++) {
+        int x = cx + dir * dx;
+        if (x < 0 || x >= w) continue;
+        for (int dy = -(r - dx); dy <= r - dx; dy++)
+            if (cy + dy >= 0 && cy + dy < h) px[(size_t)(cy + dy) * w + x] = c;
+    }
 }
 
-/* the start panel: who sat down, START, and REMOVE for each of them */
+/* the start panel: who sat down, START, and REMOVE for each of them; after START only how many
+ * have arrived (the relay acts on neither START nor REMOVE any more) */
 static void draw_start_panel(uint32_t *buf, int w, int h) {
     const uint32_t gold = 0xffc828, white = 0xffffff, pale = 0xc8d2ff, dim = 0x8088a8;
     int u = h / 90 < 2 ? 2 : h / 90, sc = u >= 4 ? u / 2 : 1;
-    int items = 1 + nseated, rowh = 6 * u;
+    int items = starting ? 1 : 1 + nseated, rowh = 6 * u;
     int bw = w - 4 * u < 120 * u ? w - 4 * u : 120 * u, bh = 30 * u + items * rowh;
     if (bh > h - 2 * u) bh = h - 2 * u;
     int x = (w - bw) / 2, y = (h - bh) / 2, ly = y + 15 * u;
     char line[96];
     rt_draw_panel(buf, w, h, x, y, bw, bh);
     rt_draw_text_centred(buf, w, h, y + 4 * u, sc + 1, "YOUR GAME", gold);
+    if (starting) {
+        snprintf(line, sizeof line, "STARTING: %d OF %d PLAYERS ARE IN", remote_connected() + 1, remote_players + 1);
+        rt_draw_text_centred(buf, w, h, y + 10 * u, 1, line, pale);
+        rt_draw_text_centred(buf, w, h, ly + (rowh - u - 7 * sc) / 2, sc, "STARTING...", gold);
+        rt_draw_text_centred(buf, w, h, y + bh - 9 * u, 1, "THE MATCH BEGINS WHEN ALL OF THEM ARE IN", pale);
+        rt_draw_text_centred(buf, w, h, y + bh - 4 * u - 2, 1, test_mode ? "" : "BACK/ESC: STOP HOSTING", pale);
+        return;
+    }
     snprintf(line, sizeof line, "%d OF %d PLAYERS ARE IN (WITH YOU)", nseated + 1, remote_players + 1);
     rt_draw_text_centred(buf, w, h, y + 10 * u, 1, line, pale);
     int full = nseated >= remote_players;
@@ -827,8 +1045,7 @@ static void draw_start_panel(uint32_t *buf, int w, int h) {
         int ry = ly + i * rowh, ty = ry + (rowh - u - 7 * sc) / 2;
         if (i == start_sel) rt_fill_rect(buf, w, h, x + 3 * u, ry, x + bw - 3 * u, ry + rowh - u, 0x34468a);
         if (i == 0) {
-            if (starting) snprintf(line, sizeof line, "STARTING...");
-            else if (full) snprintf(line, sizeof line, "START THE GAME");
+            if (full) snprintf(line, sizeof line, "START THE GAME");
             else snprintf(line, sizeof line, "START: WAITING FOR %d MORE", remote_players - nseated);
             rt_draw_text_centred(buf, w, h, ty, sc, line, full ? gold : dim);
         } else {
@@ -871,8 +1088,8 @@ const uint32_t *rg_server_compose(const uint32_t *fb, int w, int h) {
     char d[2] = {(char)('0' + picker), 0};
     int big = 3 * sc + 1, cy = y + 26 * u;
     rt_draw_text_centred(buf, w, h, cy - 7 * big / 2, big, d, white);
-    if (picker > 2) triangle(buf, w, w / 2 - 14 * u, cy, -1, 3 * u, gold);
-    if (picker < 4) triangle(buf, w, w / 2 + 14 * u, cy, 1, 3 * u, gold);
+    if (picker > 2) triangle(buf, w, h, w / 2 - 14 * u, cy, -1, 3 * u, gold);
+    if (picker < 4) triangle(buf, w, h, w / 2 + 14 * u, cy, 1, 3 * u, gold);
     char line[80];
     snprintf(line, sizeof line, "YOU + %d OTHER PLAYER%s", picker - 1, picker == 2 ? "" : "S");
     rt_draw_text_centred(buf, w, h, y + 37 * u, sc, line, pale);
@@ -929,6 +1146,21 @@ void rg_server_pump(void) {
         hosted = 1;
         host_start(test_players, -1, test_room);
     }
+    /* The picker belongs to the main menu: it closes when something else comes up (the intro, a
+     * dialog of the engine, an invitation), and its keys go to that again. */
+    if (picker && !can_host_here()) {
+        picker = 0;
+        host_log("host: the main menu went away; host picker closed");
+    }
+    /* A hero select that is no longer on top for a while (the engine replaced it) did not end
+     * through onSelect/onBack: hosting would stay blocked. */
+    if (picking && screens) {
+        if (current_screen() == hs_obj) hs_seen = now;
+        else if (now - hs_seen > 5000) {
+            picking = 0;
+            host_log("host: the hero select went away; hosting cancelled");
+        }
+    }
     /* The main menu replays the intro after ~35 s without input, and the picker keeps the keys
      * from the engine: tap Right (does nothing in the main menu) when it opens and every 10 s. */
     static uint32_t last_nudge;
@@ -957,14 +1189,28 @@ void rg_server_pump(void) {
 #endif
     }
     if (ws_up && now - last_ping > 15000) { last_ping = now; ws_send(1, "{\"t\":\"ping\"}", 12); }
+    if (reserve_at && (int32_t)(now - reserve_at) >= 0) {
+        reserve_at = 0;
+        if (serving && ws_up) send_serve();
+    }
+    /* Back/Esc before the host screen was up, and it never came (the main menu went away): the
+     * relay is told here; should the screen still come, it leaves at once (acc_set_controller) */
+    if (stopping && serving && !host_acc && now - stop_since > 3000) {
+        host_log("host: the host screen did not come up; the game is no longer offered");
+        end_serving();
+    }
     track_seats();
-    if (serving && !match_started && remote_players > 0 && remote_connected() >= remote_players) match_started = 1;
-    if (starting && now - starting_since > 20000) starting = 0;      /* the players did not come: show the panel again */
+    if (serving && !match_started && remote_players > 0 && remote_connected() >= remote_players) {
+        match_started = 1;
+        starting = 0;
+    }
     ev *e;
     while ((e = pop_ev())) {
         sess_t *s = by_pid(e->pid);
         if (e->kind == EV_JOIN) {
-            if (s && s->closed) s = NULL;      /* the same relay pid in a new game */
+            /* the same relay pid in a new game, or (a relay that restarted) of someone new while the
+             * player who had it is away */
+            if (s && (s->closed || s->away)) s = NULL;
             if (!s) {
                 if (nsess < MAX_SESS) s = &sess[nsess++];
                 else host_log("host: no player slot left");
@@ -978,7 +1224,10 @@ void rg_server_pump(void) {
             }
             free(e);
         } else if (e->kind == EV_LEAVE || e->kind == EV_LOST) {
-            if (s && e->kind == EV_LOST && serving && !rejoin_off && s->key > 0 && !s->closed) {
+            if (s && s->away) {
+                /* held already (their link or ours dropped): the relay may tell of that
+                 * connection's end only now; the seat stays held */
+            } else if (s && e->kind == EV_LOST && serving && !rejoin_off && s->key > 0 && !s->closed) {
                 s->away = 1;            /* the seat is held: see track_seats */
                 s->away_since = host_time_ms();
                 free_queue(s);
@@ -988,22 +1237,57 @@ void rg_server_pump(void) {
                 host_log("host: player %d left", e->pid);
             }
             free(e);
-        } else if (e->kind == EV_DATA && s) {
+        } else if (e->kind == EV_DATA && s && !s->away) {      /* an away player is not in the game */
             e->next = NULL;
             if (s->in_tail) s->in_tail->next = e; else s->in_head = e;
             s->in_tail = e;
         } else if (e->kind == EV_SEATS) {
             if (serving && !match_started) seats_update((const char *)e->data);
             free(e);
+        } else if (e->kind == EV_UP) {
+            if (serving && !serve_sent) send_serve();       /* the same room and key: it is ours again */
+            free(e);
+        } else if (e->kind == EV_SERVING) {
+            if (serving && !strcmp((const char *)e->data, room)) served = 1;
+            free(e);
+        } else if (e->kind == EV_TAKEN) {
+            /* Another connection serves that room: someone else's game with the same name (a
+             * waiting game takes a new number), or our own older link that the relay has not
+             * seen end (a relay without keys; the room is tried again until that link is gone). */
+            if (serving && !strcmp((const char *)e->data, room)) {
+                if (!match_started && !test_mode) {
+                    pick_room_name();
+                    host_log("host: that room name is taken; the game is offered as %s", room);
+                    reserve_at = (now + 500) | 1;
+                } else {
+                    host_log("host: room %s is still held by an older connection; trying again", room);
+                    reserve_at = (now + 5000) | 1;
+                }
+            }
+            free(e);
         } else if (e->kind == EV_CLOSED) {
             host_log("host: relay connection lost");
             seats_clear();
+            serve_sent = served = 0;
+            reserve_at = 0;
             pthread_mutex_lock(&send_lock);
             rt_link *l = ws;
             ws = NULL;
             pthread_mutex_unlock(&send_lock);
             if (l) { link_close(l); link_release(l); }
-            for (int i = 0; i < nsess; i++) if (sess[i].used) sess[i].closed = 1;
+            /* While the match runs, its players' links went with ours: their seats are held, as
+             * for a player who dropped (the engine is not told), and they come back through Quick
+             * Match once we serve the room again (the relay sends them away on that). Before it
+             * runs they are let go (seats come again from the relay). */
+            int kept = 0;
+            for (int i = 0; i < nsess; i++) {
+                sess_t *o = &sess[i];
+                if (!o->used || o->closed) continue;
+                if (serving && match_started && !rejoin_off && o->key > 0) {
+                    if (!o->away) { o->away = 1; o->away_since = now; free_queue(o); kept++; }
+                } else o->closed = 1;
+            }
+            if (kept) host_log("host: %d player(s) keep their seats until they are back", kept);
             free(e);
         } else free(e);
     }

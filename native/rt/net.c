@@ -104,9 +104,10 @@ static int ws_send(int opcode, const void *data, size_t len) {
 /* tiny JSON field reader for the relay's flat messages */
 static int json_str(const char *j, const char *key, char *out, size_t n) {
     char pat[40];
+    if (!n) return 0;
     snprintf(pat, sizeof pat, "\"%s\":\"", key);
     const char *p = strstr(j, pat);
-    if (!p) { if (n) out[0] = 0; return 0; }
+    if (!p) { out[0] = 0; return 0; }
     p += strlen(pat);
     size_t i = 0;
     while (*p && *p != '"' && i + 1 < n) { if (*p == '\\' && p[1]) p++; out[i++] = *p++; }
@@ -115,7 +116,7 @@ static int json_str(const char *j, const char *key, char *out, size_t n) {
 }
 
 static void on_disconnect(int gen) {
-    rg_lobby_reset();
+    rg_lobby_lost(gen);
     pthread_mutex_lock(&lock);
     int was = logged_in && gen == ws_generation && !logout_queued;
     pthread_mutex_unlock(&lock);
@@ -139,13 +140,17 @@ static char want_reply[512];     /* and the reply */
 static int want_got;             /* 1 that reply came, -1 an error did */
 #endif
 
-/* a frame from the relay (op 1 text, 2 binary; msg NUL-terminated) */
-static void on_frame(int op, const uint8_t *msg, size_t len) {
+/* a frame from the relay link `gen` (op 1 text, 2 binary; msg NUL-terminated) */
+static void on_frame(int gen, int op, const uint8_t *msg, size_t len) {
+    pthread_mutex_lock(&lock);
+    int stale = gen != ws_generation;
+    pthread_mutex_unlock(&lock);
+    if (stale) return;                               /* the reader of a link replaced since */
     if (op == 1) {                                   /* text: control reply / notice */
         char t[24];
         json_str((const char *)msg, "t", t, sizeof t);
         if (!strcmp(t, "pong") || !strcmp(t, "peer_joined") || !strcmp(t, "peer_left")) return;
-        if (!strcmp(t, "games")) { rg_lobby_message((const char *)msg); return; }   /* Quick Match: lobby.c */
+        if (!strcmp(t, "games")) { rg_lobby_message(gen, (const char *)msg); return; }   /* Quick Match: lobby.c */
         pthread_mutex_lock(&lock);
         if (!strcmp(t, "joined") && entering[0]) {   /* before the packets behind it */
             snprintf(room, sizeof room, "%s", entering);
@@ -181,7 +186,7 @@ static void *reader(void *arg) {
     uint8_t *msg = (uint8_t *)malloc(65536);
     size_t len;
     int op;
-    while ((op = link_read(a.l, msg, 65536, &len)) != 0) on_frame(op, msg, len);
+    while ((op = link_read(a.l, msg, 65536, &len)) != 0) on_frame(a.gen, op, msg, len);
     free(msg);
     link_release(a.l);
     on_disconnect(a.gen);
@@ -216,11 +221,15 @@ static int request(const char *json, const char *type, char *out, size_t n) {
 }
 #endif
 
+/* Every logout and failed login ends here. The game list goes with the link: in the browser
+   build nothing else would clear it (pump_link stops polling a closed link, so on_disconnect
+   never runs), and a list left on screen kept the menu's keys. */
 static void ws_close(void) {
     pthread_mutex_lock(&send_lock);
     rt_link *l = ws;
     ws = NULL;
     pthread_mutex_unlock(&send_lock);
+    rg_lobby_reset(0);
     if (l) { link_close(l); link_release(l); }
 }
 
@@ -241,8 +250,8 @@ static int ws_connect(void) {
     pthread_mutex_lock(&lock);
     int gen = ++ws_generation;
     pthread_mutex_unlock(&lock);
+    rg_lobby_reset(gen);             /* before its reader runs: only this link's lists count now */
 #ifdef RT_NO_THREADS
-    (void)gen;
     link_dead = 0;
 #else
     reader_arg *a = (reader_arg *)malloc(sizeof *a);
@@ -415,7 +424,7 @@ static void pump_link(void) {
         int op = link_poll(ws, msg, 65536, &len);
         if (op == 0) return;
         if (op < 0) { link_dead = 1; on_disconnect(ws_generation); return; }
-        on_frame(op, msg, len);
+        on_frame(ws_generation, op, msg, len);
     }
 }
 

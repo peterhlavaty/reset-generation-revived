@@ -30,6 +30,47 @@ fn serve(t: &mut T, h: &C, nick: &str, room: &str, players: u32, approve: bool) 
     t.send(h, json!({"t": "serve", "room": room, "players": players, "name": nick, "hero": 7, "approve": approve}));
 }
 
+/// A hosting session's key (random per session in the engine).
+const KEY: &str = "0123456789abcdef";
+
+/// A host's game link as the engine opens it since the keys: hello as RGHost and `serve` with the
+/// session's key (`running` once its match has started); the answers stay in the inbox.
+fn keyed_host(t: &mut T, room: &str, players: u32, key: &str, running: bool, addr: &str) -> C {
+    let h = t.conn_from(Some(addr));
+    t.send(&h, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+    h.take();
+    let mut m = json!({"t": "serve", "room": room, "players": players, "name": "Ann", "hero": 7, "approve": true, "key": key});
+    if running {
+        m["running"] = json!(true);
+    }
+    t.send(&h, m);
+    h
+}
+
+/// Ann's started match (HOST_Ann_1, keyed) with Pia and Rex in its room, seated; the inboxes are
+/// empty.
+fn keyed_match(t: &mut T) -> (C, C, C) {
+    let ann = keyed_host(t, "HOST_Ann_1", 2, KEY, false, "82.0.0.1");
+    let pia = waiting_chooser(t, "Pia", "82.0.0.3");
+    let rex = waiting_chooser(t, "Rex", "82.0.0.4");
+    pick(t, &pia, gid(1));
+    pick(t, &rex, gid(1));
+    start(t, &ann);
+    for c in [&pia, &rex] {
+        t.lock_ok(c);
+    }
+    for c in [&pia, &rex] {
+        assert_eq!(matched_room(&c.msgs()).as_deref(), Some("HOST_Ann_1"));
+        t.send(c, json!({"t": "move", "room": "HOST_Ann_1"}));
+        t.bin(c, &frame(CH_TABLE, &Writer::new().u8(REQUEST).u8(13).u32(7).done()));
+    }
+    assert_eq!(ann.texts().iter().filter(|m| m["t"] == "player_joined").count(), 2);
+    for c in [&pia, &rex] {
+        c.take();
+    }
+    (ann, pia, rex)
+}
+
 fn pick(t: &mut T, c: &C, id: u64) {
     t.send(c, json!({"t": "pick", "id": id}));
 }
@@ -357,21 +398,34 @@ fn an_approving_host_s_full_game_never_starts_by_itself() {
 }
 
 /// A host whose game quits right after its OK (between `start` and the players' lock answers):
-/// its players must not be sent into a room nobody serves any more.
+/// its players are not sent into a room nobody serves any more; their connections are closed
+/// (their game says so) instead of leaving them on "Game starting". A host who stops there (Esc)
+/// the same.
 #[test]
-#[ignore = "BUG: players are matched into the room of a host who quit during the start"]
 fn a_host_who_quits_while_its_game_starts_sends_no_one_into_its_room() {
-    let mut t = T::new(Config::default());
-    let ann = t.host_approving("Ann", 1, "82.0.0.1");
-    let pia = waiting_chooser(&mut t, "Pia", "82.0.0.3");
-    pick(&mut t, &pia, gid(1));
-    pia.take();
-    start(&mut t, &ann);
-    assert!(got_lock(&pia.msgs()));
-    t.disconnect(&ann);
-    t.lock_ok(&pia);
-    t.tick(4_000);
-    assert_eq!(matched_room(&pia.msgs()), None, "HOST_Ann_1 has no game server any more");
+    for stops in [false, true] {
+        let mut t = T::new(Config::default());
+        let ann = t.host_approving("Ann", 1, "82.0.0.1");
+        let pia = waiting_chooser(&mut t, "Pia", "82.0.0.3");
+        pick(&mut t, &pia, gid(1));
+        pia.take();
+        start(&mut t, &ann);
+        assert!(got_lock(&pia.msgs()));
+        if stops {
+            t.send(&ann, json!({"t": "unserve"}));
+        } else {
+            t.disconnect(&ann);
+        }
+        t.lock_ok(&pia);
+        assert_eq!(pia.closed(), Some(4003), "stops {stops}: Pia's game hears the host is gone");
+        assert_eq!(matched_room(&pia.msgs()), None, "stops {stops}: HOST_Ann_1 has no game server any more");
+        // back with a new connection: an ordinary Quick Match (the host is gone)
+        let pia2 = t.chooser_at("Pia", "82.0.0.3");
+        t.quick_match(&pia2);
+        let (texts, m) = pia2.split();
+        assert!(!got_lock(&m), "stops {stops}");
+        assert_eq!(last_games(&texts).unwrap()["games"], json!([]), "stops {stops}");
+    }
 }
 
 // ------------------------------------------------------------------ kick
@@ -672,7 +726,6 @@ fn the_kick_lasts_ten_minutes() {
 /// Kicked players who just keep waiting get that game back once the 10 minutes are over: the
 /// chooser's list offers it again, the older game's player is seated in it.
 #[test]
-#[ignore = "BUG: kicks only expire when something else rematches; a waiting kicked player never gets the game back"]
 fn waiting_kicked_players_get_the_game_back_when_the_ten_minutes_are_over() {
     let mut t = T::new(Config::default());
     let ann = t.host_approving("Ann", 2, "82.0.0.1");
@@ -888,26 +941,277 @@ fn a_host_whose_link_drops_and_comes_back_is_offered_again() {
 
 /// The host's link comes back before the relay noticed the old one died (a phone changing
 /// networks: the old TCP connection is half open). The engine sends `serve` again on every new
-/// link; its game must stay offered and its seats reach the new link.
+/// link, with its session's key: the new link takes the game over (same list id, its seated
+/// players keep their seats and the new link hears them), the old one is closed.
 #[test]
-#[ignore = "BUG: a host's new link gets serve \"taken\" while its dead old link holds the room; the game vanishes"]
 fn a_host_whose_link_comes_back_before_the_relay_notices_keeps_its_game() {
     let mut t = T::new(Config::default());
-    let old = t.host_approving("Ann", 1, "82.0.0.1");
+    let old = keyed_host(&mut t, "HOST_Ann_1", 2, KEY, false, "82.0.0.1");
     let pia = waiting_chooser(&mut t, "Pia", "82.0.0.3");
+    pick(&mut t, &pia, gid(1));
+    assert_eq!(seats(&old.texts()), Some(vec!["Pia"]));
     later(&mut t, 25_000, &[&pia]); // the old link is silent from now on
-    let new = open_host(&mut t, "Ann", "HOST_Ann_1", 1, true, "82.0.0.7");
+    pia.take();
+    let new = keyed_host(&mut t, "HOST_Ann_1", 2, KEY, false, "82.0.0.7");
+    assert_eq!(old.closed(), Some(4002), "the old link is replaced");
     let texts = new.texts();
-    assert!(texts.iter().any(|m| m["t"] == "serving"), "{texts:?}");
-    later(&mut t, 60_000, &[&pia, &new]); // the old link is closed as idle meanwhile
-    assert!(old.closed().is_some());
+    assert_eq!(texts[0], json!({"t": "serving", "room": "HOST_Ann_1"}));
+    assert_eq!(seats(&texts), Some(vec!["Pia"]), "the new link hears who sits there");
+    assert!(pia.texts().iter().all(|m| m["t"] != "games"), "nothing changes for Pia");
+    assert_eq!(t.relay.status()["hosted"], 1);
     let rex = t.chooser_at("Rex", "82.0.0.5");
     t.quick_match(&rex);
     let g = last_offer(&rex).unwrap();
-    assert_eq!(offered(&g), ["Ann"]);
-    new.take();
-    pick(&mut t, &rex, g["games"][0][0].as_u64().unwrap());
-    assert_eq!(seats(&new.texts()), Some(vec!["Rex"]));
+    assert_eq!(g["games"], json!([[gid(1), "Ann", 7, 1, 2, 0, 1]]));
+    pick(&mut t, &rex, gid(1));
+    assert_eq!(seats(&new.texts()), Some(vec!["Pia", "Rex"]));
+    start(&mut t, &new);
+    for c in [&pia, &rex] {
+        t.lock_ok(c);
+    }
+    for c in [&pia, &rex] {
+        assert_eq!(matched(&c.msgs()), Some(("HOST_Ann_1".into(), 2)));
+    }
+}
+
+/// While a room is served, a `serve` for it with another key or without one is refused
+/// (`taken`): the room, its game and its seats stay its host's.
+#[test]
+fn a_serve_with_another_key_or_none_is_taken() {
+    for other in [Some("fedcba9876543210"), None] {
+        let mut t = T::new(Config::default());
+        let ann = keyed_host(&mut t, "HOST_Ann_1", 1, KEY, false, "82.0.0.1");
+        let pia = waiting_chooser(&mut t, "Pia", "82.0.0.3");
+        pick(&mut t, &pia, gid(1));
+        ann.take();
+        pia.take();
+        let b = t.conn_from(Some("82.0.0.1"));
+        t.send(&b, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+        b.take();
+        let mut m = json!({"t": "serve", "room": "HOST_Ann_1", "players": 1, "name": "Ann", "approve": true});
+        if let Some(k) = other {
+            m["key"] = json!(k);
+        }
+        t.send(&b, m);
+        assert_eq!(b.texts(), vec![json!({"t": "error", "op": "serve", "room": "HOST_Ann_1", "code": "taken"})]);
+        assert_eq!(ann.closed(), None, "key {other:?}");
+        assert!(ann.texts().is_empty(), "key {other:?}");
+        assert_eq!(last_offer(&pia), None, "key {other:?}: Pia keeps her seat");
+        assert_eq!(t.relay.status()["hosted"], 1);
+        start(&mut t, &ann);
+        t.lock_ok(&pia);
+        assert_eq!(matched(&pia.msgs()), Some(("HOST_Ann_1".into(), 1)), "key {other:?}");
+    }
+}
+
+/// A host's game that says its match is running (a link back after a relay restart, or late)
+/// is served but never offered as a waiting game.
+#[test]
+fn a_running_serve_is_never_offered() {
+    let mut t = T::new(Config::default());
+    let ann = keyed_host(&mut t, "HOST_Ann_7", 2, KEY, true, "82.0.0.1");
+    assert_eq!(ann.texts(), vec![json!({"t": "serving", "room": "HOST_Ann_7"})], "no seats: not a waiting game");
+    assert_eq!(t.relay.status()["hosted"], 0);
+    let pia = t.chooser_at("Pia", "82.0.0.1");
+    t.quick_match(&pia);
+    let (texts, m) = pia.split();
+    assert_eq!(last_games(&texts).unwrap()["games"], json!([]));
+    assert!(!got_lock(&m));
+    let quinn = t.player_at("Quinn", "82.0.0.1");
+    t.quick_match(&quinn);
+    assert!(!got_lock(&quinn.msgs()));
+    assert!(ann.texts().is_empty(), "no seats");
+}
+
+/// The host's link drops mid-match and comes back (same room and key, `running`): the new link
+/// serves the room, but its game lost the players' sessions with the old link, so the players in
+/// the room are disconnected (4004) and go back into the match with Quick Match; the match is
+/// never offered as a waiting game.
+#[test]
+fn a_host_whose_link_comes_back_mid_match_takes_its_players_back() {
+    let mut t = T::new(Config::default());
+    let (ann, pia, rex) = keyed_match(&mut t);
+    t.disconnect(&ann);
+    t.tick(5_000);
+    assert_eq!((pia.closed(), rex.closed()), (None, None), "they wait for the host");
+    t.bin(&pia, &frame(CH_GAME, &[0, 1, 2, 3]));
+    assert!(rex.take().is_empty(), "the match is not passed between the players");
+    let ann2 = keyed_host(&mut t, "HOST_Ann_1", 2, KEY, true, "82.0.0.9");
+    assert_eq!(ann2.texts(), vec![json!({"t": "serving", "room": "HOST_Ann_1"})], "no player_left: the new link has no sessions");
+    assert_eq!((pia.closed(), rex.closed()), (Some(4004), Some(4004)));
+    assert_eq!(t.relay.status()["hosted"], 0);
+    let sue = t.chooser_at("Sue", "82.0.0.5");
+    t.quick_match(&sue);
+    assert_eq!(last_offer(&sue).unwrap()["games"], json!([]), "not offered");
+    for (name, addr) in [("Pia", "82.0.0.3"), ("Rex", "82.0.0.4")] {
+        let p = t.chooser_at(name, addr);
+        t.quick_match(&p);
+        assert!(got_lock(&p.msgs()), "{name} goes back into the match");
+        t.lock_ok(&p);
+        assert_eq!(matched(&p.msgs()), Some(("HOST_Ann_1".into(), 1)));
+        t.send(&p, json!({"t": "move", "room": "HOST_Ann_1"}));
+        t.bin(&p, &frame(CH_TABLE, &Writer::new().u8(REQUEST).u8(13).u32(7).done()));
+        assert!(ann2.texts().iter().any(|m| m["t"] == "player_joined" && m["name"] == name));
+        t.bin(&p, &frame(CH_GAME, &[9, 9]));
+        assert!(!ann2.take().is_empty(), "{name}'s match reaches the host");
+    }
+}
+
+/// The host's link drops mid-match and does not come back: after HOST_BACK_MS the players in its
+/// room are disconnected (4003, their game says the connection is lost instead of showing a frozen
+/// board) and the room is forgotten; a player who only arrives then is sent away too, and the
+/// host's late serve of that room is a new game.
+#[test]
+fn a_host_who_does_not_come_back_ends_the_match() {
+    let mut t = T::new(Config::default());
+    let (ann, pia, rex) = keyed_match(&mut t);
+    t.disconnect(&rex); // remembered: it may come back while the host does
+    t.disconnect(&ann);
+    later(&mut t, 10_000, &[&pia]);
+    assert_eq!(pia.closed(), None);
+    let rex2 = t.chooser_at("Rex", "82.0.0.4");
+    t.quick_match(&rex2);
+    assert!(!got_lock(&rex2.msgs()), "no way back while nobody serves the match");
+    later(&mut t, 5_000, &[&pia, &rex2]);
+    assert_eq!(pia.closed(), Some(4003), "the host is gone");
+    let lister = t.hello("Lister");
+    t.send(&lister, json!({"t": "rooms"}));
+    let rooms = lister.texts()[0]["rooms"].clone();
+    assert!(!rooms.as_array().unwrap().iter().any(|r| r["name"] == "HOST_Ann_1"), "{rooms}");
+    // a player matched into it who arrives only now
+    let late = t.chooser_at("Late", "82.0.0.6");
+    t.send(&late, json!({"t": "move", "room": "HOST_Ann_1"}));
+    assert_eq!(late.closed(), Some(4003));
+    // Rex's next Quick Match is an ordinary one
+    rex2.take();
+    t.cancel(&rex2);
+    t.quick_match(&rex2);
+    assert!(!got_lock(&rex2.msgs()));
+    // the host's game serves that room again: a new game, offered
+    let ann2 = keyed_host(&mut t, "HOST_Ann_1", 1, KEY, false, "82.0.0.1");
+    assert_eq!(ann2.texts()[0], json!({"t": "serving", "room": "HOST_Ann_1"}));
+    assert_eq!(t.relay.status()["hosted"], 1);
+}
+
+/// A host who stops mid-match (`unserve`) without serving it again: the players still in its room
+/// are disconnected after HOST_BACK_MS (a start that never comes, or an end screen), not at once;
+/// players who left the room before are not.
+#[test]
+fn the_players_left_in_the_room_of_a_host_who_stopped_are_sent_away() {
+    let mut t = T::new(Config::default());
+    let (ann, pia, rex) = keyed_match(&mut t);
+    t.send(&rex, json!({"t": "move", "room": "CasinoSystem"}));
+    t.send(&ann, json!({"t": "unserve"}));
+    later(&mut t, 10_000, &[&pia, &rex]);
+    assert_eq!(pia.closed(), None);
+    t.bin(&pia, &frame(CH_GAME, &[0, 1]));
+    later(&mut t, 5_000, &[&pia, &rex]);
+    assert_eq!(pia.closed(), Some(4003));
+    assert_eq!(rex.closed(), None, "Rex had left the room");
+}
+
+/// Rex drops out of Ann's match while Ann's link is away and plays Ben's game meanwhile (Ben's
+/// inbox is emptied); the way back into Ann's match is kept for when Ann is back.
+fn rex_in_two_matches(t: &mut T) -> (C, C, C) {
+    let (ann, _pia, rex) = keyed_match(t);
+    t.disconnect(&ann);
+    t.disconnect(&rex);
+    t.tick(100);
+    let ben = t.host_approving("Ben", 1, "82.0.0.9");
+    let rex2 = waiting_chooser(t, "Rex", "82.0.0.4");
+    pick(t, &rex2, gid(2));
+    assert_eq!(seats(&ben.texts()), Some(vec!["Rex"]));
+    (ann, ben, rex2)
+}
+
+/// A player with a way back into two matches (they dropped out of one while its host was away,
+/// then of the next one) goes back into the one they dropped out of last, whatever the order of
+/// the relay's maps.
+#[test]
+fn a_player_back_from_two_matches_goes_into_the_one_they_left_last() {
+    let mut t = T::new(Config::default());
+    let (_ann, ben, rex2) = rex_in_two_matches(&mut t);
+    start(&mut t, &ben);
+    t.lock_ok(&rex2);
+    assert_eq!(matched_room(&rex2.msgs()).as_deref(), Some("HOST_Ben_1"));
+    t.send(&rex2, json!({"t": "move", "room": "HOST_Ben_1"}));
+    seat_take(&mut t, &rex2);
+    t.tick(100);
+    t.disconnect(&rex2);
+    let ann2 = keyed_host(&mut t, "HOST_Ann_1", 2, KEY, true, "82.0.0.1");
+    assert!(ann2.texts().contains(&json!({"t": "serving", "room": "HOST_Ann_1"})));
+    let rex3 = t.chooser_at("Rex", "82.0.0.4");
+    t.quick_match(&rex3);
+    t.lock_ok(&rex3);
+    assert_eq!(matched_room(&rex3.msgs()).as_deref(), Some("HOST_Ben_1"), "the last match");
+    // done with Ben's match (left the normal way): Ann's is next
+    t.send(&rex3, json!({"t": "move", "room": "HOST_Ben_1"}));
+    seat_take(&mut t, &rex3);
+    t.send(&rex3, json!({"t": "move", "room": "CasinoSystem"}));
+    rex3.take();
+    t.quick_match(&rex3);
+    t.lock_ok(&rex3);
+    assert_eq!(matched_room(&rex3.msgs()).as_deref(), Some("HOST_Ann_1"));
+}
+
+/// A player seated in a waiting game while their match's host was away, sent back into the match
+/// once the host is back, frees the seat: a player waiting for a game at home gets it by itself.
+#[test]
+fn going_back_into_a_match_frees_the_seat_for_the_next_player() {
+    let mut t = T::new(Config::default());
+    let (_ann, ben, rex2) = rex_in_two_matches(&mut t);
+    let sue = waiting_chooser(&mut t, "Sue", "82.0.0.9"); // Ben's home: his game is full
+    assert_eq!(seats(&ben.texts()), None);
+    let _ann2 = keyed_host(&mut t, "HOST_Ann_1", 2, KEY, true, "82.0.0.1");
+    t.quick_match(&rex2);
+    assert!(got_lock(&rex2.msgs()), "back into Ann's match");
+    assert_eq!(seats(&ben.texts()), Some(vec!["Sue"]));
+    assert_eq!(last_games(&sue.texts()).unwrap()["seat"], gid(2));
+}
+
+/// The room of a started match that its host left is still the host's for HOST_BACK_MS: another
+/// host's game (another key, or none) cannot take it then.
+#[test]
+fn a_room_whose_host_is_coming_back_is_taken_for_others() {
+    let mut t = T::new(Config::default());
+    let (ann, pia, _rex) = keyed_match(&mut t);
+    t.disconnect(&ann);
+    for other in [Some("fedcba9876543210"), None] {
+        let b = t.conn_from(Some("82.0.0.8"));
+        t.send(&b, json!({"t": "hello", "v": 1, "name": "RGHost"}));
+        b.take();
+        let mut m = json!({"t": "serve", "room": "HOST_Ann_1", "players": 1, "name": "Ann", "approve": true});
+        if let Some(k) = other {
+            m["key"] = json!(k);
+        }
+        t.send(&b, m);
+        assert_eq!(b.texts()[0]["code"], "taken", "key {other:?}");
+    }
+    assert_eq!(pia.closed(), None);
+    assert_eq!(t.relay.status()["hosted"], 0);
+}
+
+/// An older host (no key) whose link drops mid-match cannot take its room back: without a key
+/// anyone could serve that name. Its players stay until HOST_BACK, then they are sent away.
+#[test]
+fn an_older_host_whose_link_comes_back_mid_match_does_not_get_its_room() {
+    let mut t = T::new(Config::default());
+    let ann = t.host_approving("Ann", 1, "82.0.0.1");
+    let pia = waiting_chooser(&mut t, "Pia", "82.0.0.3");
+    pick(&mut t, &pia, gid(1));
+    start(&mut t, &ann);
+    t.lock_ok(&pia);
+    assert_eq!(matched_room(&pia.msgs()).as_deref(), Some("HOST_Ann_1"));
+    t.send(&pia, json!({"t": "move", "room": "HOST_Ann_1"}));
+    t.disconnect(&ann);
+    let ann2 = open_host(&mut t, "Ann", "HOST_Ann_1", 1, true, "82.0.0.1");
+    assert_eq!(ann2.texts()[0]["code"], "taken");
+    assert_eq!(pia.closed(), None);
+    t.tick(16_000);
+    assert_eq!(pia.closed(), Some(4003));
+    let pia2 = t.chooser_at("Pia", "82.0.0.3");
+    t.quick_match(&pia2);
+    assert!(!got_lock(&pia2.msgs()), "not back into the old match");
 }
 
 /// A `serve` whose seat count is not a whole number 1..99 is served (a plain room) but lists no
@@ -1027,18 +1331,23 @@ fn on_a_lan_relay_every_game_is_at_home() {
     assert!(offered(&g).is_empty(), "sent away from both");
 }
 
-/// Two hosts who play under the same nickname (the engine names the room `HOST_<nick>_<n>`,
-/// counting from 1 per session): both games must be offered.
+/// Two hosts who play under the same nickname: the engine names the room `HOST_<nick>_<n>` with a
+/// random n, and a host whose `serve` is refused (`taken`: the same n by chance, or an older host
+/// counting from 1) serves another n. Both games are offered, and each host hears only its own
+/// seats.
 #[test]
-#[ignore = "BUG: a second host with the same nickname gets serve \"taken\"; its game is never listed"]
 fn two_hosts_with_the_same_nickname_both_get_their_game_listed() {
     let mut t = T::new(Config::default());
-    let a = open_host(&mut t, "Ann", "HOST_Ann_1", 1, true, "82.0.0.1");
+    let a = keyed_host(&mut t, "HOST_Ann_1", 1, KEY, false, "82.0.0.1");
     assert_eq!(a.texts()[0]["t"], "serving");
-    let b = open_host(&mut t, "Ann", "HOST_Ann_1", 1, true, "82.0.0.2");
-    let texts = b.texts();
-    assert!(texts.iter().all(|m| m["t"] != "error"), "{texts:?}");
+    let b = keyed_host(&mut t, "HOST_Ann_1", 1, "00000000ffffffff", false, "82.0.0.2");
+    assert_eq!(b.texts()[0]["code"], "taken");
+    t.send(&b, json!({"t": "serve", "room": "HOST_Ann_482913", "players": 1, "name": "Ann", "hero": 7, "approve": true, "key": "00000000ffffffff"}));
+    assert_eq!(b.texts()[0], json!({"t": "serving", "room": "HOST_Ann_482913"}));
     let pia = t.chooser_at("Pia", "82.0.0.3");
     t.quick_match(&pia);
     assert_eq!(offered(&last_offer(&pia).unwrap()), ["Ann", "Ann"]);
+    pick(&mut t, &pia, gid(2));
+    assert_eq!(seats(&b.texts()), Some(vec!["Pia"]));
+    assert!(a.texts().is_empty());
 }

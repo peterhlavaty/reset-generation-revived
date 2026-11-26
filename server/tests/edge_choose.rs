@@ -171,7 +171,6 @@ fn a_game_at_home_is_listed_first_even_among_many() {
 /// The player picked the oldest of 20 games; five more are hosted. Their own game must stay on
 /// the list (lobby.c draws the "HOST'S GAME n/m" strip only for a game it finds in the list).
 #[test]
-#[ignore = "BUG: GAMES_MAX cuts the player's own game off their list"]
 fn the_own_game_stays_listed_when_more_than_twenty_wait() {
     let mut t = T::new(Config::default());
     for i in 1..=20 {
@@ -320,7 +319,8 @@ fn without_addresses_no_game_is_at_home() {
 
 // ------------------------------------------------------------------ picks
 
-/// An id that is no waiting game: the same list again, nothing else changes.
+/// An id that is no waiting game: the same list again, nothing else changes. (Spaced out: picks
+/// faster than one per 500 ms after a few at once are ignored.)
 #[test]
 fn picking_an_unknown_id_resends_the_same_list() {
     let mut t = T::new(Config::default());
@@ -330,6 +330,7 @@ fn picking_an_unknown_id_resends_the_same_list() {
     let before = games(&p);
     ann.take();
     for bad in [0, 1, 12_345, id(0), id(2), u64::from(u32::MAX)] {
+        t.tick(500);
         pick(&mut t, &p, bad);
         let (texts, m) = p.split();
         assert_eq!(all_games(&texts), [&before], "id {bad}");
@@ -1105,7 +1106,6 @@ fn ten_minutes_after_being_sent_away_the_game_is_offered_again() {
 /// The same when nothing else happens meanwhile: the waiting player's list should offer the game
 /// again once the ten minutes are over.
 #[test]
-#[ignore = "BUG: an expired kick is only forgotten when something else matchmakes"]
 fn ten_minutes_after_being_sent_away_the_list_offers_the_game_by_itself() {
     let mut t = T::new(Config::default());
     let ann = serve(&mut t, "Ann", 2, 1, "82.0.0.1", true);
@@ -1342,4 +1342,208 @@ fn sent_away_at_home_a_chooser_is_seated_in_another_game_at_home() {
     assert_eq!(g["seat"], id(1));
     assert_eq!(ids(&g), [id(1)], "Sis's game is not offered");
     assert_eq!(seats(&bro.texts()), Some(vec!["Pia"]));
+}
+
+// ------------------------------------------------------------------ kicks are the host's
+
+/// A kick holds for the host, not just for that game: the same host's next game (another room)
+/// is not offered to the player either, while another host's is.
+#[test]
+fn a_kick_holds_for_the_host_s_next_game() {
+    let mut t = T::new(Config::default());
+    let ann = serve(&mut t, "Ann", 1, 1, "82.0.0.1", true);
+    let p = t.chooser_at("Pia", "82.0.0.3");
+    t.quick_match(&p);
+    pick(&mut t, &p, id(1));
+    kick(&mut t, &ann, "Pia");
+    t.send(&ann, json!({"t": "unserve"}));
+    t.send(&ann, json!({"t": "serve", "room": "HOST_Ann_2", "players": 1, "name": "Ann", "hero": 1, "approve": true}));
+    let ben = serve(&mut t, "Ben", 1, 1, "82.0.0.2", true);
+    let g = games(&p);
+    assert_eq!(offered(&g), ["Ben"], "Ann's next game is not offered");
+    pick(&mut t, &p, id(2));
+    assert_eq!(games(&p)["seat"], 0, "nor taken");
+    assert_eq!(seats(&ann.texts()), no_seats());
+    pick(&mut t, &p, id(3));
+    assert_eq!(seats(&ben.texts()), Some(vec!["Pia"]));
+    // an older game's player sent away is not seated in the host's next game by itself
+    let q = t.player_at("Quinn", "82.0.0.4");
+    t.quick_match(&q); // Ben's game is full
+    assert_eq!(seats(&ann.texts()), Some(vec!["Quinn"]));
+    kick(&mut t, &ann, "Quinn");
+    t.send(&ann, json!({"t": "serve", "room": "HOST_Ann_3", "players": 1, "name": "Ann", "hero": 1, "approve": true}));
+    assert_eq!(seats(&ann.texts()), no_seats(), "Quinn waits");
+}
+
+/// A kick also holds for the player's address: a stranger who comes back under another name
+/// from there is not offered that host's game (another host's is).
+#[test]
+fn a_kick_holds_for_the_player_s_address() {
+    let mut t = T::new(Config::default());
+    let ann = serve(&mut t, "Ann", 2, 1, "82.0.0.1", true);
+    let _ben = serve(&mut t, "Ben", 1, 1, "82.0.0.2", true);
+    let p = t.chooser_at("Troll", "82.0.0.66");
+    t.quick_match(&p);
+    pick(&mut t, &p, id(1));
+    kick(&mut t, &ann, "Troll");
+    t.disconnect(&p);
+    ann.take();
+    let p2 = t.chooser_at("Nice", "82.0.0.66");
+    t.quick_match(&p2);
+    assert_eq!(offered(&games(&p2)), ["Ben"]);
+    pick(&mut t, &p2, id(1));
+    assert_eq!(games(&p2)["seat"], 0);
+    // an older game from there is not seated in it by itself either
+    let old = t.player_at("Old", "82.0.0.66");
+    t.quick_match(&old);
+    assert_eq!(seats(&ann.texts()), None, "nobody new in Ann's game");
+    // someone from elsewhere is offered it
+    let r = t.chooser_at("Rex", "82.0.0.5");
+    t.quick_match(&r);
+    assert_eq!(offered(&games(&r)), ["Ann"]);
+}
+
+/// The address of a player at the host's own network does not count (a LAN relay, the host's
+/// family): only the name is kept away.
+#[test]
+fn a_kick_at_the_host_s_own_network_holds_only_for_the_name() {
+    for (host, player, sibling) in [("82.0.0.1", "82.0.0.1", "82.0.0.1"), ("127.0.0.1", "192.168.0.20", "192.168.0.21")] {
+        let mut t = T::new(Config::default());
+        let ann = serve(&mut t, "Ann", 2, 1, host, true);
+        let p = t.chooser_at("Pia", player);
+        t.quick_match(&p);
+        assert_eq!(games(&p)["seat"], id(1), "{host}: at home");
+        kick(&mut t, &ann, "Pia");
+        ann.take();
+        let s = t.chooser_at("Sis", sibling);
+        t.quick_match(&s);
+        assert_eq!(games(&s)["seat"], id(1), "{host}: Sis is seated at home");
+        assert_eq!(seats(&ann.texts()), Some(vec!["Sis"]));
+        assert_eq!(games(&p)["seat"], 0, "{host}: Pia stays away");
+    }
+}
+
+/// The 10 minutes end by themselves: the tick at the end of them offers the game again and seats
+/// the older game's player, nothing else needs to happen; a moment before, nothing changes.
+#[test]
+fn a_kick_ends_exactly_after_ten_minutes() {
+    let mut t = T::new(Config::default());
+    let ann = serve(&mut t, "Ann", 2, 1, "82.0.0.1", true);
+    let p = t.chooser_at("Pia", "82.0.0.3");
+    t.quick_match(&p);
+    pick(&mut t, &p, id(1));
+    let q = t.player_at("Quinn", "82.0.0.4");
+    t.quick_match(&q);
+    kick(&mut t, &ann, "Pia");
+    kick(&mut t, &ann, "Quinn");
+    for c in [&ann, &p, &q] {
+        c.take();
+    }
+    wait(&mut t, 590_000, &[&ann, &p, &q]);
+    t.tick(9_999);
+    assert!(all_games(&p.texts()).is_empty(), "9:59.999: nothing yet");
+    assert!(!got_lock(&q.msgs()));
+    assert_eq!(seats(&ann.texts()), None);
+    t.tick(1);
+    assert_eq!(seats(&ann.texts()), Some(vec!["Quinn"]), "10:00: Quinn is seated again");
+    assert_eq!(offered(&games(&p)), ["Ann"], "and Pia is offered the game again");
+}
+
+// ------------------------------------------------------------------ picks
+
+/// Picks are rate limited per connection (each one can change every waiting chooser's list): a
+/// few at once, then one per 500 ms; a pick beyond that is ignored, not queued.
+#[test]
+fn picks_are_rate_limited() {
+    let mut t = T::new(Config::default());
+    let ann = serve(&mut t, "Ann", 1, 1, "82.0.0.1", true);
+    let ben = serve(&mut t, "Ben", 1, 1, "82.0.0.2", true);
+    let p = t.chooser_at("Pia", "82.0.0.3");
+    t.quick_match(&p);
+    for i in 0..4 {
+        pick(&mut t, &p, id(1 + i % 2));
+    }
+    assert_eq!(games(&p)["seat"], id(2), "the first four count");
+    ann.take();
+    pick(&mut t, &p, id(1));
+    assert!(all_games(&p.texts()).is_empty(), "the fifth at once is ignored");
+    assert_eq!(seats(&ann.texts()), None);
+    t.tick(499);
+    pick(&mut t, &p, id(1));
+    assert!(all_games(&p.texts()).is_empty(), "still too soon");
+    t.tick(1);
+    pick(&mut t, &p, id(1));
+    assert_eq!(games(&p)["seat"], id(1), "one per 500 ms");
+    assert_eq!(seats(&ann.texts()), Some(vec!["Pia"]));
+    // another player's picks count for them alone
+    let r = t.chooser_at("Rex", "82.0.0.4");
+    t.quick_match(&r);
+    pick(&mut t, &r, id(2));
+    assert_eq!(games(&r)["seat"], id(2));
+    assert_eq!(seats(&ben.texts()), Some(vec!["Rex"]));
+}
+
+/// A game that does not choose (no `pick` in its hello) cannot pick: it was never offered the
+/// games, and its picks would change every chooser's list.
+#[test]
+fn a_pick_from_an_older_game_is_ignored() {
+    let mut t = T::new(Config::default());
+    let _ann = serve(&mut t, "Ann", 2, 1, "82.0.0.1", true);
+    t.tick(1_000);
+    let ben = serve(&mut t, "Ben", 2, 1, "82.0.0.2", true);
+    let q = t.player_at("Quinn", "82.0.0.4");
+    t.quick_match(&q);
+    assert_eq!(seats(&ben.texts()), Some(vec!["Quinn"]), "the newest game");
+    q.take();
+    pick(&mut t, &q, id(1));
+    assert!(ben.texts().is_empty(), "Quinn stays put");
+    assert!(q.take().is_empty());
+}
+
+// ------------------------------------------------------------------ the same name in a match
+
+/// A player in a match whose game restarts after a network blip comes back from the same address
+/// before the old connection is silent for long (match traffic): the new connection takes the
+/// name over at once (the old one is closed as lost: the host holds the seat), and Quick Match
+/// sends them back into the match. From another address it is someone else.
+#[test]
+fn a_player_back_from_the_same_address_takes_over_their_connection_in_a_match() {
+    let mut t = T::new(Config::default());
+    let ann = serve(&mut t, "Ann", 1, 1, "82.0.0.1", true);
+    let p = t.chooser_at("Pia", "82.0.0.3");
+    t.quick_match(&p);
+    pick(&mut t, &p, id(1));
+    start(&mut t, &ann);
+    t.lock_ok(&p);
+    assert_eq!(matched_room(&p.msgs()).as_deref(), Some("HOST_Ann_1"));
+    t.send(&p, json!({"t": "move", "room": "HOST_Ann_1"}));
+    seat_take(&mut t, &p);
+    ann.take();
+    t.tick(5_000);
+    let p2 = t.conn_from(Some("82.0.0.3"));
+    t.send(&p2, json!({"t": "hello", "v": 1, "name": "Pia", "pick": true}));
+    assert_eq!(p2.texts()[0]["name"], "Pia", "not Pia2");
+    assert_eq!(p.closed(), Some(4002));
+    assert!(ann.texts().contains(&json!({"t": "player_left", "pid": 1, "lost": 1})), "the host holds the seat");
+    t.send(&p2, json!({"t": "join", "room": "CasinoSystem"}));
+    t.quick_match(&p2);
+    assert!(got_lock(&p2.msgs()), "back into the match");
+    let p3 = t.conn_from(Some("82.0.0.9"));
+    t.send(&p3, json!({"t": "hello", "v": 1, "name": "Pia", "pick": true}));
+    assert_eq!(p3.texts()[0]["name"], "Pia2");
+    assert_eq!(p2.closed(), None);
+}
+
+/// On a LAN relay a friend over Tailscale (100.64.0.0/10) is at home like the LAN: seated in the
+/// relay's own game by itself.
+#[test]
+fn a_tailscale_friend_is_at_home_on_a_lan_relay() {
+    let mut t = T::new(Config::default());
+    let lan = serve(&mut t, "Lan", 2, 1, "127.0.0.1", true);
+    let p = t.chooser_at("Pia", "100.101.102.103");
+    t.quick_match(&p);
+    let g = games(&p);
+    assert_eq!(g["seat"], id(1));
+    assert_eq!(g["games"][0][5], 1, "home");
+    assert_eq!(seats(&lan.texts()), Some(vec!["Pia"]));
 }

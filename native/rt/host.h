@@ -67,9 +67,14 @@ const char *rt_stub_name(uint32_t addr);
 static inline uint32_t rt_arg(int i);
 void rt_ret(uint32_t eax, int pop_args);
 
-/* 5x7 bitmap font (font.c): glyph rows (5 bits each), NULL for characters it does not have */
+/* 5x7 bitmap font (font.c): glyph rows (5 bits each), NULL for characters it does not have.
+ * Every glyph takes 6*scale px (also one it does not have). The drawing functions clip at every
+ * edge of the w x h frame: any position and size is safe. */
 const uint8_t *rt_glyph(char c);
 int rt_text_width(const char *s, int scale);
+/* Cuts s in place to at most max_w px at `scale`, ending in ".." when it was cut (just the
+ * letters that fit when not even ".." does); returns the width left. */
+int rt_text_fit(char *s, int scale, int max_w);
 void rt_draw_text(uint32_t *px, int w, int h, int x, int y, int scale, const char *s, uint32_t color);
 void rt_draw_text_centred(uint32_t *px, int w, int h, int y, int scale, const char *s, uint32_t color);
 void rt_fill_rect(uint32_t *px, int w, int h, int x0, int y0, int x1, int y1, uint32_t color);
