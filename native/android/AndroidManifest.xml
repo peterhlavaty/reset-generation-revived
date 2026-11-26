@@ -16,7 +16,8 @@
         android:extractNativeLibs="true"
         android:allowBackup="true"
         android:appCategory="game"
-        android:isGame="true">
+        android:isGame="true"
+        android:enableOnBackInvokedCallback="false">
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"

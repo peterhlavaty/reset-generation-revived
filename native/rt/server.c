@@ -572,7 +572,10 @@ static void end_serving(void) {
     reserve_at = 0;
     seats_clear();
     close_sessions();                    /* that game's players */
-    ws_send(1, "{\"t\":\"unserve\"}", 15);
+    /* abort: its match never ran here (Back/Esc after START, or a start that timed out): the
+     * relay sends the players it sent here away at once instead of waiting for us to come back */
+    const char *msg = match_started ? "{\"t\":\"unserve\"}" : "{\"t\":\"unserve\",\"abort\":true}";
+    ws_send(1, msg, strlen(msg));
 }
 /* The engine's game server is gone (match over, or the host left the host screen). */
 static void l_close(int arg) {

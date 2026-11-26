@@ -163,7 +163,12 @@ network (a chooser, `Client.picks`).
 * Back/Esc (Android: Back) stops hosting while the game waits: host screen, start panel,
   STARTING. `server.c` clears the acceptor's "listening" byte (+0x18); the LAN host screen's
   update (`0x100ca8d0`) then returns to the main menu, its exit deletes the acceptor and the host
-  sends `unserve`. That key, its repeats and its release never reach the engine.
+  sends `unserve`; before its match ran on the host's engine (STARTING) with `"abort":true`,
+  and the relay sends the players it sent there away at once (4003) instead of after
+  `HOST_BACK_MS`. That key, its repeats and its release never reach the engine. Android's system
+  Back reaches the game as Esc: the manifest opts out of predictive back
+  (`android:enableOnBackInvokedCallback="false"`; with targetSdk 36 the system would close the
+  activity instead).
 * The relay ignores picks beyond 4 at once, then more than one per 500 ms. The player's own game
   is always in the list, even past the 20th entry. On a LAN relay 100.64.0.0/10 (Tailscale)
   counts as a local network too (Hamachi's 25.0.0.0/8 does not: it is public address space).

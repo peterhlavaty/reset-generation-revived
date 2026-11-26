@@ -95,6 +95,20 @@ struct Expected {
 struct Orphan {
     since: u64,
     key: Option<String>,
+    /// its link dropped (else it unserved after the match: only those still in the room wait)
+    lost: bool,
+}
+
+/// How a game server stops serving its room.
+#[derive(Clone, Copy, PartialEq)]
+enum Stop {
+    /// its connection is gone
+    Lost,
+    /// `unserve`: its match is over, or the host left (its next game on the same link too)
+    Done,
+    /// `unserve` with `"abort":true`: the host stopped before its match ran on its engine (Back/Esc
+    /// after START): the players sent there are sent away at once
+    Abort,
 }
 
 /// Shared state the bots use: the connections, the rooms the matchmaker announced, the game
@@ -305,7 +319,8 @@ impl Relay {
             "serve" => self.serve(c, room, &m),
             "unserve" => {
                 if self.net.clients[&c].serves.is_some() {
-                    self.unserve(c);
+                    let abort = m.get("abort").and_then(Value::as_bool) == Some(true);
+                    self.stop_serving(c, if abort { Stop::Abort } else { Stop::Done });
                 }
             }
             "rooms" => self.ctl(c, json!({"t": "rooms", "rooms": self.room_list()})),
@@ -495,7 +510,7 @@ impl Relay {
             false
         };
         if self.net.clients[&c].serves.as_ref().is_some_and(|s| *s != key) {
-            self.unserve(c); // a host's next game
+            self.stop_serving(c, Stop::Done); // a host's next game
         }
         if let Some(o) = old {
             self.retire(o, &key);
@@ -549,26 +564,32 @@ impl Relay {
         }
     }
 
-    /// The host's game server stops (`unserve`: match over or the host left the host screen or
-    /// stopped hosting; or its next game on the same link).
-    fn unserve(&mut self, c: ClientId) {
-        self.stop_serving(c, false);
-    }
-
-    /// `lost`: the server's connection is gone. A started match then waits HOST_BACK_MS for its
-    /// host's game to serve it again, also after `unserve` (whoever still waits in its room, for a
-    /// start that will not come or on an end screen, is sent away then); a waiting game ends at
-    /// once (its players get another).
-    fn stop_serving(&mut self, c: ClientId, lost: bool) {
+    /// A started match then waits HOST_BACK_MS for its host's game to serve it again, also after
+    /// `unserve` (whoever still waits in its room, on an end screen, is sent away then), unless the
+    /// host aborted it; a waiting game ends at once (its players get another).
+    fn stop_serving(&mut self, c: ClientId, how: Stop) {
         let Some(cl) = self.net.clients.get_mut(&c) else { return };
         let Some(key) = cl.serves.take() else { return };
         let host_key = cl.host_key.take();
         self.net.servers.remove(&key);
-        if self.casino.is_running(&key) {
-            let how = if lost { "is lost" } else { "stops" };
-            self.net.log(&format!("the server of {key} {how}: its match waits {HOST_BACK_MS} ms for its host"));
-            self.orphans.insert(key.clone(), Orphan { since: self.net.now, key: host_key });
+        let running = self.casino.is_running(&key);
+        if running && how == Stop::Abort {
+            self.net.log(&format!("the server of {key} stops before its match: its players are sent away"));
+            return self.host_gone(&key);
+        }
+        if running {
+            let lost = how == Stop::Lost;
+            let why = if lost {
+                format!("is lost: its match waits {HOST_BACK_MS} ms for its host")
+            } else {
+                format!("stops after its match: players still in its room are sent away in {HOST_BACK_MS} ms")
+            };
+            self.net.log(&format!("the server of {key} {why}"));
+            self.orphans.insert(key.clone(), Orphan { since: self.net.now, key: host_key, lost });
         } else {
+            if self.casino.is_hosted(&key) {
+                self.net.log(&format!("the server of {key} stops: its game is no longer offered"));
+            }
             self.casino.game_over(&mut self.net, &key);
         }
         if let Some(room) = self.rooms.get_mut(&key) {
@@ -610,7 +631,7 @@ impl Relay {
     /// says the connection is lost; the match cannot go on) and the room is forgotten. Players
     /// still on their way there are sent away when they arrive.
     fn host_gone(&mut self, key: &str) {
-        self.net.log(&format!("the host of {key} did not come back: the match is over"));
+        self.net.log(&format!("{key}: the match is over"));
         self.casino.game_over(&mut self.net, key);
         self.net.expected.remove(key);
         self.dead.insert(key.to_string(), self.net.now + DEAD_ROOM_MS);
@@ -727,7 +748,7 @@ impl Relay {
         let Some(cl) = self.net.clients.get_mut(&c) else { return };
         // it is going: nothing more for it (the casino tidies up its lists while it leaves)
         cl.out = Box::new(|_| {});
-        self.stop_serving(c, true);
+        self.stop_serving(c, Stop::Lost);
         self.leave(c, true, false);
         let name = self.net.clients.shift_remove(&c).and_then(|cl| cl.name).unwrap_or_default();
         self.net.log(&format!("bye c{c} {name}"));
@@ -780,7 +801,9 @@ impl Relay {
             self.orphans.iter().filter(|(_, o)| now >= o.since + HOST_BACK_MS).map(|(k, _)| k.clone()).collect();
         gone.sort(); // the same order every run
         for key in gone {
-            self.orphans.remove(&key);
+            if self.orphans.remove(&key).is_some_and(|o| o.lost) {
+                self.net.log(&format!("the host of {key} did not come back"));
+            }
             self.host_gone(&key);
         }
         self.dead.retain(|_, &mut t| now < t);

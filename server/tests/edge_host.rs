@@ -1351,3 +1351,36 @@ fn two_hosts_with_the_same_nickname_both_get_their_game_listed() {
     assert_eq!(seats(&b.texts()), Some(vec!["Pia"]));
     assert!(a.texts().is_empty());
 }
+
+/// A host that stops before its match ran on its engine (Back/Esc after START) says so
+/// (`"abort":true`): the players sent to it are sent away at once, not after HOST_BACK_MS; one
+/// still on the way in is turned away at the door. A normal `unserve` after the match leaves
+/// whoever is still in the room for HOST_BACK_MS.
+#[test]
+fn a_host_that_aborts_its_started_match_sends_its_players_away_at_once() {
+    for abort in [true, false] {
+        let mut t = T::new(Config::default());
+        let ann = t.host_approving("Ann", 2, "82.0.0.1");
+        let pia = waiting_chooser(&mut t, "Pia", "82.0.0.3");
+        pick(&mut t, &pia, gid(1));
+        let rex = waiting_chooser(&mut t, "Rex", "82.0.0.4");
+        pick(&mut t, &rex, gid(1));
+        start(&mut t, &ann);
+        t.lock_ok(&pia);
+        t.lock_ok(&rex);
+        assert_eq!(matched_room(&pia.msgs()).as_deref(), Some("HOST_Ann_1"));
+        assert_eq!(matched_room(&rex.msgs()).as_deref(), Some("HOST_Ann_1"));
+        t.send(&pia, json!({"t": "move", "room": "HOST_Ann_1"}));
+        ann.take();
+        t.send(&ann, if abort { json!({"t": "unserve", "abort": true}) } else { json!({"t": "unserve"}) });
+        assert_eq!(ann.closed(), None, "the host stays");
+        assert_eq!(pia.closed(), if abort { Some(4003) } else { None }, "abort {abort}");
+        t.send(&rex, json!({"t": "move", "room": "HOST_Ann_1"}));
+        assert_eq!(rex.closed(), if abort { Some(4003) } else { None }, "abort {abort}");
+        t.tick(16_000);
+        assert_eq!(pia.closed(), Some(4003));
+        let pia2 = t.chooser_at("Pia", "82.0.0.3");
+        t.quick_match(&pia2);
+        assert!(!got_lock(&pia2.msgs()), "not back into that match");
+    }
+}

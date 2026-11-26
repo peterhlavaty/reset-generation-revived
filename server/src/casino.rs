@@ -303,7 +303,11 @@ impl Casino {
             return true;
         }
         if let Some(key) = self.arriving.remove(&c) {
-            self.dropped_out(net, &key, &name);
+            // on the way into its room (the engine leaves the casino first): entering it forgets
+            // this, so it is not logged as a drop
+            if self.running.contains_key(&key) {
+                self.dropped.entry(key).or_default().insert(name.to_lowercase(), net.now);
+            }
             return true;
         }
         false
@@ -322,6 +326,11 @@ impl Casino {
     /// Is this player in a started hosted game they have not reached yet?
     pub fn launched(&self, c: ClientId) -> bool {
         self.arriving.contains_key(&c) || self.matches.iter().any(|m| m.hosted && m.group.iter().any(|q| q.client == c))
+    }
+
+    /// Is this room's game offered (waiting for its players)?
+    pub fn is_hosted(&self, key: &str) -> bool {
+        self.hosted.iter().any(|h| h.key == key)
     }
 
     /// Has a match been started in this room (and its host not finished it)?
