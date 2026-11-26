@@ -111,7 +111,11 @@ window and [tinyaudio](https://crates.io/crates/tinyaudio) sound:
 
 * The engine runs on the main thread at its own 32 fps pace; the 640×360 frame is shown scaled
   with the aspect ratio kept (the window can be resized). Keys are sent as Java AWT codes
-  (arrows, Enter, Esc/Backspace, Ctrl, Space, letters, digits).
+  (arrows, Enter, Esc/Backspace, Ctrl, Space, letters, digits). The in-match message is the
+  engine's phone-style text box ("abc"): it takes letters and Space from the typed characters
+  (`rg_key_char`), but AWT's digit codes 48-57 are its keypad keys (engine key ids 0x16-0x1f,
+  `0x100012c0`) and type no digits; numpad codes did not help either (tried 2026-11-26). The
+  original host sent the same codes.
 * Sound: the engine's 8 kHz mono mix goes into a queue (~100 ms) that the audio thread resamples
   to 44.1 kHz stereo.
 * Next to the program: `data/` (the game data, pre-patched for 640×360 by

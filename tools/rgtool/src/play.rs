@@ -41,6 +41,11 @@ fn spawn(args: &[String], log: &str) -> R<u32> {
 /// Starts the game (arguments as on its command line, e.g. --nickname=Bob --server=lan;
 /// `--log=NAME.log`: its log in build/logs, default run.log, so several games can run at once).
 pub fn run(args: &[String]) -> R<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("cargo x run [game options: --server=auto|lan|online|URL --nickname=N --host=auto --host_players=N
+                    --window_scale=N --window_x=X --window_y=Y --keys=MS:KEY,...] [--log=NAME.log]");
+        return Ok(());
+    }
     let log = args.iter().find_map(|a| a.strip_prefix("--log=")).unwrap_or("run.log").to_string();
     let rest: Vec<String> = args.iter().filter(|a| !a.starts_with("--log=")).cloned().collect();
     let pid = spawn(&rest, &log)?;
@@ -94,9 +99,10 @@ pub fn lan_test(args: &[String]) -> R<()> {
         std::thread::sleep(Duration::from_millis(500));
     }
     // intro, main menu (ESC opens Quit -> No), down to Quick Match, pick the first hero
+    let mut joiners = Vec::new();
     let keys = "--keys=6000:ESC,8000:ESC,9500:RETURN,10500:DOWN,11000:DOWN,11500:RETURN,14500:RETURN";
     for i in 2..=n {
-        spawn(
+        joiners.push(spawn(
             &[
                 format!("--nickname=Player{i}"),
                 s.clone(),
@@ -106,13 +112,22 @@ pub fn lan_test(args: &[String]) -> R<()> {
                 format!("--window_y={}", (i - 1) / 2 * 420 + 20),
             ],
             &format!("player{i}.log"),
-        )?;
+        )?);
         std::thread::sleep(Duration::from_secs(2));
     }
     // the host starts the game once everybody sat down
     let seated = format!("host: {m} of {m} player(s) seated", m = n - 1);
     let t = Instant::now();
     while !std::fs::read_to_string(&host_log).unwrap_or_default().contains(&seated) {
+        // a slow start (login, a busy PC) can make the hero screen come after the last key: Enter
+        // again once every joiner's keys are done
+        let s = t.elapsed().as_secs();
+        if s >= 16 && s % 4 == 2 {
+            for &p in &joiners {
+                let _ = win::find(Some(p)).and_then(|w| win::send_keys(w, "RETURN"));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
         if t.elapsed() > Duration::from_secs(90) {
             return Err(format!("the players did not sit down, see {}", logs().display()).into());
         }
