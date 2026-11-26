@@ -38,10 +38,13 @@ fn spawn(args: &[String], log: &str) -> R<u32> {
     Ok(child.id())
 }
 
-/// Starts the game (arguments as on its command line, e.g. --nickname=Bob --server=lan).
+/// Starts the game (arguments as on its command line, e.g. --nickname=Bob --server=lan;
+/// `--log=NAME.log`: its log in build/logs, default run.log, so several games can run at once).
 pub fn run(args: &[String]) -> R<()> {
-    let pid = spawn(args, "run.log")?;
-    println!("started pid {pid}, log {}", logs().join("run.log").display());
+    let log = args.iter().find_map(|a| a.strip_prefix("--log=")).unwrap_or("run.log").to_string();
+    let rest: Vec<String> = args.iter().filter(|a| !a.starts_with("--log=")).cloned().collect();
+    let pid = spawn(&rest, &log)?;
+    println!("started pid {pid}, log {}", logs().join(&log).display());
     Ok(())
 }
 
